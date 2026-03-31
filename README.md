@@ -28,5 +28,5 @@ Quit with `q` or `Esc`.
 
 The app draws:
 
-- Green boxes for detected people
+- Green boxes for detected people with tracking IDs like `Person 1`
 - Blue boxes for detected faces

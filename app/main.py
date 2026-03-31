@@ -3,6 +3,7 @@ import argparse
 import cv2
 
 from detector import FaceDetector, PersonDetector
+from tracker import PersonTracker
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,12 +57,12 @@ def build_open_error(source: str) -> str:
     return "\n".join(details)
 
 
-def draw_people(frame, people):
-    for (x, y, w, h) in people:
+def draw_people(frame, tracked_people):
+    for person_id, (x, y, w, h) in tracked_people:
         cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 2)
         cv2.putText(
             frame,
-            "Person",
+            f"Person {person_id}",
             (x, max(y - 10, 20)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -88,6 +89,7 @@ def main() -> None:
     args = parse_args()
     person_detector = PersonDetector(scale=args.scale, min_neighbors=args.min_neighbors)
     face_detector = FaceDetector()
+    tracker = PersonTracker()
     capture = open_source(args.source)
 
     if not capture.isOpened():
@@ -101,13 +103,14 @@ def main() -> None:
             break
 
         people = person_detector.detect(frame)
+        tracked_people = tracker.update(people)
         faces = face_detector.detect(frame)
-        draw_people(frame, people)
+        draw_people(frame, tracked_people)
         draw_faces(frame, faces)
 
         cv2.putText(
             frame,
-            f"People: {len(people)} | Faces: {len(faces)}",
+            f"People: {len(tracked_people)} | Faces: {len(faces)}",
             (20, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
