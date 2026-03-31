@@ -1,5 +1,6 @@
 import argparse
 import sys
+from time import perf_counter
 from pathlib import Path
 
 import cv2
@@ -19,23 +20,28 @@ except Exception:
 
 
 FONT_CANDIDATES = [
-    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
     Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"),
-    Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
     Path("/System/Library/Fonts/Supplemental/NotoSansGothic-Regular.ttf"),
+    Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 ]
+FONT_CACHE = {}
 
 
 def load_overlay_font(size: int):
     if ImageFont is None:
         return None
+    if size in FONT_CACHE:
+        return FONT_CACHE[size]
 
     for path in FONT_CANDIDATES:
         if path.exists():
             try:
-                return ImageFont.truetype(str(path), size=size)
+                FONT_CACHE[size] = ImageFont.truetype(str(path), size=size)
+                return FONT_CACHE[size]
             except Exception:
                 continue
+    FONT_CACHE[size] = None
     return None
 
 
@@ -94,8 +100,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--person-imgsz",
         type=int,
-        default=960,
+        default=640,
         help="YOLO 사람 감지 입력 크기. 클수록 보통 더 정확합니다.",
+    )
+    parser.add_argument(
+        "--person-detect-interval",
+        type=int,
+        default=2,
+        help="사람 감지를 몇 프레임마다 수행할지 설정합니다. 클수록 더 빠릅니다.",
     )
     parser.add_argument(
         "--stt",
@@ -185,15 +197,17 @@ def build_open_error(source: str) -> str:
 
 
 def draw_people(frame, tracked_people):
-    for person_id, (x, y, w, h) in tracked_people:
+    for person in tracked_people:
+        person_id = person["id"]
+        x, y, w, h = person["bbox"]
         cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 2)
-        draw_unicode_text(frame, f"사람 {person_id}", (x, max(y - 24, 20)), (40, 180, 99), 20)
+        draw_unicode_text(frame, f"사람 {person_id}", (x, max(y - 28, 20)), (40, 180, 99), 24)
 
 
 def draw_faces(frame, faces):
     for (x, y, w, h) in faces:
         cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
-        draw_unicode_text(frame, "얼굴", (x, max(y - 22, 20)), (255, 200, 0), 18)
+        draw_unicode_text(frame, "얼굴", (x, max(y - 26, 20)), (255, 200, 0), 22)
 
 
 def localize_status(status: str) -> str:
@@ -232,15 +246,7 @@ def draw_speech(frame, result):
 
     transcript = result.transcript.strip() or "-"
     status_text = f"음성 인식: {localize_status(result.status)} | 레벨: {result.audio_level:.3f}"
-    cv2.putText(
-        frame,
-        status_text,
-        (20, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        color,
-        2,
-    )
+    draw_unicode_text(frame, status_text, (20, 42), color, 22)
 
     message = transcript
     if result.error:
@@ -251,7 +257,7 @@ def draw_speech(frame, result):
         message = message[: max_length - 3] + "..."
 
     speech_text = f"인식 내용: {message}"
-    draw_unicode_text(frame, speech_text, (20, 78), color, 22)
+    draw_unicode_text(frame, speech_text, (20, 72), color, 24)
 
 
 def draw_risk(frame, assessment):
@@ -263,14 +269,12 @@ def draw_risk(frame, assessment):
     elif assessment.level == "HIGH":
         color = (0, 70, 255)
 
-    cv2.putText(
+    draw_unicode_text(
         frame,
         f"위험도: {assessment.score}/100 | {localize_risk_level(assessment.level)}",
-        (20, 125),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
+        (20, 108),
         color,
-        2,
+        24,
     )
 
     reason_parts = []
@@ -282,7 +286,42 @@ def draw_risk(frame, assessment):
     if len(message) > 85:
         message = message[:82] + "..."
 
-    draw_unicode_text(frame, message, (20, 138), color, 18)
+    draw_unicode_text(frame, message, (20, 142), color, 20)
+
+
+def draw_fps(frame, fps: float):
+    draw_unicode_text(frame, f"FPS: {fps:.1f}", (20, 174), (200, 200, 200), 20)
+
+
+def draw_counts(frame, people_count: int, face_count: int):
+    draw_unicode_text(
+        frame,
+        f"사람: {people_count} | 얼굴: {face_count}",
+        (20, 10),
+        (0, 255, 255),
+        24,
+    )
+
+
+def box_contains_face(person_box, faces) -> bool:
+    px, py, pw, ph = person_box
+    for fx, fy, fw, fh in faces:
+        face_cx = fx + fw / 2
+        face_cy = fy + fh / 2
+        if px <= face_cx <= px + pw and py <= face_cy <= py + ph:
+            return True
+    return False
+
+
+def filter_people(tracked_people, faces):
+    filtered = []
+    for person in tracked_people:
+        stationary_frames = person.get("stationary_frames", 0)
+        has_face = box_contains_face(person["bbox"], faces)
+        if stationary_frames >= 15 and not has_face:
+            continue
+        filtered.append(person)
+    return filtered
 
 
 def main() -> None:
@@ -327,27 +366,34 @@ def main() -> None:
         raise RuntimeError(build_open_error(args.source))
 
     window_name = "detectWarning - 사람 및 얼굴 감지"
+    frame_index = 0
+    tracked_people = []
+    last_frame_time = perf_counter()
+    smoothed_fps = 0.0
 
     while True:
         ok, frame = capture.read()
         if not ok:
             break
+        frame_index += 1
+        now = perf_counter()
+        instant_fps = 1.0 / max(now - last_frame_time, 1e-6)
+        last_frame_time = now
+        if smoothed_fps == 0.0:
+            smoothed_fps = instant_fps
+        else:
+            smoothed_fps = smoothed_fps * 0.9 + instant_fps * 0.1
 
-        people = person_detector.detect(frame)
-        tracked_people = tracker.update(people)
+        if frame_index % max(args.person_detect_interval, 1) == 0:
+            people = person_detector.detect(frame)
+            tracked_people = tracker.update(people)
         faces = face_detector.detect(frame)
-        draw_people(frame, tracked_people)
         draw_faces(frame, faces)
+        visible_people = filter_people(tracked_people, faces)
+        draw_people(frame, visible_people)
 
-        cv2.putText(
-            frame,
-            f"사람: {len(tracked_people)} | 얼굴: {len(faces)}",
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2,
-        )
+        draw_counts(frame, len(visible_people), len(faces))
+        draw_fps(frame, smoothed_fps)
         if speech_listener is not None:
             speech_result = speech_listener.get_result()
             draw_speech(frame, speech_result)
@@ -359,7 +405,7 @@ def main() -> None:
 
         risk_assessment = risk_analyzer.update(
             speech_result,
-            people_count=len(tracked_people),
+            tracked_people=visible_people,
             face_count=len(faces),
         )
         draw_risk(frame, risk_assessment)

@@ -2,9 +2,15 @@ from math import hypot
 
 
 class PersonTracker:
-    def __init__(self, max_distance: float = 90.0, max_missing: int = 12) -> None:
+    def __init__(
+        self,
+        max_distance: float = 90.0,
+        max_missing: int = 12,
+        stationary_distance: float = 12.0,
+    ) -> None:
         self.max_distance = max_distance
         self.max_missing = max_missing
+        self.stationary_distance = stationary_distance
         self.next_id = 1
         self.tracks = {}
 
@@ -22,11 +28,26 @@ class PersonTracker:
             if track_id is None:
                 track_id = self.next_id
                 self.next_id += 1
+                stationary_frames = 0
+                movement = 0.0
+            else:
+                previous_centroid = self.tracks[track_id]["centroid"]
+                movement = hypot(
+                    centroid[0] - previous_centroid[0],
+                    centroid[1] - previous_centroid[1],
+                )
+                stationary_frames = (
+                    self.tracks[track_id].get("stationary_frames", 0) + 1
+                    if movement < self.stationary_distance
+                    else 0
+                )
 
             self.tracks[track_id] = {
                 "bbox": detection,
                 "centroid": centroid,
                 "missing": 0,
+                "stationary_frames": stationary_frames,
+                "movement": movement,
             }
             updated_ids.add(track_id)
 
@@ -38,7 +59,15 @@ class PersonTracker:
 
         results = []
         for track_id in sorted(updated_ids):
-            results.append((track_id, self.tracks[track_id]["bbox"]))
+            track = self.tracks[track_id]
+            results.append(
+                {
+                    "id": track_id,
+                    "bbox": track["bbox"],
+                    "stationary_frames": track.get("stationary_frames", 0),
+                    "movement": track.get("movement", 0.0),
+                }
+            )
         return results
 
     def _find_best_match(self, centroid, updated_ids):

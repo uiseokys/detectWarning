@@ -11,7 +11,7 @@ class PersonDetector:
         min_neighbors: int = 5,
         score_threshold: float = 0.25,
         nms_threshold: float = 0.45,
-        resize_width: int = 960,
+        resize_width: int = 640,
     ) -> None:
         self.scale = scale
         self.min_neighbors = min_neighbors
