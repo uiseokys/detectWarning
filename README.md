@@ -1,8 +1,8 @@
 # detectWarning
 
-Start with person and face detection before adding risk analysis.
+위험도 분석을 붙이기 전에, 먼저 사람과 얼굴 감지를 기반으로 시작하는 프로젝트입니다.
 
-## Setup
+## 설치
 
 ```bash
 python3 -m venv .venv
@@ -10,66 +10,66 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run
+## 실행
 
-Use the webcam:
+웹캠 사용:
 
 ```bash
 python3 app/main.py --source 0
 ```
 
-Enable microphone speech-to-text while the video is running:
+영상과 함께 마이크 음성 인식(STT) 사용:
 
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR
 ```
 
-Use the recommended balance for warning detection:
+경고 감지용 권장 균형 설정:
 
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model base --stt-phrase-seconds 1.8 --stt-beam-size 1
 ```
 
-Use a larger Whisper model for better accuracy:
+정확도를 더 높이고 싶을 때:
 
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model small --stt-phrase-seconds 2.8 --stt-beam-size 4 --stt-best-of 4
 ```
 
-Use low-latency STT for alert-style detection:
+지연을 더 줄이고 싶을 때:
 
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model tiny --stt-phrase-seconds 1.5 --stt-beam-size 1
 ```
 
-Use a local video file:
+로컬 영상 파일 사용:
 
 ```bash
 python3 app/main.py --source /path/to/video.mp4
 ```
 
-Quit with `q` or `Esc`.
+종료는 `q` 또는 `Esc` 키로 할 수 있습니다.
 
-The app draws:
+화면에는 다음 정보가 표시됩니다:
 
-- Green boxes for detected people with tracking IDs like `Person 1`
-- Blue boxes for detected faces
-- STT status and the most recent recognized speech from the microphone
-- A live risk score that combines recent speech keywords, audio intensity, and visible people or faces
+- 감지된 사람을 `Person 1` 같은 추적 ID와 함께 초록색 박스로 표시
+- 감지된 얼굴을 파란색 박스로 표시
+- 마이크에서 인식한 STT 상태와 최근 음성 인식 결과 표시
+- 최근 음성 키워드, 오디오 크기, 사람/얼굴 감지 결과를 합친 실시간 위험 점수 표시
 
-## Risk Score
+## 위험 점수
 
-- The risk score is a heuristic 0-100 value, not a safety-certified classifier.
-- It becomes more sensitive when emergency phrases like `살려줘`, `도와줘`, `하지마`, or `불이야` are recognized.
-- Loud audio and visible people or faces increase the score further to make warning behavior more immediate.
+- 위험 점수는 0~100 범위의 휴리스틱 값이며, 안전 인증을 받은 분류기는 아닙니다.
+- `살려줘`, `도와줘`, `하지마`, `불이야` 같은 긴급 표현이 인식되면 더 민감하게 반응합니다.
+- 큰 소리와 사람/얼굴 감지가 함께 나타나면 점수가 더 올라가도록 설계되어 있습니다.
 
-## Notes
+## 참고 사항
 
-- STT uses the microphone even when the video source is a local file.
-- Install the new speech dependencies with `pip install -r requirements.txt`.
-- STT now uses local Whisper inference through `faster-whisper`.
-- The first model load may download Whisper weights, so internet access can be required once during setup.
-- The default STT settings now aim for a warning-detection balance: `base` model with a short phrase window and fast decoding.
-- Larger models like `small` or `medium` are usually more accurate, but they need more CPU or GPU resources.
-- `tiny` is faster, but `base` is usually a better balance when you still want usable Korean recognition quality.
-- On macOS, STT runs in a separate process to avoid FFmpeg library conflicts between OpenCV and Whisper dependencies.
+- 영상 입력이 로컬 파일이어도 STT는 마이크를 사용합니다.
+- 새로운 음성 인식 의존성은 `pip install -r requirements.txt`로 설치할 수 있습니다.
+- STT는 현재 `faster-whisper`를 사용한 로컬 Whisper 추론으로 동작합니다.
+- 처음 모델을 로드할 때는 Whisper 가중치 다운로드가 필요할 수 있어, 최초 1회는 인터넷 연결이 필요할 수 있습니다.
+- 기본 STT 설정은 경고 감지에 맞춘 균형형 설정입니다. `base` 모델과 짧은 구간, 빠른 디코딩을 사용합니다.
+- `small`, `medium` 같은 더 큰 모델은 보통 더 정확하지만, CPU/GPU 자원을 더 많이 사용합니다.
+- `tiny`는 더 빠르지만, 한국어 인식 품질까지 고려하면 보통 `base`가 더 좋은 균형점입니다.
+- macOS에서는 OpenCV와 Whisper 의존성 간 FFmpeg 충돌을 피하기 위해 STT를 별도 프로세스로 실행합니다.
