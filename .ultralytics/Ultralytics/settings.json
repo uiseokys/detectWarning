@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "/Users/jung-uiseok/Desktop/detectWarning/datasets",
+  "weights_dir": "/Users/jung-uiseok/Desktop/detectWarning/weights",
+  "runs_dir": "/Users/jung-uiseok/Desktop/detectWarning/runs",
+  "uuid": "af0420a388ed813ae00c3c7e64d84199d14d89a7f242e98a4e95fd815fb9e41f",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

@@ -1,36 +1,61 @@
+import os
+from pathlib import Path
+
 import cv2
 
 
 class PersonDetector:
-    def __init__(self, scale: float = 1.05, min_neighbors: int = 5) -> None:
+    def __init__(
+        self,
+        scale: float = 1.03,
+        min_neighbors: int = 5,
+        score_threshold: float = 0.25,
+        nms_threshold: float = 0.45,
+        resize_width: int = 960,
+    ) -> None:
         self.scale = scale
         self.min_neighbors = min_neighbors
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.score_threshold = score_threshold
+        self.nms_threshold = nms_threshold
+        self.resize_width = resize_width
+        config_dir = Path(__file__).resolve().parent.parent / ".ultralytics"
+        config_dir.mkdir(exist_ok=True)
+        os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir))
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import Ultralytics YOLO. Install dependencies with "
+                "`pip install -r requirements.txt`."
+            ) from exc
+
+        self.model = YOLO("yolo26n.pt")
 
     def detect(self, frame):
-        resized = cv2.resize(frame, (640, 360))
-        boxes, _weights = self.hog.detectMultiScale(
-            resized,
-            winStride=(8, 8),
-            padding=(8, 8),
-            scale=self.scale,
-            useMeanshiftGrouping=False,
+        results = self.model.predict(
+            source=frame,
+            classes=[0],
+            conf=self.score_threshold,
+            imgsz=self.resize_width,
+            verbose=False,
         )
+        if not results:
+            return []
 
-        scale_x = frame.shape[1] / resized.shape[1]
-        scale_y = frame.shape[0] / resized.shape[0]
+        boxes = results[0].boxes
+        if boxes is None or boxes.xyxy is None:
+            return []
 
         people = []
-        for (x, y, w, h) in boxes:
-            people.append(
-                (
-                    int(x * scale_x),
-                    int(y * scale_y),
-                    int(w * scale_x),
-                    int(h * scale_y),
-                )
-            )
+        for xyxy in boxes.xyxy.cpu().tolist():
+            x1, y1, x2, y2 = [int(value) for value in xyxy]
+            x = max(x1, 0)
+            y = max(y1, 0)
+            w = max(x2 - x1, 0)
+            h = max(y2 - y1, 0)
+            if w == 0 or h == 0:
+                continue
+            people.append((x, y, w, h))
         return people
 
 

@@ -30,6 +30,18 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR
 python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model base --stt-phrase-seconds 1.8 --stt-beam-size 1
 ```
 
+사람 감지를 좀 더 민감하게 하고 싶을 때:
+
+```bash
+python3 app/main.py --source 0 --person-score-threshold 0.1 --person-nms-threshold 0.4
+```
+
+최신 YOLO 사람 감지를 더 크게 돌리고 싶을 때:
+
+```bash
+python3 app/main.py --source 0 --person-imgsz 1280 --person-score-threshold 0.2
+```
+
 정확도를 더 높이고 싶을 때:
 
 ```bash
@@ -68,8 +80,11 @@ python3 app/main.py --source /path/to/video.mp4
 - 영상 입력이 로컬 파일이어도 STT는 마이크를 사용합니다.
 - 새로운 음성 인식 의존성은 `pip install -r requirements.txt`로 설치할 수 있습니다.
 - STT는 현재 `faster-whisper`를 사용한 로컬 Whisper 추론으로 동작합니다.
+- 사람 감지는 현재 Ultralytics `YOLO26n` 모델을 사용합니다.
 - 처음 모델을 로드할 때는 Whisper 가중치 다운로드가 필요할 수 있어, 최초 1회는 인터넷 연결이 필요할 수 있습니다.
+- 처음 사람 감지를 실행할 때도 YOLO26 가중치 다운로드가 필요할 수 있습니다.
 - 기본 STT 설정은 경고 감지에 맞춘 균형형 설정입니다. `base` 모델과 짧은 구간, 빠른 디코딩을 사용합니다.
 - `small`, `medium` 같은 더 큰 모델은 보통 더 정확하지만, CPU/GPU 자원을 더 많이 사용합니다.
 - `tiny`는 더 빠르지만, 한국어 인식 품질까지 고려하면 보통 `base`가 더 좋은 균형점입니다.
 - macOS에서는 OpenCV와 Whisper 의존성 간 FFmpeg 충돌을 피하기 위해 STT를 별도 프로세스로 실행합니다.
+- 사람 감지가 느리면 `--person-imgsz` 값을 낮추고, 더 정확하게 보고 싶으면 값을 높여볼 수 있습니다.

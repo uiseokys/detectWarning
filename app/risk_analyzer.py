@@ -23,9 +23,9 @@ class RiskAnalyzer:
         self._keyword_window_seconds = 4.0
         self._audio_window_seconds = 2.0
         self._patterns = [
-            (("살려줘", "살려 줘", "사려줘", "살려조", "살려죠"), 75, "emergency-help"),
-            (("도와줘", "도와 줘", "도와주세요", "도와줘요"), 60, "help-request"),
-            (("하지마", "하지 마", "하지마라", "그만해", "그만 해"), 58, "stop-command"),
+            (("살려줘", "살려 줘", "사려줘", "살려조", "살려죠"), 75, "긴급 도움 요청"),
+            (("도와줘", "도와 줘", "도와주세요", "도와줘요"), 60, "도움 요청"),
+            (("하지마", "하지 마", "하지마라", "그만해", "그만 해"), 58, "제지 표현"),
             (
                 (
                     "왜이러세요",
@@ -37,7 +37,7 @@ class RiskAnalyzer:
                     "왜그러시는거예요",
                 ),
                 52,
-                "boundary-violation",
+                "침해 의심 표현",
             ),
             (
                 (
@@ -53,7 +53,7 @@ class RiskAnalyzer:
                     "저리 가세요",
                 ),
                 55,
-                "rejection-command",
+                "거부 표현",
             ),
             (
                 (
@@ -68,11 +68,11 @@ class RiskAnalyzer:
                     "그만하시죠",
                 ),
                 42,
-                "resistance",
+                "저항 표현",
             ),
-            (("불이야", "불이야!", "불났", "불 났", "화재야"), 70, "fire-alert"),
-            (("경찰", "신고해", "신고 해", "119", "112"), 45, "report-request"),
-            (("아파", "죽겠", "죽을 것 같", "무서워"), 35, "distress"),
+            (("불이야", "불이야!", "불났", "불 났", "화재야"), 70, "화재 경고"),
+            (("경찰", "신고해", "신고 해", "119", "112"), 45, "신고 요청"),
+            (("아파", "죽겠", "죽을 것 같", "무서워"), 35, "고통/불안"),
         ]
 
     def update(self, speech_result, people_count: int, face_count: int) -> RiskAssessment:
@@ -107,29 +107,29 @@ class RiskAnalyzer:
         audio_score = self._score_audio(recent_audio_level)
         if audio_score > 0:
             score += audio_score
-            reasons.append(f"audio:{recent_audio_level:.2f}")
+            reasons.append(f"큰 소리:{recent_audio_level:.2f}")
 
         visual_score = 0
         if people_count > 0:
             visual_score += 6
-            reasons.append(f"people:{people_count}")
+            reasons.append(f"사람:{people_count}")
         if face_count > 0:
             visual_score += 4
-            reasons.append(f"faces:{face_count}")
+            reasons.append(f"얼굴:{face_count}")
         score += visual_score
 
         if matched_keywords and people_count > 0:
             score += 10
-            reasons.append("keyword+person")
+            reasons.append("키워드+사람")
         if matched_keywords and recent_audio_level >= 0.10:
             score += 10
-            reasons.append("keyword+loud")
+            reasons.append("키워드+큰 소리")
         if not matched_keywords and recent_audio_level >= 0.18 and people_count > 0:
             score += 12
-            reasons.append("loud-near-people")
+            reasons.append("큰 소리+사람")
         if matched_keywords and face_count > 0:
             score += 5
-            reasons.append("keyword+face")
+            reasons.append("키워드+얼굴")
 
         score = min(int(round(score)), 100)
         level = self._score_to_level(score)
