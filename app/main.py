@@ -1,10 +1,42 @@
 import argparse
+import sys
+from pathlib import Path
 
 import cv2
+import numpy as np
 
-from audio_detector import SpeechToTextListener
+from audio_detector import SpeechResult, SpeechToTextListener, list_input_devices
 from detector import FaceDetector, PersonDetector
+from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
+
+FONT_CANDIDATES = [
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+    Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
+    Path("/System/Library/Fonts/Supplemental/NotoSansGothic-Regular.ttf"),
+]
+
+
+def load_overlay_font(size: int):
+    if ImageFont is None:
+        return None
+
+    for path in FONT_CANDIDATES:
+        if path.exists():
+            try:
+                return ImageFont.truetype(str(path), size=size)
+            except Exception:
+                continue
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stt-phrase-seconds",
         type=float,
-        default=3.0,
+        default=1.8,
         help="How many seconds of audio to capture before each recognition request.",
     )
     parser.add_argument(
@@ -51,6 +83,35 @@ def parse_args() -> argparse.Namespace:
         "--stt-compute-type",
         default="int8",
         help="Whisper compute type, for example int8, int16, or float16.",
+    )
+    parser.add_argument(
+        "--stt-beam-size",
+        type=int,
+        default=1,
+        help="Higher values can improve accuracy, but add latency.",
+    )
+    parser.add_argument(
+        "--stt-best-of",
+        type=int,
+        default=1,
+        help="Sampling candidates for better recognition quality.",
+    )
+    parser.add_argument(
+        "--stt-no-speech-threshold",
+        type=float,
+        default=0.6,
+        help="Lower values treat more audio as speech.",
+    )
+    parser.add_argument(
+        "--stt-device",
+        type=int,
+        default=None,
+        help="Input audio device index. Use --list-audio-devices to find it.",
+    )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="Print available input audio devices and exit.",
     )
     return parser.parse_args()
 
@@ -118,9 +179,11 @@ def draw_speech(frame, result):
         color = (0, 90, 255)
     elif result.status == "recognized":
         color = (80, 220, 120)
+    elif result.status == "processing":
+        color = (255, 220, 80)
 
     transcript = result.transcript.strip() or "-"
-    status_text = f"STT: {result.status}"
+    status_text = f"STT: {result.status} | Level: {result.audio_level:.3f}"
     cv2.putText(
         frame,
         status_text,
@@ -139,12 +202,61 @@ def draw_speech(frame, result):
     if len(message) > max_length:
         message = message[: max_length - 3] + "..."
 
+    speech_text = f"Speech: {message}"
+    font = load_overlay_font(22)
+    if font is None or Image is None or ImageDraw is None:
+        cv2.putText(
+            frame,
+            speech_text,
+            (20, 95),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
+        return
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb_frame)
+    draw = ImageDraw.Draw(image)
+    draw.text((20, 78), speech_text, font=font, fill=(color[2], color[1], color[0]))
+    frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+
+def draw_risk(frame, assessment):
+    color = (90, 200, 90)
+    if assessment.level == "ELEVATED":
+        color = (0, 215, 255)
+    elif assessment.level == "MEDIUM":
+        color = (0, 140, 255)
+    elif assessment.level == "HIGH":
+        color = (0, 70, 255)
+
     cv2.putText(
         frame,
-        f"Speech: {message}",
-        (20, 95),
+        f"Risk: {assessment.score}/100 | {assessment.level}",
+        (20, 125),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
+        0.7,
+        color,
+        2,
+    )
+
+    reason_parts = []
+    if assessment.matched_keywords:
+        reason_parts.append("keywords=" + ",".join(assessment.matched_keywords))
+    if assessment.reasons:
+        reason_parts.append("signals=" + ", ".join(assessment.reasons))
+    message = " | ".join(reason_parts) if reason_parts else "signals=none"
+    if len(message) > 85:
+        message = message[:82] + "..."
+
+    cv2.putText(
+        frame,
+        message,
+        (20, 152),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
         color,
         2,
     )
@@ -152,9 +264,19 @@ def draw_speech(frame, result):
 
 def main() -> None:
     args = parse_args()
+    if args.list_audio_devices:
+        devices = list_input_devices()
+        if not devices:
+            print("No input audio devices found.")
+        else:
+            for index, name, channels, sample_rate in devices:
+                print(f"{index}: {name} | input_channels={channels} | default_sr={sample_rate:.0f}")
+        sys.exit(0)
+
     person_detector = PersonDetector(scale=args.scale, min_neighbors=args.min_neighbors)
     face_detector = FaceDetector()
     tracker = PersonTracker()
+    risk_analyzer = RiskAnalyzer()
     speech_listener = None
     if args.stt:
         speech_listener = SpeechToTextListener(
@@ -162,6 +284,10 @@ def main() -> None:
             phrase_time_limit=args.stt_phrase_seconds,
             model_size=args.stt_model,
             compute_type=args.stt_compute_type,
+            input_device=args.stt_device,
+            beam_size=args.stt_beam_size,
+            best_of=args.stt_best_of,
+            no_speech_threshold=args.stt_no_speech_threshold,
         )
         speech_listener.start()
     capture = open_source(args.source)
@@ -194,7 +320,20 @@ def main() -> None:
             2,
         )
         if speech_listener is not None:
-            draw_speech(frame, speech_listener.get_result())
+            speech_result = speech_listener.get_result()
+            draw_speech(frame, speech_result)
+        else:
+            speech_result = None
+
+        if speech_result is None:
+            speech_result = SpeechResult(status="idle")
+
+        risk_assessment = risk_analyzer.update(
+            speech_result,
+            people_count=len(tracked_people),
+            face_count=len(faces),
+        )
+        draw_risk(frame, risk_assessment)
 
         cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
