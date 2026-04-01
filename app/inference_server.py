@@ -11,6 +11,7 @@ import wave
 import cv2
 import numpy as np
 import uvicorn
+from fastapi import Body
 from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -471,19 +472,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 </html>"""
 
     @app.get("/health")
-    async def health() -> dict:
+    def health() -> dict:
         return {"status": "ok", "sessions": len(sessions)}
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard() -> str:
+    def dashboard() -> str:
         return render_dashboard()
 
     @app.get("/api/clients")
-    async def api_clients() -> list[dict]:
+    def api_clients() -> list[dict]:
         return list_client_summaries()
 
     @app.get("/api/client/{client_id}")
-    async def api_client(client_id: str) -> dict:
+    def api_client(client_id: str) -> dict:
         with session_lock:
             session = sessions.get(client_id)
             if session is None:
@@ -507,18 +508,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             }
 
     @app.post("/analyze/audio")
-    async def analyze_audio(
-        request: Request,
+    def analyze_audio(
+        audio_bytes: bytes = Body(..., media_type="audio/wav"),
         client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
     ) -> dict:
         started_at = perf_counter()
-        wav_bytes = await request.body()
-        if not wav_bytes:
+        if not audio_bytes:
             raise HTTPException(status_code=400, detail="빈 오디오 요청입니다.")
 
         session = get_session(client_id)
         try:
-            transcript, audio_level = speech_recognizer.transcribe_wav_bytes(wav_bytes)
+            transcript, audio_level = speech_recognizer.transcribe_wav_bytes(audio_bytes)
             speech_status = "recognized" if transcript else "listening"
         except Exception as exc:
             transcript = ""
@@ -548,12 +548,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         }
 
     @app.post("/analyze/frame")
-    async def analyze_frame(
-        request: Request,
+    def analyze_frame(
+        image_bytes: bytes = Body(..., media_type="image/jpeg"),
         client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
     ) -> dict:
         started_at = perf_counter()
-        image_bytes = await request.body()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="빈 이미지 요청입니다.")
 

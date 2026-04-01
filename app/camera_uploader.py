@@ -70,9 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url", required=True, help="원격 추론 서버 주소. 예: http://100.x.x.x:8000")
     parser.add_argument("--client-id", default="", help="클라이언트 식별자. 비우면 자동 생성")
     parser.add_argument("--jpeg-quality", type=int, default=70, help="전송용 JPEG 품질")
-    parser.add_argument("--max-fps", type=float, default=6.0, help="최대 전송 FPS")
+    parser.add_argument("--max-fps", type=float, default=3.0, help="최대 전송 FPS")
     parser.add_argument("--show-local-preview", action="store_true", help="노트북에서도 카메라 미리보기를 표시")
-    parser.add_argument("--timeout-seconds", type=float, default=3.0, help="서버 요청 제한 시간")
+    parser.add_argument("--timeout-seconds", type=float, default=10.0, help="서버 요청 제한 시간")
     parser.add_argument("--stt", action="store_true", help="맥북 마이크 오디오를 서버로 보내 STT를 함께 수행합니다.")
     parser.add_argument("--stt-device", type=int, default=None, help="입력 오디오 장치 번호")
     parser.add_argument("--select-audio-device", action="store_true", help="실행 전에 마이크 장치를 직접 선택합니다.")
@@ -251,7 +251,10 @@ class AudioStreamer:
             )
             response.raise_for_status()
         except Exception as exc:
-            print(f"\n오디오 전송 실패: {exc}")
+            print(
+                "\n오디오 전송 실패: "
+                f"{exc} | 서버 STT가 느리거나 현재 요청이 밀린 상태일 수 있습니다."
+            )
 
 
 def main() -> None:
@@ -352,7 +355,12 @@ def main() -> None:
                 flush=True,
             )
         except Exception as exc:
-            print(f"\r전송 실패: {exc}", end="", flush=True)
+            print(
+                "\r전송 실패: "
+                f"{exc} | 서버 YOLO/STT 처리 시간이 타임아웃보다 길 수 있습니다.",
+                end="",
+                flush=True,
+            )
 
         last_sent_at = now
 
