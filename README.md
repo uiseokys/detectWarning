@@ -43,6 +43,12 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR
 python3 app/inference_server.py --host 0.0.0.0 --port 8000
 ```
 
+데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
+
+```bash
+python3 app/inference_server.py --host 0.0.0.0 --port 8000 --show-windows
+```
+
 팀원 노트북 실행:
 
 ```bash
@@ -50,6 +56,18 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://10
 ```
 
 `100.x.x.x`는 Tailscale로 연결된 데스크탑의 IP 주소입니다.
+
+노트북 실행 전에 마이크를 직접 고르고 싶다면:
+
+```bash
+python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000 --select-audio-device
+```
+
+장치 목록만 먼저 보고 싶다면:
+
+```bash
+python3 app/main.py --list-audio-devices
+```
 
 경고 감지용 권장 균형 설정:
 
@@ -198,6 +216,7 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   카메라 입력, STT, 위험도 계산, UI 표시, 로그 저장
 - 데스크탑 서버:
   사람 감지, 얼굴 감지, 사람 추적
+- 선택적으로 데스크탑 OpenCV 창에서 팀원별 분석 화면 표시
 - 통신 방식:
   노트북이 JPEG 프레임을 HTTP로 전송하고, 서버가 사람/얼굴 결과 JSON을 반환
 
@@ -211,6 +230,8 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   서버 응답 대기 시간
 - `--server-jpeg-quality`
   전송용 JPEG 품질. 낮출수록 빠르지만 화질이 떨어짐
+- `--select-audio-device`
+  실행 직전에 사용할 마이크 장치를 직접 선택
 
 서버 쪽 주요 옵션:
 
@@ -224,6 +245,8 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   서버 YOLO 입력 크기
 - `--client-session-ttl`
   팀원별 추적 상태 유지 시간
+- `--show-windows`
+  데스크탑에서 수신 영상과 검출 결과를 OpenCV 창으로 직접 표시
 
 ## 오탐 감소 로직
 

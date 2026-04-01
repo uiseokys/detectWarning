@@ -176,6 +176,11 @@ def parse_args() -> argparse.Namespace:
         help="사용 가능한 입력 오디오 장치를 출력하고 종료합니다.",
     )
     parser.add_argument(
+        "--select-audio-device",
+        action="store_true",
+        help="실행 전에 입력 오디오 장치를 직접 선택합니다.",
+    )
+    parser.add_argument(
         "--warning-log-path",
         default="logs/warnings.jsonl",
         help="위험 이벤트 로그를 저장할 JSONL 파일 경로.",
@@ -390,6 +395,32 @@ def main() -> None:
             for index, name, channels, sample_rate in devices:
                 print(f"{index}: {name} | 입력채널={channels} | 기본샘플레이트={sample_rate:.0f}")
         sys.exit(0)
+
+    if args.select_audio_device:
+        devices = list_input_devices()
+        if not devices:
+            print("사용 가능한 입력 오디오 장치를 찾지 못했습니다.")
+            sys.exit(1)
+
+        print("사용 가능한 입력 오디오 장치:")
+        for index, name, channels, sample_rate in devices:
+            print(f"{index}: {name} | 입력채널={channels} | 기본샘플레이트={sample_rate:.0f}")
+
+        while True:
+            selected = input("사용할 마이크 장치 번호를 입력하세요: ").strip()
+            if not selected:
+                print("장치 번호를 입력해 주세요.")
+                continue
+            if not selected.isdigit():
+                print("숫자 장치 번호를 입력해 주세요.")
+                continue
+            selected_index = int(selected)
+            if not any(device_index == selected_index for device_index, *_rest in devices):
+                print("목록에 있는 장치 번호를 입력해 주세요.")
+                continue
+            args.stt_device = selected_index
+            print(f"선택된 마이크 장치: {selected_index}")
+            break
 
     remote_client = None
     if args.server_url.strip():

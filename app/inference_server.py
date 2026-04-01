@@ -20,6 +20,53 @@ class ClientSession:
     last_seen: float
 
 
+def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms: float) -> None:
+    for person in tracked_people:
+        x, y, w, h = person["bbox"]
+        person_id = person["id"]
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 2)
+        cv2.putText(
+            frame,
+            f"Person {person_id}",
+            (x, max(y - 10, 24)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (40, 180, 99),
+            2,
+        )
+
+    for x, y, w, h in faces:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
+        cv2.putText(
+            frame,
+            "Face",
+            (x, max(y - 10, 24)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 200, 0),
+            2,
+        )
+
+    cv2.putText(
+        frame,
+        f"client: {client_id}",
+        (20, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"people: {len(tracked_people)} | faces: {len(faces)} | latency: {latency_ms:.1f}ms",
+        (20, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="원격 영상 추론 서버를 실행합니다.")
     parser.add_argument("--host", default="0.0.0.0", help="서버 바인드 주소")
@@ -41,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="클라이언트 추적 상태를 유지할 최대 유휴 시간(초)",
+    )
+    parser.add_argument(
+        "--show-windows",
+        action="store_true",
+        help="수신한 팀원 카메라 프레임을 데스크탑 OpenCV 창에 표시합니다.",
     )
     return parser.parse_args()
 
@@ -98,6 +150,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         tracked_people = session.tracker.update(people)
         faces = face_detector.detect(frame)
         latency_ms = (perf_counter() - started_at) * 1000.0
+        if args.show_windows:
+            annotated = frame.copy()
+            draw_server_overlay(annotated, client_id, tracked_people, faces, latency_ms)
+            cv2.imshow(f"detectWarning server - {client_id}", annotated)
+            cv2.waitKey(1)
         return {
             "client_id": client_id,
             "tracked_people": tracked_people,
