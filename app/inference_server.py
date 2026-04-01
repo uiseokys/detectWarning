@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import threading
 from dataclasses import dataclass
 from time import monotonic, perf_counter
+import wave
 
 import cv2
 import numpy as np
@@ -22,6 +24,56 @@ class ClientSession:
     last_seen: float
     latest_frame_jpeg: bytes | None = None
     latest_meta: dict | None = None
+
+
+class ServerSpeechRecognizer:
+    def __init__(self, model_size: str, compute_type: str, language: str) -> None:
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:
+            raise RuntimeError(
+                "faster-whisper를 불러오지 못했습니다. `pip install -r requirements.txt`를 확인해 주세요."
+            ) from exc
+
+        self.language = normalize_language(language)
+        self.model = WhisperModel(
+            model_size_or_path=model_size,
+            device="auto",
+            compute_type=compute_type,
+        )
+        self._lock = threading.Lock()
+
+    def transcribe_wav_bytes(self, wav_bytes: bytes) -> tuple[str, float]:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            frames = wav_file.readframes(wav_file.getnframes())
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+        if len(audio) == 0:
+            return "", 0.0
+
+        audio_level = float(np.sqrt(np.mean(np.square(audio))))
+        with self._lock:
+            segments, _info = self.model.transcribe(
+                audio,
+                language=self.language,
+                vad_filter=False,
+                beam_size=1,
+                best_of=1,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False,
+                temperature=0.0,
+            )
+        transcript = " ".join(
+            segment.text.strip() for segment in segments if segment.text.strip()
+        ).strip()
+        return transcript, audio_level
+
+
+def normalize_language(language: str) -> str:
+    normalized = language.strip()
+    if "-" in normalized:
+        normalized = normalized.split("-", 1)[0]
+    return normalized.lower() or "ko"
 
 
 def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms: float) -> None:
@@ -98,6 +150,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="수신한 팀원 카메라 프레임을 데스크탑 OpenCV 창에 표시합니다.",
     )
+    parser.add_argument(
+        "--stt-model",
+        default="base",
+        help="서버 STT용 Whisper 모델 크기",
+    )
+    parser.add_argument(
+        "--stt-compute-type",
+        default="int8",
+        help="서버 STT용 Whisper 연산 타입",
+    )
+    parser.add_argument(
+        "--stt-language",
+        default="ko-KR",
+        help="서버 STT 언어 코드. 예: ko-KR",
+    )
     return parser.parse_args()
 
 
@@ -108,6 +175,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         resize_width=args.person_imgsz,
     )
     face_detector = FaceDetector()
+    speech_recognizer = ServerSpeechRecognizer(
+        model_size=args.stt_model,
+        compute_type=args.stt_compute_type,
+        language=args.stt_language,
+    )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
 
@@ -142,6 +214,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "people_count": int(meta.get("people_count", 0)),
                         "face_count": int(meta.get("face_count", 0)),
                         "latency_ms": float(meta.get("latency_ms", 0.0)),
+                        "speech_status": str(meta.get("speech_status", "idle")),
+                        "transcript": str(meta.get("transcript", "")),
                         "has_frame": session.latest_frame_jpeg is not None,
                     }
                 )
@@ -301,7 +375,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <div class="stat" id="faceCount">얼굴: 0</div>
             <div class="stat" id="latency">지연: 0ms</div>
             <div class="stat" id="lastSeen">최근 수신: -</div>
+            <div class="stat" id="speechStatus">음성 인식: 대기</div>
+            <div class="stat" id="audioLevel">오디오 레벨: 0.000</div>
           </div>
+          <div class="stat" id="transcript" style="display:block; border-radius:16px; margin-bottom:16px;">인식 내용: -</div>
           <div class="screen" id="screen">
             <div class="placeholder">클라이언트를 선택하면 분석 화면이 표시됩니다.</div>
           </div>
@@ -336,7 +413,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           <div class="client-title">${client.client_id}</div>
           <div class="client-meta">
             사람 ${client.people_count}명 | 얼굴 ${client.face_count}개<br/>
-            최근 수신 ${client.last_seen_seconds}초 전 | 지연 ${client.latency_ms.toFixed(1)}ms
+            최근 수신 ${client.last_seen_seconds}초 전 | 지연 ${client.latency_ms.toFixed(1)}ms<br/>
+            STT ${client.speech_status} ${client.transcript ? '| ' + client.transcript : ''}
           </div>
         `;
         item.onclick = () => {
@@ -374,6 +452,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       document.getElementById('faceCount').textContent = `얼굴: ${data ? data.face_count : 0}`;
       document.getElementById('latency').textContent = `지연: ${data ? data.latency_ms.toFixed(1) : 0}ms`;
       document.getElementById('lastSeen').textContent = `최근 수신: ${data ? data.last_seen_seconds.toFixed(1) : '-'}초 전`;
+      document.getElementById('speechStatus').textContent = `음성 인식: ${data ? data.speech_status_label : '대기'}`;
+      document.getElementById('audioLevel').textContent = `오디오 레벨: ${data ? data.audio_level.toFixed(3) : '0.000'}`;
+      document.getElementById('transcript').textContent = `인식 내용: ${data && data.transcript ? data.transcript : '-'}`;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const requestedClientId = params.get('client_id');
+    if (requestedClientId) {
+      selectedClientId = requestedClientId;
     }
 
     refreshClients();
@@ -411,9 +498,54 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "people_count": int(meta.get("people_count", 0)),
                 "face_count": int(meta.get("face_count", 0)),
                 "latency_ms": float(meta.get("latency_ms", 0.0)),
+                "speech_status": str(meta.get("speech_status", "idle")),
+                "speech_status_label": localize_speech_status(str(meta.get("speech_status", "idle"))),
+                "transcript": str(meta.get("transcript", "")),
+                "audio_level": float(meta.get("audio_level", 0.0)),
                 "last_seen_seconds": monotonic() - session.last_seen,
                 "frame_data_url": frame_data_url,
             }
+
+    @app.post("/analyze/audio")
+    async def analyze_audio(
+        request: Request,
+        client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
+    ) -> dict:
+        started_at = perf_counter()
+        wav_bytes = await request.body()
+        if not wav_bytes:
+            raise HTTPException(status_code=400, detail="빈 오디오 요청입니다.")
+
+        session = get_session(client_id)
+        try:
+            transcript, audio_level = speech_recognizer.transcribe_wav_bytes(wav_bytes)
+            speech_status = "recognized" if transcript else "listening"
+        except Exception as exc:
+            transcript = ""
+            audio_level = 0.0
+            speech_status = "error"
+            if session.latest_meta is None:
+                session.latest_meta = {}
+            session.latest_meta["speech_error"] = str(exc)
+
+        latency_ms = (perf_counter() - started_at) * 1000.0
+        if session.latest_meta is None:
+            session.latest_meta = {}
+        session.latest_meta.update(
+            {
+                "speech_status": speech_status,
+                "transcript": transcript,
+                "audio_level": round(audio_level, 4),
+                "speech_latency_ms": round(latency_ms, 1),
+            }
+        )
+        return {
+            "client_id": client_id,
+            "speech_status": speech_status,
+            "transcript": transcript,
+            "audio_level": round(audio_level, 4),
+            "latency_ms": round(latency_ms, 1),
+        }
 
     @app.post("/analyze/frame")
     async def analyze_frame(
@@ -440,11 +572,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         success, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if success:
             session.latest_frame_jpeg = encoded.tobytes()
-        session.latest_meta = {
-            "people_count": len(tracked_people),
-            "face_count": len(faces),
-            "latency_ms": round(latency_ms, 1),
-        }
+        if session.latest_meta is None:
+            session.latest_meta = {}
+        session.latest_meta.update(
+            {
+                "people_count": len(tracked_people),
+                "face_count": len(faces),
+                "latency_ms": round(latency_ms, 1),
+            }
+        )
         if args.show_windows:
             cv2.imshow(f"detectWarning server - {client_id}", annotated)
             cv2.waitKey(1)
@@ -456,6 +592,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         }
 
     return app
+
+
+def localize_speech_status(status: str) -> str:
+    labels = {
+        "idle": "대기",
+        "listening": "듣는 중",
+        "recognized": "인식됨",
+        "error": "오류",
+    }
+    return labels.get(status, status)
 
 
 def main() -> None:
