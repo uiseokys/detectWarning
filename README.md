@@ -9,7 +9,9 @@
 - 영상: 사람 감지, 얼굴 감지, 간단한 움직임/추적 분석
 - 음성: Whisper 기반 STT, 음량 분석, 상대 음량 급상승 감지
 - 위험도: 영상 + 음성 + 키워드 + 큰 소리 패턴을 결합한 휴리스틱 점수 계산
+- 이벤트 로그: 위험 점수가 일정 기준 이상이면 JSONL 형태로 저장
 - 표시: 한국어 UI로 사람 수, 얼굴 수, STT 결과, 위험도를 화면에 오버레이
+- 원격 추론: 팀원 노트북 카메라 영상을 데스크탑 서버로 보내 사람/얼굴 분석 가능
 
 ## 설치
 
@@ -32,6 +34,22 @@ python3 app/main.py --source 0
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR
 ```
+
+팀원 노트북 카메라 영상을 데스크탑에서 분석하려면 먼저 데스크탑에서 서버를 실행합니다.
+
+데스크탑 서버 실행:
+
+```bash
+python3 app/inference_server.py --host 0.0.0.0 --port 8000
+```
+
+팀원 노트북 실행:
+
+```bash
+python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000
+```
+
+`100.x.x.x`는 Tailscale로 연결된 데스크탑의 IP 주소입니다.
 
 경고 감지용 권장 균형 설정:
 
@@ -75,6 +93,18 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model tiny --stt
 python3 app/main.py --source /path/to/video.mp4
 ```
 
+위험 이벤트 로그까지 함께 저장:
+
+```bash
+python3 app/main.py --source 0 --stt --stt-language ko-KR --warning-log-path logs/warnings.jsonl --warning-log-min-score 60
+```
+
+원격 추론과 함께 로그도 저장:
+
+```bash
+python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000 --warning-log-path logs/warnings.jsonl
+```
+
 종료는 `q` 또는 `Esc` 키로 할 수 있습니다.
 
 화면 표시 정보
@@ -83,6 +113,7 @@ python3 app/main.py --source /path/to/video.mp4
 - 감지된 얼굴을 파란색 박스로 표시
 - 상단에 `사람: n | 얼굴: n` 표시
 - `음성 인식`, `인식 내용`, `위험도`, `FPS`를 한국어로 표시
+- 원격 추론 사용 시 `원격 추론 | 서버 지연: nms` 상태를 표시
 - 최근 음성 키워드, 오디오 크기, 사람/얼굴 감지 결과를 합친 실시간 위험 점수 표시
 
 ## 위험 점수
@@ -118,6 +149,30 @@ PDF 기준을 반영한 현재 위험 평가 항목:
 - 키워드 + 큰 소리
 - 큰 소리 + 사람
 
+## 위험 이벤트 로그
+
+- 위험 점수가 기본 `60` 이상이면 `logs/warnings.jsonl`에 이벤트를 저장합니다.
+- 같은 이벤트가 짧은 시간에 반복될 때는 중복 로그를 줄이기 위해 쿨다운이 적용됩니다.
+- 저장 형식은 서버 전송을 염두에 둔 JSON Lines(`.jsonl`)입니다.
+
+예시 스키마:
+
+```json
+{
+  "event_id": "evt_20260401_143218_123456",
+  "timestamp": "2026-04-01T14:32:18+09:00",
+  "source": "0",
+  "score": 78,
+  "level": "HIGH",
+  "categories": ["도움 요청", "반복적 고성", "사람:1"],
+  "matched_keywords": ["도와줘"],
+  "transcript": "도와주세요",
+  "people_count": 1,
+  "face_count": 1,
+  "audio_level": 0.1832
+}
+```
+
 ## 참고 사항
 
 - 영상 입력이 로컬 파일이어도 STT는 마이크를 사용합니다.
@@ -132,6 +187,43 @@ PDF 기준을 반영한 현재 위험 평가 항목:
 - macOS에서는 OpenCV와 Whisper 의존성 간 FFmpeg 충돌을 피하기 위해 STT를 별도 프로세스로 실행합니다.
 - 사람 감지가 느리면 `--person-imgsz` 값을 낮추고, 더 정확하게 보고 싶으면 값을 높여볼 수 있습니다.
 - FPS가 부족하면 `--person-detect-interval` 값을 2 또는 3으로 높여 사람 감지를 덜 자주 수행할 수 있습니다.
+- 서버 연동 전 단계로 `logs/warnings.jsonl` 파일을 그대로 읽어 전송 계층에 연결할 수 있습니다.
+- `--server-url`을 주면 노트북은 로컬 YOLO/얼굴 추론을 하지 않고 JPEG 프레임만 서버로 전송합니다.
+- 원격 추론 서버는 `client_id`별로 사람 추적 상태를 따로 유지합니다.
+- 팀 프로젝트에서는 Tailscale로 데스크탑과 팀원 노트북을 같은 tailnet에 연결하는 방식을 권장합니다.
+
+## 원격 추론 구조
+
+- 팀원 노트북:
+  카메라 입력, STT, 위험도 계산, UI 표시, 로그 저장
+- 데스크탑 서버:
+  사람 감지, 얼굴 감지, 사람 추적
+- 통신 방식:
+  노트북이 JPEG 프레임을 HTTP로 전송하고, 서버가 사람/얼굴 결과 JSON을 반환
+
+노트북 쪽 주요 옵션:
+
+- `--server-url`
+  원격 추론 서버 주소
+- `--server-client-id`
+  팀원별 고유 식별자. 비우면 자동 생성
+- `--server-timeout-seconds`
+  서버 응답 대기 시간
+- `--server-jpeg-quality`
+  전송용 JPEG 품질. 낮출수록 빠르지만 화질이 떨어짐
+
+서버 쪽 주요 옵션:
+
+- `--host`
+  바인드 주소. 팀원 접속을 받으려면 보통 `0.0.0.0`
+- `--port`
+  서버 포트
+- `--person-score-threshold`
+  서버 사람 감지 민감도
+- `--person-imgsz`
+  서버 YOLO 입력 크기
+- `--client-session-ttl`
+  팀원별 추적 상태 유지 시간
 
 ## 오탐 감소 로직
 

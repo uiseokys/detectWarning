@@ -1,13 +1,17 @@
 import argparse
 import sys
 from time import perf_counter
+from time import monotonic
 from pathlib import Path
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from audio_detector import SpeechResult, SpeechToTextListener, list_input_devices
 from detector import FaceDetector, PersonDetector
+from event_logger import WarningEventLogger
+from remote_inference import RemoteInferenceClient
 from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
 
@@ -26,6 +30,13 @@ FONT_CANDIDATES = [
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 ]
 FONT_CACHE = {}
+
+
+@dataclass
+class ServerStatus:
+    mode: str = "로컬 추론"
+    latency_ms: float = 0.0
+    error: str | None = None
 
 
 def load_overlay_font(size: int):
@@ -164,6 +175,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="사용 가능한 입력 오디오 장치를 출력하고 종료합니다.",
     )
+    parser.add_argument(
+        "--warning-log-path",
+        default="logs/warnings.jsonl",
+        help="위험 이벤트 로그를 저장할 JSONL 파일 경로.",
+    )
+    parser.add_argument(
+        "--warning-log-min-score",
+        type=int,
+        default=60,
+        help="이 점수 이상일 때만 위험 이벤트 로그를 저장합니다.",
+    )
+    parser.add_argument(
+        "--server-url",
+        default="",
+        help="비어 있지 않으면 사람/얼굴 영상 추론을 원격 서버로 보냅니다. 예: http://100.x.x.x:8000",
+    )
+    parser.add_argument(
+        "--server-client-id",
+        default="",
+        help="원격 추론 서버에서 팀원별 추적 상태를 구분할 ID입니다. 비우면 자동 생성합니다.",
+    )
+    parser.add_argument(
+        "--server-timeout-seconds",
+        type=float,
+        default=3.0,
+        help="원격 추론 서버 요청 제한 시간(초).",
+    )
+    parser.add_argument(
+        "--server-jpeg-quality",
+        type=int,
+        default=80,
+        help="원격 전송용 JPEG 품질. 낮을수록 빠르지만 화질이 떨어집니다.",
+    )
     return parser.parse_args()
 
 
@@ -293,6 +337,18 @@ def draw_fps(frame, fps: float):
     draw_unicode_text(frame, f"FPS: {fps:.1f}", (20, 174), (200, 200, 200), 20)
 
 
+def draw_server_status(frame, status: ServerStatus):
+    color = (120, 210, 120)
+    if status.error:
+        color = (0, 90, 255)
+    text = status.mode
+    if status.latency_ms > 0:
+        text += f" | 서버 지연: {status.latency_ms:.0f}ms"
+    if status.error:
+        text += " | 연결 문제"
+    draw_unicode_text(frame, text, (20, 198), color, 20)
+
+
 def draw_counts(frame, people_count: int, face_count: int):
     draw_unicode_text(
         frame,
@@ -335,16 +391,33 @@ def main() -> None:
                 print(f"{index}: {name} | 입력채널={channels} | 기본샘플레이트={sample_rate:.0f}")
         sys.exit(0)
 
-    person_detector = PersonDetector(
-        scale=args.scale,
-        min_neighbors=args.min_neighbors,
-        score_threshold=args.person_score_threshold,
-        nms_threshold=args.person_nms_threshold,
-        resize_width=args.person_imgsz,
-    )
-    face_detector = FaceDetector()
-    tracker = PersonTracker()
+    remote_client = None
+    if args.server_url.strip():
+        remote_client = RemoteInferenceClient(
+            server_url=args.server_url.strip(),
+            client_id=args.server_client_id.strip() or None,
+            timeout_seconds=args.server_timeout_seconds,
+            jpeg_quality=args.server_jpeg_quality,
+        )
+        person_detector = None
+        face_detector = None
+        tracker = None
+    else:
+        person_detector = PersonDetector(
+            scale=args.scale,
+            min_neighbors=args.min_neighbors,
+            score_threshold=args.person_score_threshold,
+            nms_threshold=args.person_nms_threshold,
+            resize_width=args.person_imgsz,
+        )
+        face_detector = FaceDetector()
+        tracker = PersonTracker()
+
     risk_analyzer = RiskAnalyzer()
+    event_logger = WarningEventLogger(
+        log_path=Path(args.warning_log_path),
+        min_score=args.warning_log_min_score,
+    )
     speech_listener = None
     if args.stt:
         speech_listener = SpeechToTextListener(
@@ -368,8 +441,10 @@ def main() -> None:
     window_name = "detectWarning - 사람 및 얼굴 감지"
     frame_index = 0
     tracked_people = []
+    faces = []
     last_frame_time = perf_counter()
     smoothed_fps = 0.0
+    server_status = ServerStatus(mode="원격 추론" if remote_client else "로컬 추론")
 
     while True:
         ok, frame = capture.read()
@@ -384,16 +459,31 @@ def main() -> None:
         else:
             smoothed_fps = smoothed_fps * 0.9 + instant_fps * 0.1
 
-        if frame_index % max(args.person_detect_interval, 1) == 0:
-            people = person_detector.detect(frame)
-            tracked_people = tracker.update(people)
-        faces = face_detector.detect(frame)
+        if remote_client is not None:
+            remote_result = remote_client.analyze_frame(frame)
+            if remote_result.error:
+                server_status.error = remote_result.error
+                server_status.latency_ms = remote_result.latency_ms
+            else:
+                tracked_people = remote_result.tracked_people
+                faces = remote_result.faces
+                server_status.error = None
+                server_status.latency_ms = remote_result.latency_ms
+        else:
+            if frame_index % max(args.person_detect_interval, 1) == 0:
+                people = person_detector.detect(frame)
+                tracked_people = tracker.update(people)
+            faces = face_detector.detect(frame)
+            server_status.latency_ms = 0.0
+            server_status.error = None
+
         draw_faces(frame, faces)
         visible_people = filter_people(tracked_people, faces)
         draw_people(frame, visible_people)
 
         draw_counts(frame, len(visible_people), len(faces))
         draw_fps(frame, smoothed_fps)
+        draw_server_status(frame, server_status)
         if speech_listener is not None:
             speech_result = speech_listener.get_result()
             draw_speech(frame, speech_result)
@@ -409,6 +499,14 @@ def main() -> None:
             face_count=len(faces),
         )
         draw_risk(frame, risk_assessment)
+        event_logger.maybe_log(
+            now_monotonic=monotonic(),
+            source=str(args.source),
+            assessment=risk_assessment,
+            speech_result=speech_result,
+            people_count=len(visible_people),
+            face_count=len(faces),
+        )
 
         cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
