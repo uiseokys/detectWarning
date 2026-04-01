@@ -12,12 +12,14 @@ class PersonDetector:
         score_threshold: float = 0.25,
         nms_threshold: float = 0.45,
         resize_width: int = 640,
+        device: str = "cuda:0",
     ) -> None:
         self.scale = scale
         self.min_neighbors = min_neighbors
         self.score_threshold = score_threshold
         self.nms_threshold = nms_threshold
         self.resize_width = resize_width
+        self.device = device
         config_dir = Path(__file__).resolve().parent.parent / ".ultralytics"
         config_dir.mkdir(exist_ok=True)
         os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir))
@@ -37,6 +39,7 @@ class PersonDetector:
             classes=[0],
             conf=self.score_threshold,
             imgsz=self.resize_width,
+            device=self.device,
             verbose=False,
         )
         if not results:

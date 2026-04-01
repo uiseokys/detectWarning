@@ -45,6 +45,12 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR
 python3 app/inference_server.py --host 0.0.0.0 --port 8000
 ```
 
+GPU를 확실히 쓰도록 강제하려면:
+
+```bash
+python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-compute-type float16
+```
+
 데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
 
 ```bash
@@ -287,6 +293,10 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   팀원별 추적 상태 유지 시간
 - `--show-windows`
   데스크탑에서 수신 영상과 검출 결과를 OpenCV 창으로 직접 표시
+- `--yolo-device`
+  YOLO 추론 장치. GPU를 강제로 쓰려면 `cuda:0`
+- `--stt-device`
+  Whisper 추론 장치. GPU를 강제로 쓰려면 `cuda`
 
 업로더 쪽 주요 옵션:
 

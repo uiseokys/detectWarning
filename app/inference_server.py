@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import queue
 import threading
 from dataclasses import dataclass
 from time import monotonic, perf_counter
@@ -27,8 +28,14 @@ class ClientSession:
     latest_meta: dict | None = None
 
 
+@dataclass
+class AudioJob:
+    client_id: str
+    wav_bytes: bytes
+
+
 class ServerSpeechRecognizer:
-    def __init__(self, model_size: str, compute_type: str, language: str) -> None:
+    def __init__(self, model_size: str, compute_type: str, language: str, device: str) -> None:
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:
@@ -37,9 +44,10 @@ class ServerSpeechRecognizer:
             ) from exc
 
         self.language = normalize_language(language)
+        self.device = device
         self.model = WhisperModel(
             model_size_or_path=model_size,
-            device="auto",
+            device=device,
             compute_type=compute_type,
         )
         self._lock = threading.Lock()
@@ -166,6 +174,16 @@ def parse_args() -> argparse.Namespace:
         default="ko-KR",
         help="서버 STT 언어 코드. 예: ko-KR",
     )
+    parser.add_argument(
+        "--yolo-device",
+        default="cuda:0",
+        help="YOLO 추론 장치. 예: cuda:0, cpu",
+    )
+    parser.add_argument(
+        "--stt-device",
+        default="cuda",
+        help="Whisper 추론 장치. 예: cuda, cpu",
+    )
     return parser.parse_args()
 
 
@@ -174,15 +192,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     person_detector = PersonDetector(
         score_threshold=args.person_score_threshold,
         resize_width=args.person_imgsz,
+        device=args.yolo_device,
     )
     face_detector = FaceDetector()
     speech_recognizer = ServerSpeechRecognizer(
         model_size=args.stt_model,
         compute_type=args.stt_compute_type,
         language=args.stt_language,
+        device=args.stt_device,
     )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
+    audio_job_queue: queue.Queue[AudioJob] = queue.Queue(maxsize=32)
 
     def get_session(client_id: str) -> ClientSession:
         now = monotonic()
@@ -473,7 +494,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok", "sessions": len(sessions)}
+        return {
+            "status": "ok",
+            "sessions": len(sessions),
+            "audio_queue_size": audio_job_queue.qsize(),
+            "yolo_device": args.yolo_device,
+            "stt_device": args.stt_device,
+            "stt_compute_type": args.stt_compute_type,
+        }
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
@@ -517,34 +545,28 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             raise HTTPException(status_code=400, detail="빈 오디오 요청입니다.")
 
         session = get_session(client_id)
-        try:
-            transcript, audio_level = speech_recognizer.transcribe_wav_bytes(audio_bytes)
-            speech_status = "recognized" if transcript else "listening"
-        except Exception as exc:
-            transcript = ""
-            audio_level = 0.0
-            speech_status = "error"
-            if session.latest_meta is None:
-                session.latest_meta = {}
-            session.latest_meta["speech_error"] = str(exc)
-
         latency_ms = (perf_counter() - started_at) * 1000.0
         if session.latest_meta is None:
             session.latest_meta = {}
-        session.latest_meta.update(
-            {
-                "speech_status": speech_status,
-                "transcript": transcript,
-                "audio_level": round(audio_level, 4),
-                "speech_latency_ms": round(latency_ms, 1),
-            }
-        )
+        session.latest_meta.update({"speech_status": "processing"})
+        try:
+            audio_job_queue.put_nowait(AudioJob(client_id=client_id, wav_bytes=audio_bytes))
+            queued = True
+        except queue.Full:
+            queued = False
+            session.latest_meta.update(
+                {
+                    "speech_status": "error",
+                    "speech_error": "오디오 처리 대기열이 가득 찼습니다.",
+                }
+            )
         return {
             "client_id": client_id,
-            "speech_status": speech_status,
-            "transcript": transcript,
-            "audio_level": round(audio_level, 4),
+            "speech_status": "queued" if queued else "error",
+            "transcript": "",
+            "audio_level": 0.0,
             "latency_ms": round(latency_ms, 1),
+            "queued": queued,
         }
 
     @app.post("/analyze/frame")
@@ -590,6 +612,35 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "latency_ms": round(latency_ms, 1),
         }
 
+    def audio_worker() -> None:
+        while True:
+            job = audio_job_queue.get()
+            session = get_session(job.client_id)
+            if session.latest_meta is None:
+                session.latest_meta = {}
+            try:
+                transcript, audio_level = speech_recognizer.transcribe_wav_bytes(job.wav_bytes)
+                speech_status = "recognized" if transcript else "listening"
+                session.latest_meta.update(
+                    {
+                        "speech_status": speech_status,
+                        "transcript": transcript,
+                        "audio_level": round(audio_level, 4),
+                    }
+                )
+                session.latest_meta.pop("speech_error", None)
+            except Exception as exc:
+                session.latest_meta.update(
+                    {
+                        "speech_status": "error",
+                        "speech_error": str(exc),
+                    }
+                )
+            finally:
+                audio_job_queue.task_done()
+
+    threading.Thread(target=audio_worker, name="audio-worker", daemon=True).start()
+
     return app
 
 
@@ -605,6 +656,9 @@ def localize_speech_status(status: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    print(f"[detectWarning] YOLO device: {args.yolo_device}")
+    print(f"[detectWarning] Whisper device: {args.stt_device}")
+    print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")
     app = create_app(args)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
