@@ -14,6 +14,7 @@ class WarningEvent:
     score: int
     level: str
     categories: list[str]
+    context_flags: list[str]
     matched_keywords: list[str]
     transcript: str
     people_count: int
@@ -61,7 +62,8 @@ class WarningEventLogger:
             source=source,
             score=assessment.score,
             level=assessment.level,
-            categories=list(assessment.reasons),
+            categories=list(assessment.categories),
+            context_flags=list(assessment.context_flags),
             matched_keywords=list(assessment.matched_keywords),
             transcript=(speech_result.transcript or "").strip(),
             people_count=people_count,
@@ -81,7 +83,8 @@ class WarningEventLogger:
             [
                 str(assessment.level),
                 str(assessment.score // 10),
-                ",".join(assessment.reasons[:2]),
+                ",".join(assessment.categories[:2]),
+                ",".join(assessment.context_flags[:2]),
                 ",".join(assessment.matched_keywords[:2]),
                 (speech_result.transcript or "").strip()[:30],
                 str(people_count),

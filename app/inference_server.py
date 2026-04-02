@@ -17,12 +17,14 @@ from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
+from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
 
 
 @dataclass
 class ClientSession:
     tracker: PersonTracker
+    risk_analyzer: RiskAnalyzer
     last_seen: float
     latest_frame_jpeg: bytes | None = None
     latest_meta: dict | None = None
@@ -32,6 +34,13 @@ class ClientSession:
 class AudioJob:
     client_id: str
     wav_bytes: bytes
+
+
+@dataclass
+class ServerSpeechResult:
+    status: str
+    transcript: str = ""
+    audio_level: float = 0.0
 
 
 class ServerSpeechRecognizer:
@@ -184,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stt-model",
-        default="small",
+        default="medium",
         help="서버 STT용 Whisper 모델 크기",
     )
     parser.add_argument(
@@ -241,7 +250,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
             session = sessions.get(client_id)
             if session is None:
-                session = ClientSession(tracker=PersonTracker(), last_seen=now)
+                session = ClientSession(
+                    tracker=PersonTracker(),
+                    risk_analyzer=RiskAnalyzer(),
+                    last_seen=now,
+                )
                 sessions[client_id] = session
             else:
                 session.last_seen = now
@@ -261,6 +274,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "latency_ms": float(meta.get("latency_ms", 0.0)),
                         "speech_status": str(meta.get("speech_status", "idle")),
                         "transcript": str(meta.get("transcript", "")),
+                        "risk_score": int(meta.get("risk_score", 0)),
+                        "risk_level": str(meta.get("risk_level", "LOW")),
+                        "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
+                        "risk_categories": list(meta.get("risk_categories", [])),
                         "has_frame": session.latest_frame_jpeg is not None,
                     }
                 )
@@ -422,8 +439,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <div class="stat" id="lastSeen">최근 수신: -</div>
             <div class="stat" id="speechStatus">음성 인식: 대기</div>
             <div class="stat" id="audioLevel">오디오 레벨: 0.000</div>
+          <div class="stat" id="riskLevel">위험도: 0/100 | 낮음</div>
           </div>
           <div class="stat" id="transcript" style="display:block; border-radius:16px; margin-bottom:16px;">인식 내용: -</div>
+          <div class="stat" id="riskCategories" style="display:block; border-radius:16px; margin-bottom:16px;">위험 카테고리: 없음</div>
+          <div class="stat" id="riskReasons" style="display:block; border-radius:16px; margin-bottom:16px;">위험 신호: 없음</div>
           <div class="screen" id="screen">
             <div class="placeholder">클라이언트를 선택하면 분석 화면이 표시됩니다.</div>
           </div>
@@ -459,7 +479,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           <div class="client-meta">
             사람 ${client.people_count}명 | 얼굴 ${client.face_count}개<br/>
             최근 수신 ${client.last_seen_seconds}초 전 | 지연 ${client.latency_ms.toFixed(1)}ms<br/>
-            STT ${client.speech_status} ${client.transcript ? '| ' + client.transcript : ''}
+            STT ${client.speech_status} ${client.transcript ? '| ' + client.transcript : ''}<br/>
+            위험도 ${client.risk_score}/100 | ${client.risk_level_label}<br/>
+            카테고리 ${client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '-'}
           </div>
         `;
         item.onclick = () => {
@@ -499,7 +521,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       document.getElementById('lastSeen').textContent = `최근 수신: ${data ? data.last_seen_seconds.toFixed(1) : '-'}초 전`;
       document.getElementById('speechStatus').textContent = `음성 인식: ${data ? data.speech_status_label : '대기'}`;
       document.getElementById('audioLevel').textContent = `오디오 레벨: ${data ? data.audio_level.toFixed(3) : '0.000'}`;
+      document.getElementById('riskLevel').textContent = `위험도: ${data ? data.risk_score : 0}/100 | ${data ? data.risk_level_label : '낮음'}`;
       document.getElementById('transcript').textContent = `인식 내용: ${data && data.transcript ? data.transcript : '-'}`;
+      document.getElementById('riskCategories').textContent = `위험 카테고리: ${data && data.risk_categories && data.risk_categories.length ? data.risk_categories.join(', ') : '없음'}`;
+      document.getElementById('riskReasons').textContent = `위험 신호: ${data && data.risk_reasons && data.risk_reasons.length ? data.risk_reasons.join(', ') : '없음'}`;
     }
 
     const params = new URLSearchParams(window.location.search);
@@ -554,6 +579,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "speech_status_label": localize_speech_status(str(meta.get("speech_status", "idle"))),
                 "transcript": str(meta.get("transcript", "")),
                 "audio_level": float(meta.get("audio_level", 0.0)),
+                "risk_score": int(meta.get("risk_score", 0)),
+                "risk_level": str(meta.get("risk_level", "LOW")),
+                "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
+                "risk_categories": list(meta.get("risk_categories", [])),
+                "risk_reasons": list(meta.get("risk_reasons", [])),
                 "last_seen_seconds": monotonic() - session.last_seen,
                 "frame_data_url": frame_data_url,
             }
@@ -644,11 +674,25 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             try:
                 transcript, audio_level = speech_recognizer.transcribe_wav_bytes(job.wav_bytes)
                 speech_status = "recognized" if transcript else "listening"
+                risk = session.risk_analyzer.update(
+                    ServerSpeechResult(
+                        status=speech_status,
+                        transcript=transcript,
+                        audio_level=audio_level,
+                    ),
+                    tracked_people=[],
+                    face_count=0,
+                )
                 session.latest_meta.update(
                     {
                         "speech_status": speech_status,
                         "transcript": transcript,
                         "audio_level": round(audio_level, 4),
+                        "risk_score": risk.score,
+                        "risk_level": risk.level,
+                        "risk_categories": list(risk.categories),
+                        "risk_reasons": list(risk.reasons),
+                        "risk_context_flags": list(risk.context_flags),
                     }
                 )
                 session.latest_meta.pop("speech_error", None)
@@ -675,6 +719,16 @@ def localize_speech_status(status: str) -> str:
         "error": "오류",
     }
     return labels.get(status, status)
+
+
+def localize_risk_level(level: str) -> str:
+    labels = {
+        "LOW": "낮음",
+        "ELEVATED": "주의",
+        "MEDIUM": "경계",
+        "HIGH": "위험",
+    }
+    return labels.get(level, level)
 
 
 def main() -> None:

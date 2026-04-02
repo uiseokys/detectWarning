@@ -45,10 +45,10 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR
 python3 app/inference_server.py --host 0.0.0.0 --port 8000
 ```
 
-GPU를 확실히 쓰도록 강제하고, 서버 STT를 `small`로 쓰려면:
+GPU를 확실히 쓰도록 강제하고, 서버 STT를 `medium`으로 쓰려면:
 
 ```bash
-python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-model small --stt-compute-type float16
+python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-model medium --stt-compute-type float16
 ```
 
 데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
@@ -92,7 +92,13 @@ python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --s
 ```
 
 이 경우 업로더가 시작되기 전에 터미널에서 `마이크를 선택하세요.` 목록이 먼저 표시됩니다.
-기본 전송 속도는 `3 FPS`, 기본 타임아웃은 `10초`입니다.
+기본 전송 속도는 `5 FPS`, 기본 타임아웃은 `10초`입니다.
+
+웹 화면 FPS를 조금 더 높이고 싶다면:
+
+```bash
+python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --max-fps 6 --frame-width 960
+```
 
 맥북 브라우저 대시보드:
 
@@ -180,6 +186,8 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://10
 - 최근 음성 키워드, 오디오 크기, 사람/얼굴 감지 결과를 합친 실시간 위험 점수 표시
 - 웹 대시보드 사용 시 데스크탑 브라우저에서 팀원별 분석 화면을 선택해 볼 수 있음
 - 웹 대시보드 사용 시 맥북 브라우저에서도 자기 카메라 분석 화면과 STT 결과를 볼 수 있음
+- 웹 대시보드에서 STT 기반 위험도 점수와 위험 단계도 함께 확인할 수 있음
+- 웹 대시보드에서 `위험 카테고리`와 `위험 신호`를 함께 확인할 수 있음
 
 ## 위험 점수
 
@@ -200,12 +208,23 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://10
 - 매우 큰 소리:
   `비명 의심`
 
-PDF 기준을 반영한 현재 위험 평가 항목:
+PDF 기준을 반영한 현재 위험 평가 핵심 항목:
 
 - 영상 분석 기준:
   `넘어짐 의심`, `몸싸움 의심`, `달리며 추격`, `장시간 쓰러짐`
 - 음성 분석 기준:
-  `비명 의심`, `반복적 고성`, `위협적 음성 패턴`
+  `특정 비명`, `반복적 고성`, `위협적 음성 패턴`
+
+현재 웹 위험도는 특히 아래 음성 기준을 강하게 반영합니다.
+
+- `특정 비명`
+  예: `으악`, `아악`, `꺄악`, `비명`, `소리질러`
+- `반복적 고성`
+  짧은 시간 안에 큰 소리가 여러 번 반복될 때
+- `위협적 음성 패턴`
+  예: `죽여`, `죽인다`, `가만 안 둬`, `패줄게`, `때릴 거야`
+- 추가 문맥 기준
+  `대상 특정`, `즉시 실행 암시`, `수단 언급`, `조건부 위협`, `반복 위협`
 
 조합 가중치도 들어가 있습니다.
 
@@ -264,7 +283,7 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   카메라 입력, 선택적으로 마이크 입력, 브라우저 대시보드 확인
 - 데스크탑 서버:
   사람 관절점 감지, 얼굴 감지, 사람 추적, 서버 STT
-  기본 STT 모델은 `small`
+  기본 STT 모델은 `medium`
 - 선택적으로 데스크탑 OpenCV 창에서 팀원별 분석 화면 표시
 - 데스크탑 브라우저:
   팀원별 분석 화면과 사람/얼굴 수, 서버 지연 확인
@@ -315,6 +334,8 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   전송 화질
 - `--max-fps`
   전송 프레임 속도 제한
+- `--frame-width`
+  전송 전에 축소할 가로 해상도. 낮출수록 보통 더 부드러움
 - `--show-local-preview`
   노트북에서도 카메라 미리보기 표시
 - `--stt`

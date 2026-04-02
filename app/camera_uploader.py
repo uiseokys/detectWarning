@@ -78,7 +78,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url", required=True, help="원격 추론 서버 주소. 예: http://100.x.x.x:8000")
     parser.add_argument("--client-id", default="", help="클라이언트 식별자. 비우면 자동 생성")
     parser.add_argument("--jpeg-quality", type=int, default=70, help="전송용 JPEG 품질")
-    parser.add_argument("--max-fps", type=float, default=3.0, help="최대 전송 FPS")
+    parser.add_argument("--max-fps", type=float, default=5.0, help="최대 전송 FPS")
+    parser.add_argument("--frame-width", type=int, default=960, help="전송 전 프레임 가로 크기. 0이면 원본 유지")
     parser.add_argument("--show-local-preview", action="store_true", help="노트북에서도 카메라 미리보기를 표시")
     parser.add_argument("--timeout-seconds", type=float, default=10.0, help="서버 요청 제한 시간")
     parser.add_argument("--stt", action="store_true", help="맥북 마이크 오디오를 서버로 보내 STT를 함께 수행합니다.")
@@ -192,6 +193,17 @@ def build_client_id(client_id: str) -> str:
         return client_id.strip()
     host = socket.gethostname().replace(" ", "-")
     return f"{host}-{uuid.uuid4().hex[:6]}"
+
+
+def resize_frame_for_upload(frame, target_width: int):
+    if target_width <= 0:
+        return frame
+    height, width = frame.shape[:2]
+    if width <= target_width:
+        return frame
+    scale = target_width / float(width)
+    target_height = max(int(height * scale), 1)
+    return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
 class AudioStreamer:
@@ -393,14 +405,17 @@ def main() -> None:
         now = perf_counter()
         if now - last_sent_at < interval:
             sleep(0.005)
+            frame = None
             continue
 
+        upload_frame = resize_frame_for_upload(frame, args.frame_width)
         success, encoded = cv2.imencode(
             ".jpg",
-            frame,
+            upload_frame,
             [int(cv2.IMWRITE_JPEG_QUALITY), int(max(min(args.jpeg_quality, 100), 40))],
         )
         if not success:
+            frame = None
             continue
 
         try:
