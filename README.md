@@ -45,10 +45,10 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR
 python3 app/inference_server.py --host 0.0.0.0 --port 8000
 ```
 
-GPU를 확실히 쓰도록 강제하려면:
+GPU를 확실히 쓰도록 강제하고, 서버 STT를 `small`로 쓰려면:
 
 ```bash
-python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-compute-type float16
+python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-model small --stt-compute-type float16
 ```
 
 데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
@@ -264,6 +264,7 @@ PDF 기준을 반영한 현재 위험 평가 항목:
   카메라 입력, 선택적으로 마이크 입력, 브라우저 대시보드 확인
 - 데스크탑 서버:
   사람 관절점 감지, 얼굴 감지, 사람 추적, 서버 STT
+  기본 STT 모델은 `small`
 - 선택적으로 데스크탑 OpenCV 창에서 팀원별 분석 화면 표시
 - 데스크탑 브라우저:
   팀원별 분석 화면과 사람/얼굴 수, 서버 지연 확인

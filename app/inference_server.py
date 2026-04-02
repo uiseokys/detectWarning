@@ -184,7 +184,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stt-model",
-        default="base",
+        default="small",
         help="서버 STT용 Whisper 모델 크기",
     )
     parser.add_argument(
