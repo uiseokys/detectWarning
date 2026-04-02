@@ -16,7 +16,7 @@ from fastapi import Body
 from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException, Query, Request
 
-from detector import FaceDetector, PersonDetector
+from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from tracker import PersonTracker
 
 
@@ -89,7 +89,8 @@ def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms
     for person in tracked_people:
         x, y, w, h = person["bbox"]
         person_id = person["id"]
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 2)
+        draw_pose_overlay(frame, person.get("keypoints", []))
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 1)
         cv2.putText(
             frame,
             f"Person {person_id}",
@@ -121,6 +122,28 @@ def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms
         (0, 255, 255),
         2,
     )
+
+
+def draw_pose_overlay(frame, keypoints) -> None:
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        if start_idx >= len(keypoints) or end_idx >= len(keypoints):
+            continue
+        start = keypoints[start_idx]
+        end = keypoints[end_idx]
+        if start.get("confidence", 0.0) < 0.35 or end.get("confidence", 0.0) < 0.35:
+            continue
+        cv2.line(
+            frame,
+            (int(start["x"]), int(start["y"])),
+            (int(end["x"]), int(end["y"])),
+            (60, 200, 255),
+            2,
+        )
+
+    for point in keypoints:
+        if point.get("confidence", 0.0) < 0.35:
+            continue
+        cv2.circle(frame, (int(point["x"]), int(point["y"])), 4, (0, 120, 255), -1)
     cv2.putText(
         frame,
         f"people: {len(tracked_people)} | faces: {len(faces)} | latency: {latency_ms:.1f}ms",

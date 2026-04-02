@@ -4,6 +4,14 @@ from pathlib import Path
 import cv2
 
 
+POSE_CONNECTIONS = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+]
+
+
 class PersonDetector:
     def __init__(
         self,
@@ -31,7 +39,7 @@ class PersonDetector:
                 "`pip install -r requirements.txt`."
             ) from exc
 
-        self.model = YOLO("yolo26n.pt")
+        self.model = YOLO("yolo11n-pose.pt")
 
     def detect(self, frame):
         results = self.model.predict(
@@ -46,11 +54,19 @@ class PersonDetector:
             return []
 
         boxes = results[0].boxes
+        keypoints = results[0].keypoints
         if boxes is None or boxes.xyxy is None:
             return []
 
         people = []
-        for xyxy in boxes.xyxy.cpu().tolist():
+        keypoint_xy = []
+        keypoint_conf = []
+        if keypoints is not None and keypoints.xy is not None:
+            keypoint_xy = keypoints.xy.cpu().tolist()
+        if keypoints is not None and keypoints.conf is not None:
+            keypoint_conf = keypoints.conf.cpu().tolist()
+
+        for index, xyxy in enumerate(boxes.xyxy.cpu().tolist()):
             x1, y1, x2, y2 = [int(value) for value in xyxy]
             x = max(x1, 0)
             y = max(y1, 0)
@@ -58,7 +74,25 @@ class PersonDetector:
             h = max(y2 - y1, 0)
             if w == 0 or h == 0:
                 continue
-            people.append((x, y, w, h))
+            person_keypoints = []
+            xy_points = keypoint_xy[index] if index < len(keypoint_xy) else []
+            conf_points = keypoint_conf[index] if index < len(keypoint_conf) else []
+            for point_index, xy in enumerate(xy_points):
+                px, py = xy
+                confidence = conf_points[point_index] if point_index < len(conf_points) else 0.0
+                person_keypoints.append(
+                    {
+                        "x": float(px),
+                        "y": float(py),
+                        "confidence": float(confidence),
+                    }
+                )
+            people.append(
+                {
+                    "bbox": (x, y, w, h),
+                    "keypoints": person_keypoints,
+                }
+            )
         return people
 
 

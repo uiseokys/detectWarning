@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from audio_detector import SpeechResult, SpeechToTextListener, list_input_devices
-from detector import FaceDetector, PersonDetector
+from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from event_logger import WarningEventLogger
 from remote_inference import RemoteInferenceClient
 from risk_analyzer import RiskAnalyzer
@@ -249,8 +249,33 @@ def draw_people(frame, tracked_people):
     for person in tracked_people:
         person_id = person["id"]
         x, y, w, h = person["bbox"]
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 2)
+        keypoints = person.get("keypoints", [])
+        if keypoints:
+            draw_pose(frame, keypoints)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 1)
         draw_unicode_text(frame, f"사람 {person_id}", (x, max(y - 28, 20)), (40, 180, 99), 24)
+
+
+def draw_pose(frame, keypoints):
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        if start_idx >= len(keypoints) or end_idx >= len(keypoints):
+            continue
+        start = keypoints[start_idx]
+        end = keypoints[end_idx]
+        if start.get("confidence", 0.0) < 0.35 or end.get("confidence", 0.0) < 0.35:
+            continue
+        cv2.line(
+            frame,
+            (int(start["x"]), int(start["y"])),
+            (int(end["x"]), int(end["y"])),
+            (60, 200, 255),
+            2,
+        )
+
+    for point in keypoints:
+        if point.get("confidence", 0.0) < 0.35:
+            continue
+        cv2.circle(frame, (int(point["x"]), int(point["y"])), 4, (0, 120, 255), -1)
 
 
 def draw_faces(frame, faces):

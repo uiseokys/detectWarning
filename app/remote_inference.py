@@ -67,10 +67,20 @@ class RemoteInferenceClient:
         tracked_people = []
         for person in payload.get("tracked_people", []):
             bbox = tuple(int(value) for value in person.get("bbox", [0, 0, 0, 0]))
+            keypoints = []
+            for point in person.get("keypoints", []):
+                keypoints.append(
+                    {
+                        "x": float(point.get("x", 0.0)),
+                        "y": float(point.get("y", 0.0)),
+                        "confidence": float(point.get("confidence", 0.0)),
+                    }
+                )
             tracked_people.append(
                 {
                     "id": int(person.get("id", 0)),
                     "bbox": bbox,
+                    "keypoints": keypoints,
                     "stationary_frames": int(person.get("stationary_frames", 0)),
                     "movement": float(person.get("movement", 0.0)),
                 }
