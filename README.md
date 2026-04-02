@@ -108,6 +108,12 @@ http://100.x.x.x:8000/?client_id=맥북_CLIENT_ID
 
 업로더를 실행하면 이 주소를 자동으로 출력합니다.
 
+카메라 인덱스가 헷갈리면 먼저 사용 가능한 카메라를 탐색할 수 있습니다.
+
+```bash
+python3 app/camera_uploader.py --server-url http://100.x.x.x:8000 --list-video-devices
+```
+
 경고 감지용 권장 균형 설정:
 
 ```bash

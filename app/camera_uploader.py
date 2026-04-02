@@ -7,6 +7,7 @@ import threading
 import uuid
 import wave
 from collections import deque
+from dataclasses import dataclass
 from time import perf_counter, sleep
 
 import cv2
@@ -33,7 +34,14 @@ def list_input_devices() -> list[tuple[int, str, int, float]]:
                 float(device.get("default_samplerate", 0.0)),
             )
         )
-    return devices
+        return devices
+
+
+@dataclass
+class OpenAttempt:
+    capture: cv2.VideoCapture | None
+    frame: object | None
+    backend_name: str
 
 
 def choose_audio_device_interactively() -> int:
@@ -78,19 +86,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--select-audio-device", action="store_true", help="실행 전에 마이크 장치를 직접 선택합니다.")
     parser.add_argument("--stt-phrase-seconds", type=float, default=1.8, help="한 번 인식할 오디오 길이")
     parser.add_argument("--stt-silence-seconds", type=float, default=0.35, help="이 시간 이상 조용하면 STT 전송")
+    parser.add_argument("--list-video-devices", action="store_true", help="사용 가능한 카메라 인덱스를 간단히 탐색하고 종료합니다.")
     return parser.parse_args()
 
 
-def open_source(source: str) -> cv2.VideoCapture:
+def _probe_camera(index: int, backend=None, backend_name: str = "default") -> OpenAttempt:
+    if backend is None:
+        capture = cv2.VideoCapture(index)
+    else:
+        capture = cv2.VideoCapture(index, backend)
+    if not capture.isOpened():
+        capture.release()
+        return OpenAttempt(capture=None, frame=None, backend_name=backend_name)
+
+    frame = None
+    for _ in range(25):
+        ok, candidate = capture.read()
+        if ok and candidate is not None:
+            frame = candidate
+            break
+        sleep(0.08)
+
+    if frame is None:
+        capture.release()
+        return OpenAttempt(capture=None, frame=None, backend_name=backend_name)
+    return OpenAttempt(capture=capture, frame=frame, backend_name=backend_name)
+
+
+def list_video_devices(max_index: int = 5) -> list[tuple[int, str]]:
+    found = []
+    for index in range(max_index):
+        attempts = []
+        if hasattr(cv2, "CAP_AVFOUNDATION"):
+            attempts.append((cv2.CAP_AVFOUNDATION, "AVFOUNDATION"))
+        attempts.append((None, "DEFAULT"))
+        for backend, backend_name in attempts:
+            result = _probe_camera(index, backend=backend, backend_name=backend_name)
+            if result.capture is not None:
+                result.capture.release()
+                found.append((index, backend_name))
+                break
+    return found
+
+
+def open_source(source: str) -> tuple[cv2.VideoCapture, object | None, str]:
     if source.isdigit():
         index = int(source)
+        attempts = []
         if hasattr(cv2, "CAP_AVFOUNDATION"):
-            capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-            if capture.isOpened():
-                return capture
-            capture.release()
-        return cv2.VideoCapture(index)
-    return cv2.VideoCapture(source)
+            attempts.append((cv2.CAP_AVFOUNDATION, "AVFOUNDATION"))
+        attempts.append((None, "DEFAULT"))
+
+        for backend, backend_name in attempts:
+            result = _probe_camera(index, backend=backend, backend_name=backend_name)
+            if result.capture is not None:
+                return result.capture, result.frame, result.backend_name
+        return cv2.VideoCapture(index), None, "NONE"
+
+    capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        return capture, None, "FILE"
+    ok, frame = capture.read()
+    if ok and frame is not None:
+        return capture, frame, "FILE"
+    return capture, None, "FILE"
 
 
 def build_open_error(source: str) -> str:
@@ -259,10 +318,20 @@ class AudioStreamer:
 
 def main() -> None:
     args = parse_args()
+    if args.list_video_devices:
+        devices = list_video_devices()
+        if not devices:
+            print("프레임을 읽을 수 있는 카메라를 찾지 못했습니다.")
+        else:
+            print("사용 가능한 카메라:")
+            for index, backend_name in devices:
+                print(f"{index}: {backend_name}")
+        return
+
     if args.stt and (args.select_audio_device or args.stt_device is None):
         args.stt_device = choose_audio_device_interactively()
 
-    capture = open_source(args.source)
+    capture, initial_frame, backend_name = open_source(args.source)
     if not capture.isOpened():
         raise RuntimeError(build_open_error(args.source))
 
@@ -275,17 +344,11 @@ def main() -> None:
     print(f"업로더 시작: client_id={client_id}")
     print(f"서버 주소: {args.server_url.rstrip('/')}")
     print(f"웹 대시보드: {args.server_url.rstrip('/')}/?client_id={client_id}")
+    print(f"카메라 백엔드: {backend_name}")
     print("종료하려면 q 키를 누르세요.")
 
-    initial_ok = False
-    for _ in range(20):
-        ok, frame = capture.read()
-        if ok and frame is not None:
-            initial_ok = True
-            break
-        sleep(0.1)
-
-    if not initial_ok:
+    frame = initial_frame
+    if frame is None:
         capture.release()
         cv2.destroyAllWindows()
         raise RuntimeError(build_read_error(args.source))
@@ -303,7 +366,10 @@ def main() -> None:
         audio_streamer.start()
 
     while True:
-        ok, frame = capture.read()
+        if frame is None:
+            ok, frame = capture.read()
+        else:
+            ok = True
         if not ok:
             print("\n카메라 프레임을 더 이상 읽지 못했습니다. 업로더를 종료합니다.")
             break
@@ -363,6 +429,7 @@ def main() -> None:
             )
 
         last_sent_at = now
+        frame = None
 
     capture.release()
     if audio_streamer is not None:
