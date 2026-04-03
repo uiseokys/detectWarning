@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
+from person_classifier import PersonPresenceFilter
 from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
 
@@ -33,9 +34,11 @@ except Exception:
 @dataclass
 class ClientSession:
     tracker: PersonTracker
+    person_filter: PersonPresenceFilter
     risk_analyzer: RiskAnalyzer
     last_seen: float
     latest_frame_jpeg: bytes | None = None
+    latest_people: list[dict] | None = None
     latest_meta: dict | None = None
 
 
@@ -216,22 +219,7 @@ def normalize_language(language: str) -> str:
     return normalized.lower() or "ko"
 
 
-def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms: float) -> None:
-    for person in tracked_people:
-        x, y, w, h = person["bbox"]
-        person_id = person["id"]
-        draw_pose_overlay(frame, person.get("keypoints", []))
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 180, 99), 1)
-        cv2.putText(
-            frame,
-            f"Person {person_id}",
-            (x, max(y - 10, 24)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (40, 180, 99),
-            2,
-        )
-
+def draw_server_overlay(frame, client_id: str, faces, latency_ms: float, people_count: int) -> None:
     for x, y, w, h in faces:
         cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
         cv2.putText(
@@ -246,7 +234,7 @@ def draw_server_overlay(frame, client_id: str, tracked_people, faces, latency_ms
 
     cv2.putText(
         frame,
-        f"client: {client_id}",
+        f"client: {client_id} | people: {people_count} | latency: {latency_ms:.0f}ms",
         (20, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -338,6 +326,11 @@ def parse_args() -> argparse.Namespace:
         help="서버 STT 언어 코드. 예: ko-KR",
     )
     parser.add_argument(
+        "--person-debug",
+        action="store_true",
+        help="사람 후보 상태와 제거 이유를 서버 오버레이/응답에 포함해 디버깅합니다.",
+    )
+    parser.add_argument(
         "--yolo-device",
         default="cuda:0",
         help="YOLO 추론 장치. 예: cuda:0, cpu",
@@ -388,6 +381,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             if session is None:
                 session = ClientSession(
                     tracker=PersonTracker(),
+                    person_filter=PersonPresenceFilter(debug=args.person_debug),
                     risk_analyzer=RiskAnalyzer(),
                     last_seen=now,
                 )
@@ -823,20 +817,38 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             raise HTTPException(status_code=400, detail="JPEG 이미지를 디코딩하지 못했습니다.")
 
         session = get_session(client_id)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         people = person_detector.detect(frame)
         tracked_people = session.tracker.update(people)
         faces = face_detector.detect(frame)
+        evaluated_people = session.person_filter.evaluate(
+            tracked_people=tracked_people,
+            faces=faces,
+            gray_frame=gray_frame,
+            frame_shape=frame.shape,
+        )
+        confirmed_people = [
+            person
+            for person in evaluated_people
+            if person.get("person_state") in {"full_body_person", "upper_body_person"}
+        ]
         latency_ms = (perf_counter() - started_at) * 1000.0
         annotated = frame.copy()
-        draw_server_overlay(annotated, client_id, tracked_people, faces, latency_ms)
+        session.person_filter.draw_debug_overlay(annotated, evaluated_people, draw_pose_overlay)
+        draw_server_overlay(annotated, client_id, faces, latency_ms, len(confirmed_people))
         success, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if success:
             session.latest_frame_jpeg = encoded.tobytes()
+        session.latest_people = confirmed_people
         if session.latest_meta is None:
             session.latest_meta = {}
         session.latest_meta.update(
             {
-                "people_count": len(tracked_people),
+                "people_count": len(confirmed_people),
+                "uncertain_count": sum(
+                    1 for person in evaluated_people if person.get("person_state") == "uncertain"
+                ),
+                "candidate_count": len(evaluated_people),
                 "face_count": len(faces),
                 "latency_ms": round(latency_ms, 1),
             }
@@ -846,7 +858,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             cv2.waitKey(1)
         return {
             "client_id": client_id,
-            "tracked_people": tracked_people,
+            "tracked_people": evaluated_people,
             "faces": [list(map(int, face)) for face in faces],
             "latency_ms": round(latency_ms, 1),
         }
@@ -860,14 +872,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             try:
                 transcript, audio_level = speech_recognizer.transcribe_wav_bytes(job.wav_bytes)
                 speech_status = "recognized" if transcript else "listening"
+                tracked_people = session.latest_people or []
+                face_count = int((session.latest_meta or {}).get("face_count", 0))
                 risk = session.risk_analyzer.update(
                     ServerSpeechResult(
                         status=speech_status,
                         transcript=transcript,
                         audio_level=audio_level,
                     ),
-                    tracked_people=[],
-                    face_count=0,
+                    tracked_people=tracked_people,
+                    face_count=face_count,
                 )
                 session.latest_meta.update(
                     {

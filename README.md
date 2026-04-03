@@ -6,7 +6,7 @@
 
 현재 시스템은 다음 흐름으로 동작합니다.
 
-- 영상: 사람 관절점 감지, 얼굴 감지, 간단한 움직임/추적 분석
+- 영상: `person detector -> box 내부 pose estimation -> temporal person filtering -> 얼굴 감지`
 - 음성: Whisper 기반 STT, 음량 분석, 상대 음량 급상승 감지
 - 위험도: 영상 + 음성 + 키워드 + 큰 소리 패턴을 결합한 휴리스틱 점수 계산
 - 이벤트 로그: 위험 점수가 일정 기준 이상이면 JSONL 형태로 저장
@@ -152,6 +152,12 @@ FPS를 더 높이고 싶을 때:
 python3 app/main.py --source 0 --person-imgsz 640 --person-detect-interval 3
 ```
 
+사람 후보 상태와 제거 이유를 디버그 오버레이로 보고 싶을 때:
+
+```bash
+python3 app/main.py --source 0 --person-debug
+```
+
 STT 정확도를 더 높이고 싶을 때:
 
 ```bash
@@ -187,6 +193,7 @@ python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://10
 화면 표시 정보
 
 - 감지된 사람을 `사람 1` 같은 추적 ID와 함께 관절점 스켈레톤 중심으로 표시
+- 확정된 사람만 최종 사람 수에 포함하고, 디버그 모드에서는 `full_body_person / upper_body_person / uncertain / rejected` 상태를 함께 표시
 - 감지된 얼굴을 파란색 박스로 표시
 - 상단에 `사람: n | 얼굴: n` 표시
 - `음성 인식`, `인식 내용`, `위험도`, `FPS`를 한국어로 표시
@@ -270,9 +277,10 @@ PDF 기준을 반영한 현재 위험 평가 핵심 항목:
 - 영상 입력이 로컬 파일이어도 STT는 마이크를 사용합니다.
 - 새로운 음성 인식 의존성은 `pip install -r requirements.txt`로 설치할 수 있습니다.
 - STT는 현재 `faster-whisper`를 사용한 로컬 Whisper 추론으로 동작합니다.
-- 사람 관절점 감지는 현재 Ultralytics `YOLO11n-pose` 모델을 사용합니다.
+- 사람 검출은 detection 모델로 1차 bbox를 찾고, 그 bbox 내부에만 pose model을 적용합니다.
+- 따라서 배경 전체에서 pose만 보고 사람으로 확정하지 않도록 구성되어 있습니다.
 - 처음 모델을 로드할 때는 Whisper 가중치 다운로드가 필요할 수 있어, 최초 1회는 인터넷 연결이 필요할 수 있습니다.
-- 처음 사람 감지를 실행할 때도 YOLO26 가중치 다운로드가 필요할 수 있습니다.
+- 처음 사람 감지를 실행할 때도 detection / pose 가중치 다운로드가 필요할 수 있습니다.
 - 기본 STT 설정은 경고 감지에 맞춘 균형형 설정입니다. `base` 모델과 짧은 구간, 빠른 디코딩을 사용합니다.
 - `small`, `medium` 같은 더 큰 모델은 보통 더 정확하지만, CPU/GPU 자원을 더 많이 사용합니다.
 - `tiny`는 더 빠르지만, 한국어 인식 품질까지 고려하면 보통 `base`가 더 좋은 균형점입니다.
@@ -282,6 +290,8 @@ PDF 기준을 반영한 현재 위험 평가 핵심 항목:
 - 서버 연동 전 단계로 `logs/warnings.jsonl` 파일을 그대로 읽어 전송 계층에 연결할 수 있습니다.
 - `--server-url`을 주면 노트북은 로컬 YOLO/얼굴 추론을 하지 않고 JPEG 프레임만 서버로 전송합니다.
 - 원격 추론 서버는 `client_id`별로 사람 추적 상태를 따로 유지합니다.
+- 사람 여부는 detector confidence, pose quality, geometry, temporal consistency, static false positive risk를 함께 봅니다.
+- 하체 keypoint가 없더라도 얼굴/어깨/상반신 구조가 안정적이면 `upper_body_person`으로 유지합니다.
 - 팀 프로젝트에서는 Tailscale로 데스크탑과 팀원 노트북을 같은 tailnet에 연결하는 방식을 권장합니다.
 - `app/camera_uploader.py`를 쓰면 노트북은 카메라와 선택적으로 마이크를 서버로 보내고, 분석 결과는 맥북 브라우저에서 확인할 수 있습니다.
 
@@ -327,6 +337,8 @@ PDF 기준을 반영한 현재 위험 평가 핵심 항목:
   팀원별 추적 상태 유지 시간
 - `--show-windows`
   데스크탑에서 수신 영상과 검출 결과를 OpenCV 창으로 직접 표시
+- `--person-debug`
+  `full_body_person / upper_body_person / uncertain / rejected` 상태와 제거 이유를 서버 오버레이에 표시
 - `--yolo-device`
   YOLO 추론 장치. GPU를 강제로 쓰려면 `cuda:0`
 - `--stt-device`
@@ -359,9 +371,24 @@ PDF 기준을 반영한 현재 위험 평가 핵심 항목:
 
 ## 오탐 감소 로직
 
-- 옷걸이에 걸린 옷, 마네킹, 정지된 전신 형태 같은 오탐을 줄이기 위해
-  `얼굴이 없고 오랫동안 거의 움직이지 않는 사람 박스`는 화면에서 숨기도록 처리했습니다.
-- 따라서 얼굴이 없고 장시간 정지된 객체는 사람으로 감지되더라도 표시되지 않을 수 있습니다.
+- 사람 판정은 단일 bbox 또는 keypoint 개수만으로 하지 않고, 다음을 종합해서 점수화합니다.
+  detector confidence, pose 평균 confidence, 유효 keypoint 수, 핵심 keypoint 존재, bbox 크기/종횡비, skeleton geometry, temporal consistency, static false positive risk
+- 최종 상태는 `full_body_person`, `upper_body_person`, `uncertain`, `rejected` 네 단계입니다.
+- `upper_body_person`은 앉아 있거나 테이블/의자에 가려져 하체가 안 보여도 얼굴/어깨/상반신 구조가 안정적이면 유지합니다.
+- `uncertain`은 즉시 제거하지 않고, 연속 프레임에서 승격 또는 제거되도록 남겨둡니다.
+- static false positive는 `움직임 없음 + 낮은 detector confidence + 약한 pose quality + 나쁜 geometry + 얼굴 부재` 같은 복합 조건으로 억제합니다.
+- threshold는 [`app/person_classifier.py`](/Users/jung-uiseok/Desktop/detectWarning/app/person_classifier.py)에 모아두었습니다.
+
+주요 튜닝 포인트:
+
+- 오탐이 많으면:
+  `PERSON_DET_CONF_THRES`, `FULL_BODY_SCORE_THRES`, `UPPER_BODY_SCORE_THRES`를 먼저 올립니다.
+- 앉은 사람/상반신 사람을 더 살리고 싶으면:
+  `MIN_VALID_KPTS_UPPER`, `MIN_CORE_KPTS_UPPER`, `UPPER_BODY_SCORE_THRES`를 먼저 조정합니다.
+- 정적인 포스터/옷걸이 오탐을 더 줄이고 싶으면:
+  `STATIC_FP_TIME_WINDOW`, `STATIC_MOTION_THRES`를 조정합니다.
+- 프레임 가장자리 잘림 때문에 누락이 많으면:
+  `FRAME_EDGE_MARGIN_RATIO`와 geometry 관련 threshold를 완화합니다.
 
 ## 성능 튜닝 팁
 

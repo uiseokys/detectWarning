@@ -40,13 +40,19 @@ class PersonDetector:
                 "`pip install -r requirements.txt`."
             ) from exc
 
-        self.model = YOLO("yolo11n-pose.pt")
+        self.detector_model = YOLO("yolo11n.pt")
+        self.pose_model = YOLO("yolo11n-pose.pt")
 
     def detect(self, frame):
-        results = self.model.predict(
+        candidates = self.detect_person_boxes(frame)
+        return self.estimate_pose_in_boxes(frame, candidates)
+
+    def detect_person_boxes(self, frame):
+        results = self.detector_model.predict(
             source=frame,
             classes=[0],
             conf=self.score_threshold,
+            iou=self.nms_threshold,
             imgsz=self.resize_width,
             device=self.device,
             verbose=False,
@@ -55,46 +61,149 @@ class PersonDetector:
             return []
 
         boxes = results[0].boxes
-        keypoints = results[0].keypoints
         if boxes is None or boxes.xyxy is None:
             return []
 
         people = []
-        keypoint_xy = []
-        keypoint_conf = []
-        if keypoints is not None and keypoints.xy is not None:
-            keypoint_xy = keypoints.xy.cpu().tolist()
-        if keypoints is not None and keypoints.conf is not None:
-            keypoint_conf = keypoints.conf.cpu().tolist()
-
+        confidences = boxes.conf.cpu().tolist() if boxes.conf is not None else []
+        frame_h, frame_w = frame.shape[:2]
         for index, xyxy in enumerate(boxes.xyxy.cpu().tolist()):
             x1, y1, x2, y2 = [int(value) for value in xyxy]
             x = max(x1, 0)
             y = max(y1, 0)
-            w = max(x2 - x1, 0)
-            h = max(y2 - y1, 0)
+            w = min(max(x2 - x1, 0), frame_w - x)
+            h = min(max(y2 - y1, 0), frame_h - y)
             if w == 0 or h == 0:
                 continue
-            person_keypoints = []
-            xy_points = keypoint_xy[index] if index < len(keypoint_xy) else []
-            conf_points = keypoint_conf[index] if index < len(keypoint_conf) else []
-            for point_index, xy in enumerate(xy_points):
-                px, py = xy
-                confidence = conf_points[point_index] if point_index < len(conf_points) else 0.0
-                person_keypoints.append(
-                    {
-                        "x": float(px),
-                        "y": float(py),
-                        "confidence": float(confidence),
-                    }
-                )
             people.append(
                 {
                     "bbox": (x, y, w, h),
-                    "keypoints": person_keypoints,
+                    "det_conf": float(confidences[index]) if index < len(confidences) else 0.0,
                 }
             )
         return people
+
+    def estimate_pose_in_boxes(self, frame, candidates):
+        if not candidates:
+            return []
+
+        poses = []
+        for candidate in candidates:
+            x, y, w, h = candidate["bbox"]
+            crop_box = self._expand_crop_box(frame.shape, x, y, w, h)
+            cx, cy, cw, ch = crop_box
+            if cw <= 0 or ch <= 0:
+                poses.append({**candidate, "keypoints": [], "pose_mean_conf": 0.0})
+                continue
+
+            crop = frame[cy:cy + ch, cx:cx + cw]
+            if crop.size == 0:
+                poses.append({**candidate, "keypoints": [], "pose_mean_conf": 0.0})
+                continue
+
+            pose_imgsz = max(256, min(self.resize_width, max(crop.shape[:2])))
+            pose_results = self.pose_model.predict(
+                source=crop,
+                classes=[0],
+                conf=max(self.score_threshold * 0.5, 0.15),
+                imgsz=pose_imgsz,
+                device=self.device,
+                verbose=False,
+            )
+            keypoints, pose_mean_conf = self._extract_pose_from_crop(pose_results, crop_box)
+            poses.append(
+                {
+                    **candidate,
+                    "keypoints": keypoints,
+                    "pose_mean_conf": pose_mean_conf,
+                    "crop_bbox": crop_box,
+                }
+            )
+        return poses
+
+    @staticmethod
+    def _expand_crop_box(frame_shape, x: int, y: int, w: int, h: int):
+        frame_h, frame_w = frame_shape[:2]
+        pad = int(max(w, h) * 0.08)
+        x0 = max(x - pad, 0)
+        y0 = max(y - pad, 0)
+        x1 = min(x + w + pad, frame_w)
+        y1 = min(y + h + pad, frame_h)
+        return (x0, y0, max(x1 - x0, 0), max(y1 - y0, 0))
+
+    @staticmethod
+    def _extract_pose_from_crop(results, crop_box):
+        if not results:
+            return [], 0.0
+
+        result = results[0]
+        boxes = result.boxes
+        keypoints = result.keypoints
+        if (
+            boxes is None
+            or boxes.xyxy is None
+            or keypoints is None
+            or keypoints.xy is None
+        ):
+            return [], 0.0
+
+        keypoint_xy = keypoints.xy.cpu().tolist()
+        keypoint_conf = keypoints.conf.cpu().tolist() if keypoints.conf is not None else []
+        box_conf = boxes.conf.cpu().tolist() if boxes.conf is not None else []
+        best_index = PersonDetector._select_best_pose_index(result, crop_box)
+        if best_index is None:
+            return [], 0.0
+
+        xy_points = keypoint_xy[best_index] if best_index < len(keypoint_xy) else []
+        conf_points = keypoint_conf[best_index] if best_index < len(keypoint_conf) else []
+        crop_x, crop_y, _crop_w, _crop_h = crop_box
+        person_keypoints = []
+        visible_confidences = []
+        for point_index, xy in enumerate(xy_points):
+            px, py = xy
+            confidence = conf_points[point_index] if point_index < len(conf_points) else 0.0
+            confidence = float(confidence)
+            person_keypoints.append(
+                {
+                    "x": float(px + crop_x),
+                    "y": float(py + crop_y),
+                    "confidence": confidence,
+                }
+            )
+            if confidence > 0.0:
+                visible_confidences.append(confidence)
+
+        pose_mean_conf = (
+            sum(visible_confidences) / len(visible_confidences)
+            if visible_confidences
+            else (float(box_conf[best_index]) if best_index < len(box_conf) else 0.0)
+        )
+        return person_keypoints, float(pose_mean_conf)
+
+    @staticmethod
+    def _select_best_pose_index(result, crop_box):
+        boxes = result.boxes
+        if boxes is None or boxes.xyxy is None:
+            return None
+
+        crop_x, crop_y, crop_w, crop_h = crop_box
+        crop_cx = crop_x + crop_w / 2.0
+        crop_cy = crop_y + crop_h / 2.0
+
+        best_index = None
+        best_score = None
+        confidences = boxes.conf.cpu().tolist() if boxes.conf is not None else []
+        for index, xyxy in enumerate(boxes.xyxy.cpu().tolist()):
+            x1, y1, x2, y2 = xyxy
+            center_x = crop_x + (x1 + x2) / 2.0
+            center_y = crop_y + (y1 + y2) / 2.0
+            center_distance = abs(center_x - crop_cx) + abs(center_y - crop_cy)
+            conf = float(confidences[index]) if index < len(confidences) else 0.0
+            score = conf * 1000.0 - center_distance
+            if best_score is None or score > best_score:
+                best_score = score
+                best_index = index
+        return best_index
 
     @staticmethod
     def _validate_device(device: str) -> None:

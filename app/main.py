@@ -11,6 +11,7 @@ import numpy as np
 from audio_detector import SpeechResult, SpeechToTextListener, list_input_devices
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from event_logger import WarningEventLogger
+from person_classifier import PersonPresenceFilter
 from remote_inference import RemoteInferenceClient
 from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
@@ -119,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="사람 감지를 몇 프레임마다 수행할지 설정합니다. 클수록 더 빠릅니다.",
+    )
+    parser.add_argument(
+        "--person-debug",
+        action="store_true",
+        help="사람 후보 상태(full/upper/uncertain/rejected)와 제거 이유를 디버그 오버레이로 표시합니다.",
     )
     parser.add_argument(
         "--stt",
@@ -470,6 +476,7 @@ def main() -> None:
         tracker = PersonTracker()
 
     risk_analyzer = RiskAnalyzer()
+    person_presence_filter = PersonPresenceFilter(debug=args.person_debug)
     event_logger = WarningEventLogger(
         log_path=Path(args.warning_log_path),
         min_score=args.warning_log_min_score,
@@ -497,6 +504,7 @@ def main() -> None:
     window_name = "detectWarning - 사람 및 얼굴 감지"
     frame_index = 0
     tracked_people = []
+    evaluated_people = []
     faces = []
     last_frame_time = perf_counter()
     smoothed_fps = 0.0
@@ -518,24 +526,48 @@ def main() -> None:
         if remote_client is not None:
             remote_result = remote_client.analyze_frame(frame)
             if remote_result.error:
+                tracked_people = []
+                evaluated_people = []
+                faces = []
                 server_status.error = remote_result.error
                 server_status.latency_ms = remote_result.latency_ms
             else:
                 tracked_people = remote_result.tracked_people
+                evaluated_people = tracked_people
                 faces = remote_result.faces
                 server_status.error = None
                 server_status.latency_ms = remote_result.latency_ms
         else:
+            faces = face_detector.detect(frame)
             if frame_index % max(args.person_detect_interval, 1) == 0:
                 people = person_detector.detect(frame)
                 tracked_people = tracker.update(people)
-            faces = face_detector.detect(frame)
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                evaluated_people = person_presence_filter.evaluate(
+                    tracked_people=tracked_people,
+                    faces=faces,
+                    gray_frame=gray_frame,
+                    frame_shape=frame.shape,
+                )
             server_status.latency_ms = 0.0
             server_status.error = None
 
         draw_faces(frame, faces)
-        visible_people = filter_people(tracked_people, faces)
-        draw_people(frame, visible_people)
+        if remote_client is None and not evaluated_people and tracked_people:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            evaluated_people = person_presence_filter.evaluate(
+                tracked_people=tracked_people,
+                faces=faces,
+                gray_frame=gray_frame,
+                frame_shape=frame.shape,
+            )
+
+        visible_people = [
+            person
+            for person in evaluated_people
+            if person.get("person_state") in {"full_body_person", "upper_body_person"}
+        ]
+        person_presence_filter.draw_debug_overlay(frame, evaluated_people, draw_pose)
 
         draw_counts(frame, len(visible_people), len(faces))
         draw_fps(frame, smoothed_fps)

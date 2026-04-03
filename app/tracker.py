@@ -26,6 +26,7 @@ class PersonTracker:
         for detection, centroid in zip(detections, centroids):
             bbox = self._get_bbox(detection)
             keypoints = self._get_keypoints(detection)
+            metadata = self._get_metadata(detection)
             track_id = self._find_best_match(centroid, updated_ids)
             if track_id is None:
                 track_id = self.next_id
@@ -51,6 +52,7 @@ class PersonTracker:
                 "missing": 0,
                 "stationary_frames": stationary_frames,
                 "movement": movement,
+                "metadata": metadata,
             }
             updated_ids.add(track_id)
 
@@ -70,6 +72,7 @@ class PersonTracker:
                     "keypoints": track.get("keypoints", []),
                     "stationary_frames": track.get("stationary_frames", 0),
                     "movement": track.get("movement", 0.0),
+                    **track.get("metadata", {}),
                 }
             )
         return results
@@ -112,6 +115,16 @@ class PersonTracker:
         if isinstance(detection, dict):
             return detection.get("keypoints", [])
         return []
+
+    @staticmethod
+    def _get_metadata(detection):
+        if not isinstance(detection, dict):
+            return {}
+        return {
+            key: value
+            for key, value in detection.items()
+            if key not in {"bbox", "keypoints"}
+        }
 
     @staticmethod
     def _get_centroid(box):
