@@ -1,22 +1,31 @@
 # detectWarning
 
-파이썬기반응용프로그래밍 4조 프로젝트입니다.
+카메라 영상과 마이크 음성을 이용해 사람을 찾고, 위험할 수 있는 상황을 실시간으로 보여주는 프로젝트입니다.
 
-웹캠 또는 영상 파일에서 사람의 관절점과 얼굴을 감지하고, 마이크 입력 음성과 함께 분석하여 실시간 위험도를 계산합니다.
+이 프로젝트는 다음 정보를 화면에 보여줍니다.
 
-현재 시스템은 다음 흐름으로 동작합니다.
+- 사람
+- 얼굴
+- 음성 인식 결과
+- 위험도
 
-- 영상: `person detector -> box 내부 pose estimation -> temporal person filtering -> 얼굴 감지`
-- 음성: Whisper 기반 STT, 음량 분석, 상대 음량 급상승 감지
-- 위험도: 영상 + 음성 + 키워드 + 큰 소리 패턴을 결합한 휴리스틱 점수 계산
-- 이벤트 로그: 위험 점수가 일정 기준 이상이면 JSONL 형태로 저장
-- 표시: 한국어 UI로 사람 수, 얼굴 수, STT 결과, 위험도를 화면에 오버레이
-- 원격 추론: 팀원 노트북 카메라 영상을 데스크탑 서버로 보내 사람/얼굴 분석 가능
-- 웹 대시보드: 데스크탑 브라우저에서 팀원별 분석 화면을 확인 가능
-  맥북 브라우저에서도 같은 주소로 접속 가능
-- 웹 대시보드에는 데스크탑의 GPU/CPU/RAM/오디오 큐 상태도 함께 표시
+또한 팀 프로젝트용으로, 노트북 카메라 영상을 데스크탑 서버로 보내서 분석하는 방식도 지원합니다.
+
+## 이 프로젝트가 하는 일
+
+쉽게 말하면 아래 흐름으로 동작합니다.
+
+1. 카메라에서 사람을 찾습니다.
+2. 사람의 관절점과 얼굴을 확인합니다.
+3. 마이크 음성을 글자로 바꿉니다.
+4. 영상과 음성을 함께 보고 위험도를 계산합니다.
+5. 결과를 화면이나 웹에서 보여줍니다.
 
 ## 설치
+
+처음 한 번만 하면 됩니다.
+
+macOS / Linux:
 
 ```bash
 python3 -m venv .venv
@@ -24,381 +33,145 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 실행
+Windows PowerShell:
 
-웹캠 사용:
-
-```bash
-python3 app/main.py --source 0
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-영상과 함께 마이크 음성 인식(STT) 사용:
+## 가장 추천하는 실행 방법
+
+혼자서 바로 테스트할 때는 이 명령어 하나면 충분합니다.
 
 ```bash
 python3 app/main.py --source 0 --stt --stt-language ko-KR
 ```
 
-팀원 노트북 카메라 영상을 데스크탑에서 분석하려면 먼저 데스크탑에서 서버를 실행합니다.
+이렇게 실행하면:
 
-데스크탑 서버 실행:
+- 웹캠 화면이 열리고
+- 사람과 얼굴이 표시되고
+- 마이크 음성이 인식되고
+- 위험도가 함께 표시됩니다
 
-```bash
-python3 app/inference_server.py --host 0.0.0.0 --port 8000
+종료는 `q` 또는 `Esc` 키입니다.
+
+## 팀 프로젝트용 실행 방법
+
+팀원이 각자 노트북 카메라를 쓰고,
+분석은 한 대의 데스크탑에서 하고 싶을 때 사용하는 방법입니다.
+
+### 1. 데스크탑에서 서버 실행
+
+Windows PowerShell 기준:
+
+```powershell
+.venv\Scripts\activate
+python app\inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-compute-type float16
 ```
 
-GPU를 확실히 쓰도록 강제하고, 서버 STT를 `medium`으로 쓰려면:
+이 명령어는 데스크탑 GPU를 써서 사람 인식과 음성 인식을 처리합니다.
+
+### 2. 노트북에서 카메라와 마이크 전송
+
+macOS 기준:
 
 ```bash
-python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-model medium --stt-compute-type float16
-```
-
-현재 서버 STT 기본값은 정확도 중심으로 다음처럼 맞춰져 있습니다.
-
-- 모델: `medium`
-- `beam_size=3`
-- `best_of=3`
-- `no_speech_threshold=0.55`
-
-데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
-
-```bash
-python3 app/inference_server.py --host 0.0.0.0 --port 8000 --show-windows
-```
-
-팀원 노트북 실행:
-
-```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000
-```
-
-`100.x.x.x`는 Tailscale로 연결된 데스크탑의 IP 주소입니다.
-
-노트북 실행 전에 마이크를 직접 고르고 싶다면:
-
-```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000 --select-audio-device
-```
-
-장치 목록만 먼저 보고 싶다면:
-
-```bash
-python3 app/main.py --list-audio-devices
-```
-
-맥북 부담을 더 줄이고 카메라 프레임만 데스크탑으로 보내려면 전용 업로더를 사용합니다.
-
-```bash
-python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000
-```
-
-이 경우 분석 결과는 맥북 웹 브라우저에서 확인할 수 있습니다.
-
-마이크를 먼저 선택한 뒤 영상과 음성을 함께 보내려면:
-
-```bash
+source .venv/bin/activate
 python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --stt
 ```
 
-이 경우 업로더가 시작되기 전에 터미널에서 `마이크를 선택하세요.` 목록이 먼저 표시됩니다.
-기본 전송 속도는 `5 FPS`, 기본 타임아웃은 `10초`입니다.
+여기서 `100.x.x.x`는 데스크탑의 주소입니다.
+보통 Tailscale로 연결한 뒤 받은 IP를 넣으면 됩니다.
 
-웹 화면 FPS를 조금 더 높이고 싶다면:
+이렇게 실행하면:
 
-```bash
-python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --max-fps 6 --frame-width 960
-```
+- 노트북은 카메라와 마이크를 서버로 보내고
+- 무거운 분석은 데스크탑이 하고
+- 노트북 부담은 줄어듭니다
 
-맥북 브라우저 대시보드:
+### 3. 웹에서 결과 보기
+
+노트북 브라우저에서 아래 주소를 열면 됩니다.
 
 ```text
 http://100.x.x.x:8000
 ```
 
-특정 맥북 클라이언트 화면만 바로 보려면:
+이 웹 화면에서 볼 수 있는 정보:
 
-```text
-http://100.x.x.x:8000/?client_id=맥북_CLIENT_ID
-```
+- 현재 카메라 화면
+- 사람 수
+- 얼굴 수
+- 음성 인식 결과
+- 위험도
+- 데스크탑 GPU / CPU / 메모리 상태
 
-업로더를 실행하면 이 주소를 자동으로 출력합니다.
+## 실행 전에 확인할 것
 
-카메라 인덱스가 헷갈리면 먼저 사용 가능한 카메라를 탐색할 수 있습니다.
+- 카메라 권한 허용
+- 마이크 권한 허용
+- 다른 앱이 카메라나 마이크를 쓰고 있지 않은지 확인
 
-```bash
-python3 app/camera_uploader.py --server-url http://100.x.x.x:8000 --list-video-devices
-```
+특히 macOS에서는 아래 경로에서 권한을 확인하면 됩니다.
 
-경고 감지용 권장 균형 설정:
+- `시스템 설정 > 개인정보 보호 및 보안 > 카메라`
+- `시스템 설정 > 개인정보 보호 및 보안 > 마이크`
 
-```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model base --stt-phrase-seconds 1.8 --stt-beam-size 1
-```
+## 화면에서 보이는 것
 
-사람 감지를 좀 더 민감하게 하고 싶을 때:
+- `사람`: 현재 사람으로 인정된 대상 수
+- `얼굴`: 현재 감지된 얼굴 수
+- `음성 인식`: 지금 마이크가 잘 들어오는지와 인식 결과
+- `위험도`: 현재 상황이 얼마나 위험해 보이는지 점수로 표시
 
-```bash
-python3 app/main.py --source 0 --person-score-threshold 0.1 --person-nms-threshold 0.4
-```
+## 로그 파일
 
-사람 감지 정확도를 더 높이고 싶을 때:
+위험도가 높게 올라가면 로그가 저장됩니다.
 
-```bash
-python3 app/main.py --source 0 --person-imgsz 1280 --person-score-threshold 0.2
-```
+- 저장 위치: `logs/warnings.jsonl`
 
-FPS를 더 높이고 싶을 때:
+이 파일은 나중에 서버 전송이나 웹 대시보드 기능으로 확장할 때 그대로 사용할 수 있습니다.
 
-```bash
-python3 app/main.py --source 0 --person-imgsz 640 --person-detect-interval 3
-```
+## 잘 안 될 때 가장 먼저 볼 것
 
-사람 후보 상태와 제거 이유를 디버그 오버레이로 보고 싶을 때:
+### 웹캠이 안 열릴 때
 
-```bash
-python3 app/main.py --source 0 --person-debug
-```
+- 카메라 권한 확인
+- `--source 0` 대신 다른 카메라 번호가 필요한지 확인
+- Zoom, Meet, FaceTime 같은 앱 종료
 
-STT 정확도를 더 높이고 싶을 때:
+### 마이크가 안 될 때
 
-```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model small --stt-phrase-seconds 2.8 --stt-beam-size 4 --stt-best-of 4
-```
+- 마이크 권한 확인
+- 입력 장치가 올바른지 확인
 
-STT 지연을 더 줄이고 싶을 때:
+### 노트북에서 웹 접속이 안 될 때
 
-```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --stt-model tiny --stt-phrase-seconds 1.5 --stt-beam-size 1
-```
+- 데스크탑 서버가 켜져 있는지 확인
+- 데스크탑과 노트북이 같은 Tailscale 네트워크에 있는지 확인
+- 주소의 `100.x.x.x`가 맞는지 다시 확인
 
-로컬 영상 파일 사용:
+## 한 줄 정리
 
-```bash
-python3 app/main.py --source /path/to/video.mp4
-```
+가장 자주 쓰는 명령어는 아래 3개입니다.
 
-위험 이벤트 로그까지 함께 저장:
+로컬에서 바로 실행:
 
 ```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --warning-log-path logs/warnings.jsonl --warning-log-min-score 60
+python3 app/main.py --source 0 --stt --stt-language ko-KR
 ```
 
-원격 추론과 함께 로그도 저장:
+데스크탑 서버 실행:
+
+```powershell
+python app\inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-compute-type float16
+```
+
+노트북에서 업로더 실행:
 
 ```bash
-python3 app/main.py --source 0 --stt --stt-language ko-KR --server-url http://100.x.x.x:8000 --warning-log-path logs/warnings.jsonl
+python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --stt
 ```
-
-종료는 `q` 또는 `Esc` 키로 할 수 있습니다.
-
-화면 표시 정보
-
-- 감지된 사람을 `사람 1` 같은 추적 ID와 함께 관절점 스켈레톤 중심으로 표시
-- 확정된 사람만 최종 사람 수에 포함하고, 디버그 모드에서는 `full_body_person / upper_body_person / uncertain / rejected` 상태를 함께 표시
-- 감지된 얼굴을 파란색 박스로 표시
-- 상단에 `사람: n | 얼굴: n` 표시
-- `음성 인식`, `인식 내용`, `위험도`, `FPS`를 한국어로 표시
-- 원격 추론 사용 시 `원격 추론 | 서버 지연: nms` 상태를 표시
-- 최근 음성 키워드, 오디오 크기, 사람/얼굴 감지 결과를 합친 실시간 위험 점수 표시
-- 웹 대시보드 사용 시 데스크탑 브라우저에서 팀원별 분석 화면을 선택해 볼 수 있음
-- 웹 대시보드 사용 시 맥북 브라우저에서도 자기 카메라 분석 화면과 STT 결과를 볼 수 있음
-- 웹 대시보드에서 STT 기반 위험도 점수와 위험 단계도 함께 확인할 수 있음
-- 웹 대시보드에서 `위험 카테고리`와 `위험 신호`를 함께 확인할 수 있음
-
-## 위험 점수
-
-- 위험 점수는 0~100 범위의 휴리스틱 값이며, 안전 인증을 받은 분류기는 아닙니다.
-- 위험 단계는 `낮음`, `주의`, `경계`, `위험`으로 표시됩니다.
-- 단일 신호 하나만 보기보다 영상과 음성 신호를 함께 사용해 점수를 계산합니다.
-
-현재 반영된 기준은 다음과 같습니다.
-
-- 음성 키워드:
-  `살려줘`, `도와줘`, `하지 마`, `왜 이러세요`, `이러지 마세요`, `놔 주세요`, `불이야`, `경찰`, `신고해` 등
-- 음성 강도:
-  절대 음량이 큰 경우 가중치 부여
-- 상대 음량:
-  최근 몇 초간의 평균보다 갑자기 크게 올라간 소리를 `음량 급상승`, `고성 급상승`으로 반영
-- 반복 패턴:
-  큰 소리가 반복되면 `반복적 고성`
-- 매우 큰 소리:
-  `비명 의심`
-
-PDF 기준을 반영한 현재 위험 평가 핵심 항목:
-
-- 영상 분석 기준:
-  `넘어짐 의심`, `몸싸움 의심`, `달리며 추격`, `장시간 쓰러짐`
-- 음성 분석 기준:
-  `특정 비명`, `반복적 고성`, `위협적 음성 패턴`
-
-현재 웹 위험도는 특히 아래 음성 기준을 강하게 반영합니다.
-
-- `특정 비명`
-  예: `으악`, `아악`, `꺄악`, `비명`, `소리질러`
-- `반복적 고성`
-  짧은 시간 안에 큰 소리가 여러 번 반복될 때
-- `위협적 음성 패턴`
-  예: `죽여`, `죽인다`, `가만 안 둬`, `패줄게`, `때릴 거야`
-- 추가 문맥 기준
-  `대상 특정`, `즉시 실행 암시`, `수단 언급`, `조건부 위협`, `반복 위협`
-
-조합 가중치도 들어가 있습니다.
-
-- 키워드 + 사람
-- 키워드 + 얼굴
-- 키워드 + 큰 소리
-- 큰 소리 + 사람
-
-## 위험 이벤트 로그
-
-- 위험 점수가 기본 `60` 이상이면 `logs/warnings.jsonl`에 이벤트를 저장합니다.
-- 같은 이벤트가 짧은 시간에 반복될 때는 중복 로그를 줄이기 위해 쿨다운이 적용됩니다.
-- 저장 형식은 서버 전송을 염두에 둔 JSON Lines(`.jsonl`)입니다.
-
-예시 스키마:
-
-```json
-{
-  "event_id": "evt_20260401_143218_123456",
-  "timestamp": "2026-04-01T14:32:18+09:00",
-  "source": "0",
-  "score": 78,
-  "level": "HIGH",
-  "categories": ["도움 요청", "반복적 고성", "사람:1"],
-  "matched_keywords": ["도와줘"],
-  "transcript": "도와주세요",
-  "people_count": 1,
-  "face_count": 1,
-  "audio_level": 0.1832
-}
-```
-
-## 참고 사항
-
-- 영상 입력이 로컬 파일이어도 STT는 마이크를 사용합니다.
-- 새로운 음성 인식 의존성은 `pip install -r requirements.txt`로 설치할 수 있습니다.
-- STT는 현재 `faster-whisper`를 사용한 로컬 Whisper 추론으로 동작합니다.
-- 사람 검출은 detection 모델로 1차 bbox를 찾고, 그 bbox 내부에만 pose model을 적용합니다.
-- 따라서 배경 전체에서 pose만 보고 사람으로 확정하지 않도록 구성되어 있습니다.
-- 처음 모델을 로드할 때는 Whisper 가중치 다운로드가 필요할 수 있어, 최초 1회는 인터넷 연결이 필요할 수 있습니다.
-- 처음 사람 감지를 실행할 때도 detection / pose 가중치 다운로드가 필요할 수 있습니다.
-- 기본 STT 설정은 경고 감지에 맞춘 균형형 설정입니다. `base` 모델과 짧은 구간, 빠른 디코딩을 사용합니다.
-- `small`, `medium` 같은 더 큰 모델은 보통 더 정확하지만, CPU/GPU 자원을 더 많이 사용합니다.
-- `tiny`는 더 빠르지만, 한국어 인식 품질까지 고려하면 보통 `base`가 더 좋은 균형점입니다.
-- macOS에서는 OpenCV와 Whisper 의존성 간 FFmpeg 충돌을 피하기 위해 STT를 별도 프로세스로 실행합니다.
-- 사람 감지가 느리면 `--person-imgsz` 값을 낮추고, 더 정확하게 보고 싶으면 값을 높여볼 수 있습니다.
-- FPS가 부족하면 `--person-detect-interval` 값을 2 또는 3으로 높여 사람 감지를 덜 자주 수행할 수 있습니다.
-- 서버 연동 전 단계로 `logs/warnings.jsonl` 파일을 그대로 읽어 전송 계층에 연결할 수 있습니다.
-- `--server-url`을 주면 노트북은 로컬 YOLO/얼굴 추론을 하지 않고 JPEG 프레임만 서버로 전송합니다.
-- 원격 추론 서버는 `client_id`별로 사람 추적 상태를 따로 유지합니다.
-- 사람 여부는 detector confidence, pose quality, geometry, temporal consistency, static false positive risk를 함께 봅니다.
-- 하체 keypoint가 없더라도 얼굴/어깨/상반신 구조가 안정적이면 `upper_body_person`으로 유지합니다.
-- 팀 프로젝트에서는 Tailscale로 데스크탑과 팀원 노트북을 같은 tailnet에 연결하는 방식을 권장합니다.
-- `app/camera_uploader.py`를 쓰면 노트북은 카메라와 선택적으로 마이크를 서버로 보내고, 분석 결과는 맥북 브라우저에서 확인할 수 있습니다.
-
-## 원격 추론 구조
-
-- 팀원 노트북:
-  카메라 입력, 선택적으로 마이크 입력, 브라우저 대시보드 확인
-- 데스크탑 서버:
-  사람 관절점 감지, 얼굴 감지, 사람 추적, 서버 STT
-  기본 STT 모델은 `medium`
-- 선택적으로 데스크탑 OpenCV 창에서 팀원별 분석 화면 표시
-- 데스크탑 브라우저:
-  팀원별 분석 화면과 사람/얼굴 수, 서버 지연 확인
-- 맥북 브라우저:
-  자기 client_id의 분석 화면, STT 상태, 인식 문장 확인
-- 통신 방식:
-  노트북이 JPEG 프레임을 HTTP로 전송하고, 서버가 사람/얼굴 결과 JSON을 반환
-
-노트북 쪽 주요 옵션:
-
-- `--server-url`
-  원격 추론 서버 주소
-- `--server-client-id`
-  팀원별 고유 식별자. 비우면 자동 생성
-- `--server-timeout-seconds`
-  서버 응답 대기 시간
-- `--server-jpeg-quality`
-  전송용 JPEG 품질. 낮출수록 빠르지만 화질이 떨어짐
-- `--select-audio-device`
-  실행 직전에 사용할 마이크 장치를 직접 선택
-
-서버 쪽 주요 옵션:
-
-- `--host`
-  바인드 주소. 팀원 접속을 받으려면 보통 `0.0.0.0`
-- `--port`
-  서버 포트
-- `--person-score-threshold`
-  서버 사람 감지 민감도
-- `--person-imgsz`
-  서버 YOLO 입력 크기
-- `--client-session-ttl`
-  팀원별 추적 상태 유지 시간
-- `--show-windows`
-  데스크탑에서 수신 영상과 검출 결과를 OpenCV 창으로 직접 표시
-- `--person-debug`
-  `full_body_person / upper_body_person / uncertain / rejected` 상태와 제거 이유를 서버 오버레이에 표시
-- `--yolo-device`
-  YOLO 추론 장치. GPU를 강제로 쓰려면 `cuda:0`
-- `--stt-device`
-  Whisper 추론 장치. GPU를 강제로 쓰려면 `cuda`
-
-업로더 쪽 주요 옵션:
-
-- `--server-url`
-  전송할 원격 추론 서버 주소
-- `--client-id`
-  팀원별 식별자
-- `--jpeg-quality`
-  전송 화질
-- `--max-fps`
-  전송 프레임 속도 제한
-- `--frame-width`
-  전송 전에 축소할 가로 해상도. 낮출수록 보통 더 부드러움
-- `--show-local-preview`
-  노트북에서도 카메라 미리보기 표시
-- `--stt`
-  맥북 마이크 오디오도 함께 서버로 보내 STT 수행
-- `--stt-device`
-  업로더에서 사용할 마이크 장치 번호
-- `--select-audio-device`
-  실행 전에 마이크 장치를 직접 고르기
-- `--stt-phrase-seconds`
-  한 번에 보낼 오디오 길이
-- `--stt-silence-seconds`
-  조용해졌다고 판단하는 기준 시간
-
-## 오탐 감소 로직
-
-- 사람 판정은 단일 bbox 또는 keypoint 개수만으로 하지 않고, 다음을 종합해서 점수화합니다.
-  detector confidence, pose 평균 confidence, 유효 keypoint 수, 핵심 keypoint 존재, bbox 크기/종횡비, skeleton geometry, temporal consistency, static false positive risk
-- 최종 상태는 `full_body_person`, `upper_body_person`, `uncertain`, `rejected` 네 단계입니다.
-- `upper_body_person`은 앉아 있거나 테이블/의자에 가려져 하체가 안 보여도 얼굴/어깨/상반신 구조가 안정적이면 유지합니다.
-- `uncertain`은 즉시 제거하지 않고, 연속 프레임에서 승격 또는 제거되도록 남겨둡니다.
-- static false positive는 `움직임 없음 + 낮은 detector confidence + 약한 pose quality + 나쁜 geometry + 얼굴 부재` 같은 복합 조건으로 억제합니다.
-- threshold는 [`app/person_classifier.py`](/Users/jung-uiseok/Desktop/detectWarning/app/person_classifier.py)에 모아두었습니다.
-
-주요 튜닝 포인트:
-
-- 오탐이 많으면:
-  `PERSON_DET_CONF_THRES`, `FULL_BODY_SCORE_THRES`, `UPPER_BODY_SCORE_THRES`를 먼저 올립니다.
-- 앉은 사람/상반신 사람을 더 살리고 싶으면:
-  `MIN_VALID_KPTS_UPPER`, `MIN_CORE_KPTS_UPPER`, `UPPER_BODY_SCORE_THRES`를 먼저 조정합니다.
-- 정적인 포스터/옷걸이 오탐을 더 줄이고 싶으면:
-  `STATIC_FP_TIME_WINDOW`, `STATIC_MOTION_THRES`를 조정합니다.
-- 프레임 가장자리 잘림 때문에 누락이 많으면:
-  `FRAME_EDGE_MARGIN_RATIO`와 geometry 관련 threshold를 완화합니다.
-
-## 성능 튜닝 팁
-
-- 더 빠르게:
-  `--person-imgsz 640 --person-detect-interval 3`
-- 더 정확하게:
-  `--person-imgsz 1280 --person-score-threshold 0.2`
-- 사람을 더 민감하게 잡고 싶을 때:
-  `--person-score-threshold 0.1`
-- STT를 더 정확하게:
-  `--stt-model small --stt-beam-size 4 --stt-best-of 4`
-- STT를 더 빠르게:
-  `--stt-model tiny --stt-phrase-seconds 1.5`
