@@ -14,6 +14,7 @@
 - 원격 추론: 팀원 노트북 카메라 영상을 데스크탑 서버로 보내 사람/얼굴 분석 가능
 - 웹 대시보드: 데스크탑 브라우저에서 팀원별 분석 화면을 확인 가능
   맥북 브라우저에서도 같은 주소로 접속 가능
+- 웹 대시보드에는 데스크탑의 GPU/CPU/RAM/오디오 큐 상태도 함께 표시
 
 ## 설치
 
@@ -50,6 +51,13 @@ GPU를 확실히 쓰도록 강제하고, 서버 STT를 `medium`으로 쓰려면:
 ```bash
 python3 app/inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 --stt-device cuda --stt-model medium --stt-compute-type float16
 ```
+
+현재 서버 STT 기본값은 정확도 중심으로 다음처럼 맞춰져 있습니다.
+
+- 모델: `medium`
+- `beam_size=3`
+- `best_of=3`
+- `no_speech_threshold=0.55`
 
 데스크탑에서 팀원 카메라 영상에 검출 결과까지 직접 보고 싶다면:
 

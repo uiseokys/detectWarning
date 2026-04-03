@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import platform
 import queue
+import shutil
+import socket
+import subprocess
 import threading
 from dataclasses import dataclass
 from time import monotonic, perf_counter
@@ -19,6 +23,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from risk_analyzer import RiskAnalyzer
 from tracker import PersonTracker
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 @dataclass
@@ -43,8 +52,118 @@ class ServerSpeechResult:
     audio_level: float = 0.0
 
 
+class SystemMonitor:
+    def __init__(self, args, audio_job_queue: queue.Queue) -> None:
+        self.args = args
+        self.audio_job_queue = audio_job_queue
+        self._lock = threading.Lock()
+        self._snapshot = self._collect_snapshot()
+        if psutil is not None:
+            psutil.cpu_percent(interval=None)
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="system-monitor", daemon=True).start()
+
+    def get_snapshot(self) -> dict:
+        with self._lock:
+            snapshot = dict(self._snapshot)
+        snapshot["audio_queue_size"] = self.audio_job_queue.qsize()
+        return snapshot
+
+    def _run(self) -> None:
+        while True:
+            snapshot = self._collect_snapshot()
+            with self._lock:
+                self._snapshot = snapshot
+            threading.Event().wait(1.0)
+
+    def _collect_snapshot(self) -> dict:
+        snapshot = {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "yolo_device": self.args.yolo_device,
+            "stt_device": self.args.stt_device,
+            "stt_compute_type": self.args.stt_compute_type,
+            "stt_beam_size": self.args.stt_beam_size,
+            "stt_best_of": self.args.stt_best_of,
+            "audio_queue_size": self.audio_job_queue.qsize(),
+            "cpu_percent": None,
+            "memory_percent": None,
+            "memory_used_gb": None,
+            "memory_total_gb": None,
+            "gpu_name": "",
+            "gpu_utilization_percent": None,
+            "gpu_memory_percent": None,
+            "gpu_memory_used_mb": None,
+            "gpu_memory_total_mb": None,
+            "gpu_temperature_c": None,
+            "gpu_power_watts": None,
+            "gpu_status": "unavailable",
+        }
+
+        if psutil is not None:
+            try:
+                memory = psutil.virtual_memory()
+                snapshot["cpu_percent"] = round(psutil.cpu_percent(interval=None), 1)
+                snapshot["memory_percent"] = round(memory.percent, 1)
+                snapshot["memory_used_gb"] = round(memory.used / (1024 ** 3), 1)
+                snapshot["memory_total_gb"] = round(memory.total / (1024 ** 3), 1)
+            except Exception:
+                pass
+
+        nvidia_smi = shutil.which("nvidia-smi")
+        if not nvidia_smi:
+            snapshot["gpu_status"] = "nvidia-smi not found"
+            return snapshot
+
+        try:
+            result = subprocess.run(
+                [
+                    nvidia_smi,
+                    "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=True,
+            )
+            first_line = result.stdout.strip().splitlines()[0]
+            parts = [part.strip() for part in first_line.split(",")]
+            if len(parts) >= 7:
+                snapshot["gpu_name"] = parts[0]
+                snapshot["gpu_utilization_percent"] = _to_float(parts[1])
+                snapshot["gpu_memory_percent"] = _to_float(parts[2])
+                snapshot["gpu_memory_used_mb"] = _to_float(parts[3])
+                snapshot["gpu_memory_total_mb"] = _to_float(parts[4])
+                snapshot["gpu_temperature_c"] = _to_float(parts[5])
+                snapshot["gpu_power_watts"] = _to_float(parts[6])
+                snapshot["gpu_status"] = "ok"
+        except Exception as exc:
+            snapshot["gpu_status"] = f"error: {exc}"
+
+        return snapshot
+
+
+def _to_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 class ServerSpeechRecognizer:
-    def __init__(self, model_size: str, compute_type: str, language: str, device: str) -> None:
+    def __init__(
+        self,
+        model_size: str,
+        compute_type: str,
+        language: str,
+        device: str,
+        beam_size: int,
+        best_of: int,
+        no_speech_threshold: float,
+    ) -> None:
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:
@@ -54,6 +173,9 @@ class ServerSpeechRecognizer:
 
         self.language = normalize_language(language)
         self.device = device
+        self.beam_size = beam_size
+        self.best_of = best_of
+        self.no_speech_threshold = no_speech_threshold
         self.model = WhisperModel(
             model_size_or_path=model_size,
             device=device,
@@ -75,9 +197,9 @@ class ServerSpeechRecognizer:
                 audio,
                 language=self.language,
                 vad_filter=False,
-                beam_size=1,
-                best_of=1,
-                no_speech_threshold=0.6,
+                beam_size=self.beam_size,
+                best_of=self.best_of,
+                no_speech_threshold=self.no_speech_threshold,
                 condition_on_previous_text=False,
                 temperature=0.0,
             )
@@ -153,15 +275,6 @@ def draw_pose_overlay(frame, keypoints) -> None:
         if point.get("confidence", 0.0) < 0.35:
             continue
         cv2.circle(frame, (int(point["x"]), int(point["y"])), 4, (0, 120, 255), -1)
-    cv2.putText(
-        frame,
-        f"people: {len(tracked_people)} | faces: {len(faces)} | latency: {latency_ms:.1f}ms",
-        (20, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2,
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,6 +315,24 @@ def parse_args() -> argparse.Namespace:
         help="서버 STT용 Whisper 연산 타입",
     )
     parser.add_argument(
+        "--stt-beam-size",
+        type=int,
+        default=3,
+        help="서버 STT beam size. 클수록 보통 더 정확하지만 느려집니다.",
+    )
+    parser.add_argument(
+        "--stt-best-of",
+        type=int,
+        default=3,
+        help="서버 STT best_of. 클수록 보통 더 정확하지만 느려집니다.",
+    )
+    parser.add_argument(
+        "--stt-no-speech-threshold",
+        type=float,
+        default=0.55,
+        help="낮출수록 더 많은 오디오를 음성으로 간주합니다.",
+    )
+    parser.add_argument(
         "--stt-language",
         default="ko-KR",
         help="서버 STT 언어 코드. 예: ko-KR",
@@ -232,10 +363,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         compute_type=args.stt_compute_type,
         language=args.stt_language,
         device=args.stt_device,
+        beam_size=args.stt_beam_size,
+        best_of=args.stt_best_of,
+        no_speech_threshold=args.stt_no_speech_threshold,
     )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
     audio_job_queue: queue.Queue[AudioJob] = queue.Queue(maxsize=32)
+    system_monitor = SystemMonitor(args, audio_job_queue)
+    system_monitor.start()
 
     def get_session(client_id: str) -> ClientSession:
         now = monotonic()
@@ -333,6 +469,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       grid-template-columns: 280px 1fr;
       gap: 20px;
     }
+    .system-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 20px;
+    }
     .panel {
       background: rgba(255, 250, 242, 0.92);
       border: 1px solid var(--line);
@@ -389,6 +531,21 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       padding: 8px 12px;
       font-size: 14px;
     }
+    .stat.block {
+      display: block;
+      border-radius: 16px;
+      min-height: 74px;
+    }
+    .stat-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .stat-value {
+      font-weight: 700;
+      line-height: 1.4;
+      white-space: pre-line;
+    }
     .screen {
       width: 100%;
       aspect-ratio: 16 / 9;
@@ -412,6 +569,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
     @media (max-width: 900px) {
       .grid { grid-template-columns: 1fr; }
+      .system-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -422,6 +580,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         <h1>detectWarning<br/>원격 분석 대시보드</h1>
         <p>팀원 노트북 카메라 영상을 데스크탑에서 분석하고 브라우저로 확인합니다.</p>
       </div>
+    </div>
+    <div class="system-grid">
+      <div class="stat block"><div class="stat-label">데스크탑</div><div class="stat-value" id="desktopHost">-</div></div>
+      <div class="stat block"><div class="stat-label">GPU</div><div class="stat-value" id="desktopGpu">-</div></div>
+      <div class="stat block"><div class="stat-label">CPU / RAM</div><div class="stat-value" id="desktopCpuRam">-</div></div>
+      <div class="stat block"><div class="stat-label">서버 상태</div><div class="stat-value" id="desktopRuntime">-</div></div>
     </div>
     <div class="grid">
       <section class="panel">
@@ -453,6 +617,25 @@ def create_app(args: argparse.Namespace) -> FastAPI:
   </div>
   <script>
     let selectedClientId = null;
+
+    async function refreshSystem() {
+      const response = await fetch('/api/system');
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      document.getElementById('desktopHost').textContent = `${data.hostname}\n${data.platform}`;
+      const gpuLine = data.gpu_status === 'ok'
+        ? `${data.gpu_name}\nGPU ${data.gpu_utilization_percent ?? 0}% | VRAM ${Math.round(data.gpu_memory_used_mb ?? 0)}/${Math.round(data.gpu_memory_total_mb ?? 0)} MB\n온도 ${data.gpu_temperature_c ?? '-'}C | 전력 ${data.gpu_power_watts ?? '-'}W`
+        : `GPU 정보 없음\n${data.gpu_status}`;
+      document.getElementById('desktopGpu').textContent = gpuLine;
+      const cpuRamLine =
+        `CPU ${data.cpu_percent ?? 0}%\nRAM ${data.memory_percent ?? 0}% (${data.memory_used_gb ?? 0}/${data.memory_total_gb ?? 0} GB)`;
+      document.getElementById('desktopCpuRam').textContent = cpuRamLine;
+      const runtimeLine =
+        `오디오 큐 ${data.audio_queue_size}\nYOLO ${data.yolo_device}\nSTT ${data.stt_device} / ${data.stt_compute_type}\nbeam ${data.stt_beam_size} | best_of ${data.stt_best_of}`;
+      document.getElementById('desktopRuntime').textContent = runtimeLine;
+    }
 
     async function refreshClients() {
       const response = await fetch('/api/clients');
@@ -533,7 +716,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       selectedClientId = requestedClientId;
     }
 
+    refreshSystem();
     refreshClients();
+    setInterval(refreshSystem, 1000);
     setInterval(refreshClients, 1000);
     setInterval(refreshSelectedFrame, 350);
   </script>
@@ -542,14 +727,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {
-            "status": "ok",
-            "sessions": len(sessions),
-            "audio_queue_size": audio_job_queue.qsize(),
-            "yolo_device": args.yolo_device,
-            "stt_device": args.stt_device,
-            "stt_compute_type": args.stt_compute_type,
-        }
+        snapshot = system_monitor.get_snapshot()
+        snapshot.update({"status": "ok", "sessions": len(sessions)})
+        return snapshot
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
@@ -558,6 +738,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     @app.get("/api/clients")
     def api_clients() -> list[dict]:
         return list_client_summaries()
+
+    @app.get("/api/system")
+    def api_system() -> dict:
+        snapshot = system_monitor.get_snapshot()
+        snapshot["sessions"] = len(sessions)
+        return snapshot
 
     @app.get("/api/client/{client_id}")
     def api_client(client_id: str) -> dict:
@@ -736,6 +922,7 @@ def main() -> None:
     print(f"[detectWarning] YOLO device: {args.yolo_device}")
     print(f"[detectWarning] Whisper device: {args.stt_device}")
     print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")
+    print(f"[detectWarning] Whisper beam/best_of: {args.stt_beam_size}/{args.stt_best_of}")
     app = create_app(args)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
