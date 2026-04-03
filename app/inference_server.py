@@ -422,195 +422,702 @@ def create_app(args: argparse.Namespace) -> FastAPI:
   <title>detectWarning Dashboard</title>
   <style>
     :root {
-      --bg: #f2efe6;
-      --panel: #fffaf2;
-      --ink: #18222f;
-      --accent: #cf5f39;
-      --line: #d6c8b7;
-      --muted: #6d737b;
+      --bg-top: #f8fbff;
+      --bg-bottom: #ecf2f8;
+      --panel: rgba(255, 255, 255, 0.88);
+      --panel-strong: rgba(255, 255, 255, 0.96);
+      --panel-soft: rgba(248, 251, 255, 0.82);
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: rgba(148, 163, 184, 0.22);
+      --line-strong: rgba(148, 163, 184, 0.35);
+      --accent: #2563eb;
+      --accent-soft: rgba(37, 99, 235, 0.12);
+      --success: #059669;
+      --success-soft: rgba(5, 150, 105, 0.12);
+      --warn: #d97706;
+      --warn-soft: rgba(217, 119, 6, 0.12);
+      --danger: #dc2626;
+      --danger-soft: rgba(220, 38, 38, 0.12);
+      --shadow-lg: 0 24px 60px rgba(15, 23, 42, 0.10);
+      --shadow-md: 0 12px 28px rgba(15, 23, 42, 0.08);
+      --shadow-sm: 0 8px 18px rgba(15, 23, 42, 0.06);
+      --radius-xl: 28px;
+      --radius-lg: 22px;
+      --radius-md: 18px;
+      --radius-sm: 14px;
     }
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      min-height: 100%;
+    }
     body {
       margin: 0;
-      font-family: "Pretendard", "Apple SD Gothic Neo", sans-serif;
-      background: radial-gradient(circle at top, #fff7e8 0%, var(--bg) 60%, #e9e4d8 100%);
       color: var(--ink);
+      font-family: "SF Pro Display", "Pretendard", "SUIT", "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 28%),
+        radial-gradient(circle at top right, rgba(14, 165, 233, 0.10), transparent 24%),
+        linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
     }
     .wrap {
-      max-width: 1200px;
+      max-width: 1480px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 28px 28px 36px;
     }
     .hero {
       display: flex;
+      align-items: flex-end;
       justify-content: space-between;
-      align-items: end;
-      gap: 16px;
-      margin-bottom: 20px;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .hero-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.66);
+      border: 1px solid rgba(37, 99, 235, 0.14);
+      color: #1d4ed8;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      backdrop-filter: blur(12px);
+    }
+    .eyebrow::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(37, 99, 235, 0.10);
     }
     .hero h1 {
       margin: 0;
-      font-size: 34px;
-      line-height: 1.05;
+      font-size: clamp(34px, 4vw, 48px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      font-weight: 800;
     }
     .hero p {
-      margin: 8px 0 0;
+      margin: 0;
+      max-width: 760px;
       color: var(--muted);
       font-size: 15px;
+      line-height: 1.65;
     }
-    .grid {
-      display: grid;
-      grid-template-columns: 280px 1fr;
-      gap: 20px;
+    .hero-summary {
+      min-width: 240px;
+      padding: 16px 18px;
+      border-radius: 20px;
+      background: linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(244, 248, 255, 0.82));
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      box-shadow: var(--shadow-md);
+      backdrop-filter: blur(14px);
+    }
+    .hero-summary-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .hero-summary-value {
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.4;
     }
     .system-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      margin-bottom: 20px;
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .system-card,
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm);
+      backdrop-filter: blur(16px);
+    }
+    .system-card {
+      padding: 18px;
+      min-height: 132px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .system-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .system-value {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.6;
+      white-space: pre-line;
+      color: var(--ink);
+    }
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
     }
     .panel {
-      background: rgba(255, 250, 242, 0.92);
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      box-shadow: 0 20px 60px rgba(100, 78, 44, 0.08);
       overflow: hidden;
     }
     .panel-head {
-      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 20px 22px;
       border-bottom: 1px solid var(--line);
-      font-weight: 700;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.52));
     }
-    .clients {
-      padding: 10px;
+    .panel-head-copy {
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      max-height: 72vh;
-      overflow: auto;
+      gap: 5px;
     }
-    .client {
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 14px;
-      background: #fffdf8;
-      cursor: pointer;
-    }
-    .client.active {
-      border-color: var(--accent);
-      box-shadow: inset 0 0 0 1px var(--accent);
-    }
-    .client-title {
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    .client-meta {
+    .panel-kicker {
       color: var(--muted);
-      font-size: 13px;
-      line-height: 1.5;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
-    .viewer {
-      padding: 18px;
+    .panel-title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
     }
-    .stats {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .stat {
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 999px;
+    .panel-note {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       padding: 8px 12px;
-      font-size: 14px;
-    }
-    .stat.block {
-      display: block;
-      border-radius: 16px;
-      min-height: 74px;
-    }
-    .stat-label {
+      border-radius: 999px;
+      background: var(--panel-soft);
+      border: 1px solid var(--line);
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 6px;
-    }
-    .stat-value {
       font-weight: 700;
-      line-height: 1.4;
-      white-space: pre-line;
+      white-space: nowrap;
+    }
+    .panel-note::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 0 5px rgba(5, 150, 105, 0.10);
+    }
+    .clients {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-height: 76vh;
+      overflow: auto;
+    }
+    .clients::-webkit-scrollbar {
+      width: 10px;
+    }
+    .clients::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.26);
+      border-radius: 999px;
+    }
+    .client-card {
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 249, 253, 0.88));
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+      cursor: pointer;
+      transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+    }
+    .client-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
+      border-color: rgba(37, 99, 235, 0.24);
+    }
+    .client-card.active {
+      border-color: rgba(37, 99, 235, 0.46);
+      box-shadow:
+        inset 0 0 0 1px rgba(37, 99, 235, 0.16),
+        0 18px 34px rgba(37, 99, 235, 0.12);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 1), rgba(239, 246, 255, 0.96));
+    }
+    .client-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .client-name {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.45;
+      word-break: break-all;
+    }
+    .client-badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+    .mini-badge,
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 32px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .mini-badge::before,
+    .status-pill::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.85;
+    }
+    .tone-neutral {
+      color: #475569;
+      background: rgba(148, 163, 184, 0.10);
+      border-color: rgba(148, 163, 184, 0.18);
+    }
+    .tone-good {
+      color: var(--success);
+      background: var(--success-soft);
+      border-color: rgba(5, 150, 105, 0.18);
+    }
+    .tone-warn {
+      color: var(--warn);
+      background: var(--warn-soft);
+      border-color: rgba(217, 119, 6, 0.18);
+    }
+    .tone-danger {
+      color: var(--danger);
+      background: var(--danger-soft);
+      border-color: rgba(220, 38, 38, 0.18);
+    }
+    .tone-accent {
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-color: rgba(37, 99, 235, 0.18);
+    }
+    .client-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .client-stat {
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(248, 250, 252, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .client-stat strong {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+      margin-top: 2px;
+    }
+    .client-transcript,
+    .client-categories {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .client-transcript {
+      min-height: 38px;
+      margin-bottom: 8px;
+    }
+    .client-empty {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px dashed rgba(148, 163, 184, 0.28);
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+      background: rgba(255, 255, 255, 0.56);
+    }
+    .viewer {
+      padding: 20px 22px 22px;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .metric-card {
+      min-height: 98px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.84));
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      justify-content: space-between;
+    }
+    .metric-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .metric-value {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.3;
+      color: var(--ink);
+    }
+    .metric-value.metric-compact {
+      font-size: 17px;
+      font-weight: 700;
+    }
+    .metric-value.status-pill {
+      width: fit-content;
+      max-width: 100%;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .detail-card {
+      min-height: 106px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+    }
+    .detail-label {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .detail-value {
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.65;
+      word-break: keep-all;
+    }
+    .screen-shell {
+      padding: 16px;
+      border-radius: 24px;
+      background:
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 28%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(243, 247, 252, 0.82));
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), var(--shadow-sm);
+    }
+    .screen-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .screen-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .screen-subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
     }
     .screen {
       width: 100%;
       aspect-ratio: 16 / 9;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: linear-gradient(135deg, #ddd4c8, #f7f2eb);
+      border-radius: 20px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background:
+        linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(30, 41, 59, 0.96));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), var(--shadow-md);
       overflow: hidden;
       display: flex;
       align-items: center;
       justify-content: center;
+      position: relative;
+    }
+    .screen::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(transparent, rgba(15, 23, 42, 0.08)),
+        radial-gradient(circle at top left, rgba(96, 165, 250, 0.14), transparent 24%);
+      pointer-events: none;
     }
     .screen img {
       width: 100%;
       height: 100%;
       object-fit: contain;
-      background: #1f2328;
+      background: #111827;
+      position: relative;
+      z-index: 1;
     }
-    .placeholder {
-      color: var(--muted);
-      font-size: 16px;
+    .screen-empty {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      text-align: center;
+      padding: 24px;
+      color: rgba(226, 232, 240, 0.90);
     }
-    @media (max-width: 900px) {
-      .grid { grid-template-columns: 1fr; }
-      .system-grid { grid-template-columns: 1fr 1fr; }
+    .screen-empty-icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 28px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+    .screen-empty-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .screen-empty-copy {
+      font-size: 14px;
+      line-height: 1.7;
+      color: rgba(226, 232, 240, 0.72);
+      max-width: 420px;
+    }
+    @media (max-width: 1280px) {
+      .metric-grid,
+      .detail-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 980px) {
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+      .system-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 720px) {
+      .wrap {
+        padding: 18px;
+      }
+      .hero {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .system-grid,
+      .metric-grid,
+      .detail-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="hero">
-      <div>
-        <h1>detectWarning<br/>원격 분석 대시보드</h1>
-        <p>팀원 노트북 카메라 영상을 데스크탑에서 분석하고 브라우저로 확인합니다.</p>
+    <header class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">AI Monitoring System</span>
+        <h1>detectWarning 실시간 모니터링 대시보드</h1>
+        <p>팀원 노트북에서 들어오는 영상과 음성을 데스크탑 서버가 분석하고, 현재 상태를 한눈에 볼 수 있도록 정리한 실시간 대시보드입니다.</p>
       </div>
-    </div>
-    <div class="system-grid">
-      <div class="stat block"><div class="stat-label">데스크탑</div><div class="stat-value" id="desktopHost">-</div></div>
-      <div class="stat block"><div class="stat-label">GPU</div><div class="stat-value" id="desktopGpu">-</div></div>
-      <div class="stat block"><div class="stat-label">CPU / RAM</div><div class="stat-value" id="desktopCpuRam">-</div></div>
-      <div class="stat block"><div class="stat-label">서버 상태</div><div class="stat-value" id="desktopRuntime">-</div></div>
-    </div>
-    <div class="grid">
-      <section class="panel">
-        <div class="panel-head">연결된 클라이언트</div>
-        <div id="clients" class="clients"></div>
-      </section>
-      <section class="panel">
-        <div class="panel-head">실시간 분석 화면</div>
-        <div class="viewer">
-          <div class="stats">
-            <div class="stat" id="clientName">클라이언트: -</div>
-            <div class="stat" id="peopleCount">사람: 0</div>
-            <div class="stat" id="faceCount">얼굴: 0</div>
-            <div class="stat" id="latency">지연: 0ms</div>
-            <div class="stat" id="lastSeen">최근 수신: -</div>
-            <div class="stat" id="speechStatus">음성 인식: 대기</div>
-            <div class="stat" id="audioLevel">오디오 레벨: 0.000</div>
-          <div class="stat" id="riskLevel">위험도: 0/100 | 낮음</div>
+      <div class="hero-summary">
+        <div class="hero-summary-label">Presentation Ready</div>
+        <div class="hero-summary-value">실시간 분석 화면, 위험도, 시스템 상태를 한 화면에서 확인</div>
+      </div>
+    </header>
+
+    <section class="system-grid">
+      <article class="system-card">
+        <div class="system-title">Desktop</div>
+        <div class="system-value" id="desktopHost">-</div>
+      </article>
+      <article class="system-card">
+        <div class="system-title">GPU</div>
+        <div class="system-value" id="desktopGpu">-</div>
+      </article>
+      <article class="system-card">
+        <div class="system-title">CPU / RAM</div>
+        <div class="system-value" id="desktopCpuRam">-</div>
+      </article>
+      <article class="system-card">
+        <div class="system-title">Runtime</div>
+        <div class="system-value" id="desktopRuntime">-</div>
+      </article>
+    </section>
+
+    <section class="dashboard-grid">
+      <aside class="panel">
+        <div class="panel-head">
+          <div class="panel-head-copy">
+            <div class="panel-kicker">Clients</div>
+            <h2 class="panel-title">연결된 클라이언트</h2>
           </div>
-          <div class="stat" id="transcript" style="display:block; border-radius:16px; margin-bottom:16px;">인식 내용: -</div>
-          <div class="stat" id="riskCategories" style="display:block; border-radius:16px; margin-bottom:16px;">위험 카테고리: 없음</div>
-          <div class="stat" id="riskReasons" style="display:block; border-radius:16px; margin-bottom:16px;">위험 신호: 없음</div>
-          <div class="screen" id="screen">
-            <div class="placeholder">클라이언트를 선택하면 분석 화면이 표시됩니다.</div>
-          </div>
+          <div class="panel-note">자동 갱신</div>
         </div>
-      </section>
-    </div>
+        <div id="clients" class="clients"></div>
+      </aside>
+
+      <main class="panel">
+        <div class="panel-head">
+          <div class="panel-head-copy">
+            <div class="panel-kicker">Live View</div>
+            <h2 class="panel-title">실시간 분석 화면</h2>
+          </div>
+          <div class="panel-note">AI 분석 중</div>
+        </div>
+        <div class="viewer">
+          <section class="metric-grid">
+            <article class="metric-card">
+              <div class="metric-label">클라이언트</div>
+              <div class="metric-value metric-compact" id="clientName">-</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">사람 수</div>
+              <div class="metric-value" id="peopleCount">0</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">얼굴 수</div>
+              <div class="metric-value" id="faceCount">0</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">지연 시간</div>
+              <div class="metric-value" id="latency">0ms</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">최근 수신</div>
+              <div class="metric-value metric-compact" id="lastSeen">-</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">음성 인식 상태</div>
+              <div class="metric-value status-pill tone-neutral" id="speechStatus">대기</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">오디오 레벨</div>
+              <div class="metric-value metric-compact" id="audioLevel">0.000</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">위험도</div>
+              <div class="metric-value status-pill tone-neutral" id="riskLevel">0/100 | 낮음</div>
+            </article>
+          </section>
+
+          <section class="detail-grid">
+            <article class="detail-card">
+              <div class="detail-label">인식 내용</div>
+              <div class="detail-value" id="transcript">-</div>
+            </article>
+            <article class="detail-card">
+              <div class="detail-label">위험 카테고리</div>
+              <div class="detail-value" id="riskCategories">없음</div>
+            </article>
+            <article class="detail-card">
+              <div class="detail-label">위험 신호</div>
+              <div class="detail-value" id="riskReasons">없음</div>
+            </article>
+          </section>
+
+          <section class="screen-shell">
+            <div class="screen-head">
+              <div class="screen-title">실시간 분석 프레임</div>
+              <div class="screen-subtitle">Pose / Face / Risk Overlay</div>
+            </div>
+            <div class="screen" id="screen">
+              <div class="screen-empty">
+                <div class="screen-empty-icon">AI</div>
+                <div class="screen-empty-title">분석 화면을 준비하는 중입니다</div>
+                <div class="screen-empty-copy">클라이언트가 연결되면 여기에 실시간 영상과 분석 오버레이가 표시됩니다.</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </section>
   </div>
   <script>
     let selectedClientId = null;
+
+    function speechTone(status) {
+      if (status === 'recognized') return 'tone-good';
+      if (status === 'processing') return 'tone-warn';
+      if (status === 'error') return 'tone-danger';
+      return 'tone-neutral';
+    }
+
+    function riskTone(level) {
+      if (level === 'HIGH') return 'tone-danger';
+      if (level === 'MEDIUM') return 'tone-warn';
+      if (level === 'ELEVATED') return 'tone-accent';
+      return 'tone-neutral';
+    }
+
+    function screenPlaceholder(title, copy) {
+      return `
+        <div class="screen-empty">
+          <div class="screen-empty-icon">AI</div>
+          <div class="screen-empty-title">${title}</div>
+          <div class="screen-empty-copy">${copy}</div>
+        </div>
+      `;
+    }
 
     async function refreshSystem() {
       const response = await fetch('/api/system');
@@ -638,8 +1145,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       container.innerHTML = '';
 
       if (!clients.length) {
-        container.innerHTML = '<div class="client-meta">아직 연결된 클라이언트가 없습니다.</div>';
-        document.getElementById('screen').innerHTML = '<div class="placeholder">맥북 업로더를 실행하면 화면이 나타납니다.</div>';
+        container.innerHTML = '<div class="client-empty">아직 연결된 클라이언트가 없습니다.</div>';
+        document.getElementById('screen').innerHTML = screenPlaceholder('클라이언트를 기다리는 중입니다', '맥북 업로더를 실행하면 이곳에 실시간 분석 화면이 표시됩니다.');
         updateMeta(null);
         return;
       }
@@ -650,16 +1157,23 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
       for (const client of clients) {
         const item = document.createElement('div');
-        item.className = 'client' + (client.client_id === selectedClientId ? ' active' : '');
+        item.className = 'client-card' + (client.client_id === selectedClientId ? ' active' : '');
         item.innerHTML = `
-          <div class="client-title">${client.client_id}</div>
-          <div class="client-meta">
-            사람 ${client.people_count}명 | 얼굴 ${client.face_count}개<br/>
-            최근 수신 ${client.last_seen_seconds}초 전 | 지연 ${client.latency_ms.toFixed(1)}ms<br/>
-            STT ${client.speech_status} ${client.transcript ? '| ' + client.transcript : ''}<br/>
-            위험도 ${client.risk_score}/100 | ${client.risk_level_label}<br/>
-            카테고리 ${client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '-'}
+          <div class="client-top">
+            <div class="client-name">${client.client_id}</div>
+            <div class="client-badges">
+              <span class="mini-badge ${speechTone(client.speech_status)}">${client.speech_status}</span>
+              <span class="mini-badge ${riskTone(client.risk_level)}">${client.risk_level_label}</span>
+            </div>
           </div>
+          <div class="client-stats">
+            <div class="client-stat">사람<strong>${client.people_count}</strong></div>
+            <div class="client-stat">얼굴<strong>${client.face_count}</strong></div>
+            <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
+            <div class="client-stat">지연<strong>${client.latency_ms.toFixed(1)}ms</strong></div>
+          </div>
+          <div class="client-transcript">${client.transcript ? client.transcript : '최근 인식된 음성이 없습니다.'}</div>
+          <div class="client-categories">카테고리 ${client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '없음'}</div>
         `;
         item.onclick = () => {
           selectedClientId = client.client_id;
@@ -684,24 +1198,32 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       updateMeta(data);
       const screen = document.getElementById('screen');
       if (!data.frame_data_url) {
-        screen.innerHTML = '<div class="placeholder">아직 수신된 프레임이 없습니다.</div>';
+        screen.innerHTML = screenPlaceholder('프레임을 기다리는 중입니다', '선택한 클라이언트에서 아직 수신된 프레임이 없습니다.');
         return;
       }
       screen.innerHTML = `<img alt="분석 화면" src="${data.frame_data_url}" />`;
     }
 
     function updateMeta(data) {
-      document.getElementById('clientName').textContent = `클라이언트: ${data ? data.client_id : '-'}`;
-      document.getElementById('peopleCount').textContent = `사람: ${data ? data.people_count : 0}`;
-      document.getElementById('faceCount').textContent = `얼굴: ${data ? data.face_count : 0}`;
-      document.getElementById('latency').textContent = `지연: ${data ? data.latency_ms.toFixed(1) : 0}ms`;
-      document.getElementById('lastSeen').textContent = `최근 수신: ${data ? data.last_seen_seconds.toFixed(1) : '-'}초 전`;
-      document.getElementById('speechStatus').textContent = `음성 인식: ${data ? data.speech_status_label : '대기'}`;
-      document.getElementById('audioLevel').textContent = `오디오 레벨: ${data ? data.audio_level.toFixed(3) : '0.000'}`;
-      document.getElementById('riskLevel').textContent = `위험도: ${data ? data.risk_score : 0}/100 | ${data ? data.risk_level_label : '낮음'}`;
-      document.getElementById('transcript').textContent = `인식 내용: ${data && data.transcript ? data.transcript : '-'}`;
-      document.getElementById('riskCategories').textContent = `위험 카테고리: ${data && data.risk_categories && data.risk_categories.length ? data.risk_categories.join(', ') : '없음'}`;
-      document.getElementById('riskReasons').textContent = `위험 신호: ${data && data.risk_reasons && data.risk_reasons.length ? data.risk_reasons.join(', ') : '없음'}`;
+      document.getElementById('clientName').textContent = data ? data.client_id : '-';
+      document.getElementById('peopleCount').textContent = `${data ? data.people_count : 0}`;
+      document.getElementById('faceCount').textContent = `${data ? data.face_count : 0}`;
+      document.getElementById('latency').textContent = `${data ? data.latency_ms.toFixed(1) : 0}ms`;
+      document.getElementById('lastSeen').textContent = data ? `${data.last_seen_seconds.toFixed(1)}초 전` : '-';
+
+      const speechStatus = document.getElementById('speechStatus');
+      speechStatus.textContent = data ? data.speech_status_label : '대기';
+      speechStatus.className = `metric-value status-pill ${speechTone(data ? data.speech_status : 'idle')}`;
+
+      document.getElementById('audioLevel').textContent = data ? data.audio_level.toFixed(3) : '0.000';
+
+      const riskLevel = document.getElementById('riskLevel');
+      riskLevel.textContent = `${data ? data.risk_score : 0}/100 | ${data ? data.risk_level_label : '낮음'}`;
+      riskLevel.className = `metric-value status-pill ${riskTone(data ? data.risk_level : 'LOW')}`;
+
+      document.getElementById('transcript').textContent = data && data.transcript ? data.transcript : '-';
+      document.getElementById('riskCategories').textContent = data && data.risk_categories && data.risk_categories.length ? data.risk_categories.join(', ') : '없음';
+      document.getElementById('riskReasons').textContent = data && data.risk_reasons && data.risk_reasons.length ? data.risk_reasons.join(', ') : '없음';
     }
 
     const params = new URLSearchParams(window.location.search);
