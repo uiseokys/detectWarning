@@ -923,7 +923,16 @@ def main() -> None:
     print(f"[detectWarning] Whisper device: {args.stt_device}")
     print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")
     print(f"[detectWarning] Whisper beam/best_of: {args.stt_beam_size}/{args.stt_best_of}")
-    app = create_app(args)
+    try:
+        app = create_app(args)
+    except Exception as exc:
+        raise RuntimeError(
+            "서버 시작 중 추론 장치 초기화에 실패했습니다.\n"
+            f"{exc}\n\n"
+            "해결 방법:\n"
+            "1. Windows 데스크탑에서 CUDA 지원 PyTorch를 설치합니다.\n"
+            "2. 또는 임시로 --yolo-device cpu --stt-device cpu 로 실행합니다."
+        ) from exc
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

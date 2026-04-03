@@ -28,6 +28,7 @@ class PersonDetector:
         self.nms_threshold = nms_threshold
         self.resize_width = resize_width
         self.device = device
+        self._validate_device(device)
         config_dir = Path(__file__).resolve().parent.parent / ".ultralytics"
         config_dir.mkdir(exist_ok=True)
         os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir))
@@ -94,6 +95,38 @@ class PersonDetector:
                 }
             )
         return people
+
+    @staticmethod
+    def _validate_device(device: str) -> None:
+        normalized = str(device).strip().lower()
+        if not normalized.startswith("cuda"):
+            return
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError(
+                "GPU 장치를 요청했지만 PyTorch를 불러오지 못했습니다."
+            ) from exc
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "YOLO에 GPU 장치를 요청했지만 현재 PyTorch가 CUDA를 사용할 수 없습니다.\n"
+                f"- 요청한 장치: {device}\n"
+                f"- torch.cuda.is_available(): {torch.cuda.is_available()}\n"
+                f"- torch.cuda.device_count(): {torch.cuda.device_count()}\n"
+                "현재 Windows 파이썬 환경에 CUDA 지원 PyTorch가 설치되지 않았을 가능성이 큽니다."
+            )
+
+        if ":" in normalized:
+            try:
+                device_index = int(normalized.split(":", 1)[1])
+            except ValueError:
+                return
+            if device_index >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"요청한 CUDA 장치 {device} 를 찾지 못했습니다. "
+                    f"현재 사용 가능한 GPU 개수: {torch.cuda.device_count()}"
+                )
 
 
 class FaceDetector:
