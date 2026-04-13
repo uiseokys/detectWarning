@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import cv2
+import numpy as np
+import requests
+
+from action_model import train_action_classifier
+from detector import FaceDetector, PersonDetector
+from person_classifier import PersonPresenceFilter
+from tracker import PersonTracker
+
+
+CONFIRMED_PERSON_STATES = {"full_body_person", "upper_body_person"}
+
+
+@dataclass
+class DownloadedItem:
+    item_id: str
+    source_label: str
+    target_label: str
+    video_path: Path
+    download_url: str
+    metadata: dict
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="API에서 행동 영상을 받아 pose 기반 행동 분류 학습까지 자동으로 수행합니다."
+    )
+    parser.add_argument(
+        "--config",
+        default="configs/action_training.example.json",
+        help="학습 파이프라인 설정 JSON 경로",
+    )
+    parser.add_argument(
+        "--stage",
+        default="all",
+        choices=("all", "download", "prepare", "train"),
+        help="실행할 단계",
+    )
+    return parser.parse_args()
+
+
+def load_config(config_path: Path) -> dict:
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    return config
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = Path(args.config).resolve()
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path.parent)
+    write_pipeline_status(
+        paths,
+        stage="starting",
+        state="running",
+        message="학습 파이프라인을 시작합니다.",
+        config_path=str(config_path),
+    )
+
+    try:
+        if args.stage in {"all", "download"}:
+            write_pipeline_status(paths, stage="download", state="running", message="API에서 영상을 다운로드하는 중입니다.")
+            downloaded = download_dataset(config, paths)
+            split_manifests = split_dataset(downloaded, config, paths)
+        else:
+            split_manifests = load_existing_split_manifests(paths)
+
+        if args.stage in {"all", "prepare"}:
+            write_pipeline_status(paths, stage="prepare", state="running", message="영상에서 pose 시퀀스를 추출하는 중입니다.")
+            prepared_manifests = prepare_pose_dataset(config, paths, split_manifests)
+        else:
+            prepared_manifests = load_existing_prepared_manifests(paths)
+
+        if args.stage in {"all", "train"}:
+            write_pipeline_status(paths, stage="train", state="running", message="행동 분류 모델을 학습하는 중입니다.")
+            labels = get_target_labels(config)
+            train_manifest = prepared_manifests["train"]
+            val_manifest = prepared_manifests["val"]
+            artifacts = train_action_classifier(
+                train_manifest=train_manifest,
+                val_manifest=val_manifest,
+                output_dir=paths["artifacts_dir"],
+                labels=labels,
+                epochs=int(config.get("training", {}).get("epochs", 20)),
+                batch_size=int(config.get("training", {}).get("batch_size", 16)),
+                learning_rate=float(config.get("training", {}).get("learning_rate", 1e-3)),
+                hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
+                num_layers=int(config.get("training", {}).get("num_layers", 2)),
+                dropout=float(config.get("training", {}).get("dropout", 0.2)),
+                num_workers=int(config.get("training", {}).get("num_workers", 0)),
+                device=str(config.get("training", {}).get("device", "cuda")),
+                progress_path=paths["training_progress"],
+            )
+            print(f"[train] best model: {artifacts.best_model_path}")
+            print(f"[train] metrics: {artifacts.metrics_path}")
+            print(f"[train] labels: {artifacts.labels_path}")
+
+        write_pipeline_status(
+            paths,
+            stage="completed",
+            state="completed",
+            message="학습 파이프라인이 완료되었습니다.",
+        )
+    except Exception as exc:
+        write_pipeline_status(
+            paths,
+            stage="error",
+            state="error",
+            message=str(exc),
+        )
+        raise
+
+
+def resolve_paths(config: dict, base_dir: Path) -> dict:
+    workspace_dir = (base_dir / config.get("paths", {}).get("workspace_dir", "training_data/action_pipeline")).resolve()
+    raw_dir = workspace_dir / "raw_videos"
+    manifests_dir = workspace_dir / "manifests"
+    prepared_dir = workspace_dir / "prepared_pose"
+    artifacts_dir = workspace_dir / "artifacts"
+    for path in (workspace_dir, raw_dir, manifests_dir, prepared_dir, artifacts_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    return {
+        "workspace_dir": workspace_dir,
+        "raw_dir": raw_dir,
+        "manifests_dir": manifests_dir,
+        "prepared_dir": prepared_dir,
+        "artifacts_dir": artifacts_dir,
+        "pipeline_status": workspace_dir / "pipeline_status.json",
+        "training_progress": artifacts_dir / "training_progress.json",
+        "raw_manifest": manifests_dir / "raw_items.jsonl",
+        "split_train": manifests_dir / "split_train.jsonl",
+        "split_val": manifests_dir / "split_val.jsonl",
+        "split_test": manifests_dir / "split_test.jsonl",
+        "prepared_train": manifests_dir / "prepared_train.jsonl",
+        "prepared_val": manifests_dir / "prepared_val.jsonl",
+        "prepared_test": manifests_dir / "prepared_test.jsonl",
+    }
+
+
+def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, **extra) -> None:
+    payload = {
+        "stage": stage,
+        "state": state,
+        "message": message,
+        "workspace_dir": str(paths["workspace_dir"]),
+        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        **extra,
+    }
+    with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
+    api_config = config["api"]
+    dataset_config = config["dataset"]
+    raw_manifest_path = paths["raw_manifest"]
+
+    session = requests.Session()
+    headers = build_headers(api_config)
+    session.headers.update(headers)
+
+    label_mapping = dataset_config.get("label_mapping", {})
+    max_items_per_class = int(dataset_config.get("max_items_per_class", 0))
+    per_class_counts: dict[str, int] = defaultdict(int)
+
+    items = fetch_api_items(session, api_config)
+    downloaded: list[DownloadedItem] = []
+
+    with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
+        for item in items:
+            source_label = str(extract_field(item, api_config["fields"]["label"])).strip()
+            target_label = label_mapping.get(source_label)
+            if not target_label:
+                continue
+
+            if max_items_per_class > 0 and per_class_counts[target_label] >= max_items_per_class:
+                continue
+
+            download_url = build_download_url(item, api_config)
+            if not download_url:
+                continue
+
+            item_id = str(extract_field(item, api_config["fields"]["id"]))
+            filename = build_filename(item, api_config, download_url, item_id)
+            safe_target_label = slugify(target_label)
+            target_dir = paths["raw_dir"] / safe_target_label
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / filename
+
+            download_to_file(session, download_url, target_path, timeout=float(api_config.get("timeout_seconds", 60.0)))
+
+            downloaded_item = DownloadedItem(
+                item_id=item_id,
+                source_label=source_label,
+                target_label=target_label,
+                video_path=target_path.resolve(),
+                download_url=download_url,
+                metadata=item,
+            )
+            downloaded.append(downloaded_item)
+            per_class_counts[target_label] += 1
+
+            manifest_handle.write(
+                json.dumps(
+                    {
+                        "item_id": downloaded_item.item_id,
+                        "source_label": downloaded_item.source_label,
+                        "target_label": downloaded_item.target_label,
+                        "video_path": str(downloaded_item.video_path),
+                        "download_url": downloaded_item.download_url,
+                        "metadata": downloaded_item.metadata,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    print(f"[download] saved {len(downloaded)} items -> {raw_manifest_path}")
+    return downloaded
+
+
+def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -> dict[str, Path]:
+    split_config = config.get("split", {})
+    train_ratio = float(split_config.get("train_ratio", 0.7))
+    val_ratio = float(split_config.get("val_ratio", 0.15))
+    test_ratio = float(split_config.get("test_ratio", 0.15))
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+        raise RuntimeError("split 비율 합계는 1.0 이어야 합니다.")
+
+    rng = random.Random(int(split_config.get("seed", 42)))
+    by_label: dict[str, list[DownloadedItem]] = defaultdict(list)
+    for item in downloaded:
+        by_label[item.target_label].append(item)
+
+    split_items = {"train": [], "val": [], "test": []}
+    for label, items in by_label.items():
+        rng.shuffle(items)
+        total = len(items)
+        train_end = max(1, int(total * train_ratio))
+        val_end = train_end + max(1, int(total * val_ratio)) if total >= 3 else train_end
+        split_items["train"].extend(items[:train_end])
+        split_items["val"].extend(items[train_end:val_end])
+        split_items["test"].extend(items[val_end:])
+
+    split_paths = {
+        "train": paths["split_train"],
+        "val": paths["split_val"],
+        "test": paths["split_test"],
+    }
+    for split_name, target_path in split_paths.items():
+        with target_path.open("w", encoding="utf-8") as handle:
+            for item in split_items[split_name]:
+                handle.write(
+                    json.dumps(
+                        {
+                            "item_id": item.item_id,
+                            "source_label": item.source_label,
+                            "target_label": item.target_label,
+                            "video_path": str(item.video_path),
+                            "download_url": item.download_url,
+                            "metadata": item.metadata,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        print(f"[split] {split_name}: {len(split_items[split_name])} -> {target_path}")
+
+    if not split_items["val"] and split_items["train"]:
+        moved = split_items["train"].pop()
+        split_items["val"].append(moved)
+        _rewrite_split_manifest(split_paths["train"], split_items["train"])
+        _rewrite_split_manifest(split_paths["val"], split_items["val"])
+        print("[split] validation 샘플이 없어 train에서 1개를 val로 이동했습니다.")
+
+    return split_paths
+
+
+def load_existing_split_manifests(paths: dict) -> dict[str, Path]:
+    split_paths = {
+        "train": paths["split_train"],
+        "val": paths["split_val"],
+        "test": paths["split_test"],
+    }
+    for split_name, path in split_paths.items():
+        if not path.exists():
+            raise RuntimeError(f"기존 split manifest를 찾지 못했습니다: {split_name} -> {path}")
+    return split_paths
+
+
+def _rewrite_split_manifest(path: Path, items: list[DownloadedItem]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for item in items:
+            handle.write(
+                json.dumps(
+                    {
+                        "item_id": item.item_id,
+                        "source_label": item.source_label,
+                        "target_label": item.target_label,
+                        "video_path": str(item.video_path),
+                        "download_url": item.download_url,
+                        "metadata": item.metadata,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, Path]) -> dict[str, Path]:
+    preprocess_config = config.get("preprocess", {})
+    device = str(preprocess_config.get("device", "cuda:0"))
+    person_detector = PersonDetector(
+        score_threshold=float(preprocess_config.get("person_score_threshold", 0.25)),
+        resize_width=int(preprocess_config.get("person_imgsz", 640)),
+        device=device,
+    )
+    face_detector = FaceDetector()
+
+    target_labels = get_target_labels(config)
+    label_to_idx = {label: index for index, label in enumerate(target_labels)}
+    min_frames_with_person = int(preprocess_config.get("min_frames_with_person", 4))
+
+    prepared_paths = {
+        "train": paths["prepared_train"],
+        "val": paths["prepared_val"],
+        "test": paths["prepared_test"],
+    }
+
+    for split_name, manifest_path in split_manifests.items():
+        target_manifest_path = prepared_paths[split_name]
+        with manifest_path.open("r", encoding="utf-8") as source_handle, target_manifest_path.open("w", encoding="utf-8") as target_handle:
+            kept = 0
+            for line in source_handle:
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
+                video_path = Path(sample["video_path"])
+                target_label = sample["target_label"]
+                sequence = extract_pose_sequence(
+                    video_path=video_path,
+                    person_detector=person_detector,
+                    face_detector=face_detector,
+                    sequence_length=int(preprocess_config.get("sequence_length", 48)),
+                    max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                )
+                if sequence["valid_frames"] < min_frames_with_person:
+                    continue
+
+                pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
+                pose_output_dir.mkdir(parents=True, exist_ok=True)
+                pose_path = pose_output_dir / f"{video_path.stem}_{sample['item_id']}.npz"
+                np.savez_compressed(
+                    pose_path,
+                    pose=sequence["pose"],
+                    mask=sequence["mask"],
+                    label_idx=np.int64(label_to_idx[target_label]),
+                )
+
+                target_handle.write(
+                    json.dumps(
+                        {
+                            **sample,
+                            "pose_path": str(pose_path.resolve()),
+                            "label_idx": label_to_idx[target_label],
+                            "valid_frames": sequence["valid_frames"],
+                            "confirmed_frames": sequence["confirmed_frames"],
+                            "chosen_track_id": sequence["chosen_track_id"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                kept += 1
+        print(f"[prepare] {split_name}: {kept} samples -> {target_manifest_path}")
+
+    return prepared_paths
+
+
+def load_existing_prepared_manifests(paths: dict) -> dict[str, Path]:
+    prepared_paths = {
+        "train": paths["prepared_train"],
+        "val": paths["prepared_val"],
+        "test": paths["prepared_test"],
+    }
+    for split_name, path in prepared_paths.items():
+        if split_name in {"train", "val"} and not path.exists():
+            raise RuntimeError(f"기존 prepared manifest를 찾지 못했습니다: {split_name} -> {path}")
+    return prepared_paths
+
+
+def extract_pose_sequence(
+    *,
+    video_path: Path,
+    person_detector: PersonDetector,
+    face_detector: FaceDetector,
+    sequence_length: int,
+    max_frames_to_scan: int,
+) -> dict:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"영상 파일을 열지 못했습니다: {video_path}")
+
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_indices = build_frame_indices(total_frames, sequence_length, max_frames_to_scan)
+
+    tracker = PersonTracker()
+    presence_filter = PersonPresenceFilter(debug=False)
+    track_frames: dict[int, dict[int, dict]] = defaultdict(dict)
+
+    for time_index, frame_index in enumerate(frame_indices):
+        frame = read_frame_at(capture, frame_index)
+        if frame is None:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detections = person_detector.detect(frame)
+        tracked = tracker.update(detections)
+        faces = face_detector.detect(frame)
+        evaluated = presence_filter.evaluate(tracked, faces, gray, frame.shape)
+        for candidate in evaluated:
+            if candidate.get("person_state") == "rejected":
+                continue
+            candidate_id = int(candidate["id"])
+            previous = track_frames[candidate_id].get(time_index)
+            if previous is None or candidate.get("person_score", 0) >= previous.get("person_score", 0):
+                track_frames[candidate_id][time_index] = candidate
+
+    capture.release()
+
+    if not track_frames:
+        return {
+            "pose": np.zeros((sequence_length, 17, 3), dtype=np.float32),
+            "mask": np.zeros((sequence_length,), dtype=np.float32),
+            "valid_frames": 0,
+            "confirmed_frames": 0,
+            "chosen_track_id": -1,
+        }
+
+    chosen_track_id = choose_best_track(track_frames)
+    chosen_frames = track_frames[chosen_track_id]
+    pose = np.zeros((sequence_length, 17, 3), dtype=np.float32)
+    mask = np.zeros((sequence_length,), dtype=np.float32)
+    valid_frames = 0
+    confirmed_frames = 0
+
+    for time_index in range(sequence_length):
+        candidate = chosen_frames.get(time_index)
+        if candidate is None:
+            continue
+        pose[time_index] = normalize_pose(candidate.get("keypoints", []), candidate["bbox"])
+        mask[time_index] = 1.0
+        valid_frames += 1
+        if candidate.get("person_state") in CONFIRMED_PERSON_STATES:
+            confirmed_frames += 1
+
+    return {
+        "pose": pose,
+        "mask": mask,
+        "valid_frames": valid_frames,
+        "confirmed_frames": confirmed_frames,
+        "chosen_track_id": chosen_track_id,
+    }
+
+
+def build_frame_indices(total_frames: int, sequence_length: int, max_frames_to_scan: int) -> list[int]:
+    if total_frames > 0:
+        effective_total = min(total_frames, max_frames_to_scan)
+        if effective_total <= sequence_length:
+            return list(range(effective_total))
+        return np.linspace(0, effective_total - 1, num=sequence_length, dtype=int).tolist()
+    return list(range(sequence_length))
+
+
+def read_frame_at(capture: cv2.VideoCapture, frame_index: int):
+    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    ok, frame = capture.read()
+    if not ok:
+        return None
+    return frame
+
+
+def choose_best_track(track_frames: dict[int, dict[int, dict]]) -> int:
+    best_track_id = -1
+    best_score = None
+    for track_id, frames in track_frames.items():
+        if not frames:
+            continue
+        confirmed_count = sum(
+            1 for frame in frames.values() if frame.get("person_state") in CONFIRMED_PERSON_STATES
+        )
+        avg_score = sum(float(frame.get("person_score", 0.0)) for frame in frames.values()) / max(len(frames), 1)
+        score = confirmed_count * 100.0 + len(frames) * 10.0 + avg_score
+        if best_score is None or score > best_score:
+            best_score = score
+            best_track_id = track_id
+    if best_track_id < 0:
+        return next(iter(track_frames))
+    return best_track_id
+
+
+def normalize_pose(keypoints: list[dict], bbox) -> np.ndarray:
+    x, y, w, h = bbox
+    normalized = np.zeros((17, 3), dtype=np.float32)
+    for index in range(min(len(keypoints), 17)):
+        point = keypoints[index]
+        conf = float(point.get("confidence", 0.0))
+        if conf <= 0.0:
+            continue
+        normalized[index, 0] = float((float(point.get("x", 0.0)) - x) / max(w, 1))
+        normalized[index, 1] = float((float(point.get("y", 0.0)) - y) / max(h, 1))
+        normalized[index, 2] = conf
+    return normalized
+
+
+def fetch_api_items(session: requests.Session, api_config: dict) -> list[dict]:
+    list_url = api_config["list_url"]
+    page_param = api_config.get("page_param")
+    page_start = int(api_config.get("page_start", 1))
+    static_params = dict(api_config.get("params", {}))
+    max_pages = int(api_config.get("max_pages", 0))
+
+    results = []
+    page = page_start
+    fetched_pages = 0
+
+    while True:
+        params = dict(static_params)
+        if page_param:
+            params[page_param] = page
+        response = session.get(
+            list_url,
+            params=params,
+            timeout=float(api_config.get("timeout_seconds", 60.0)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        items = extract_field(payload, api_config.get("items_path", "")) if api_config.get("items_path") else payload
+        if not isinstance(items, list):
+            raise RuntimeError("API items_path 결과가 리스트가 아닙니다.")
+        results.extend(items)
+
+        fetched_pages += 1
+        if max_pages > 0 and fetched_pages >= max_pages:
+            break
+
+        next_value = extract_field(payload, api_config.get("next_path", "")) if api_config.get("next_path") else None
+        if next_value:
+            if isinstance(next_value, str) and next_value.startswith("http"):
+                list_url = next_value
+                page_param = None
+            else:
+                page += 1
+            continue
+
+        if page_param and len(items) > 0:
+            page += 1
+            continue
+        break
+
+    return results
+
+
+def build_headers(api_config: dict) -> dict:
+    headers = dict(api_config.get("headers", {}))
+    auth_env = api_config.get("auth_token_env")
+    auth_header = api_config.get("auth_header", "Authorization")
+    if auth_env:
+        value = os.environ.get(auth_env)
+        if not value:
+            raise RuntimeError(f"환경변수 {auth_env} 가 설정되지 않았습니다.")
+        if auth_header.lower() == "authorization" and not value.lower().startswith("bearer "):
+            value = f"Bearer {value}"
+        headers[auth_header] = value
+    return headers
+
+
+def build_download_url(item: dict, api_config: dict) -> str:
+    direct_key = api_config["fields"].get("download_url")
+    if direct_key:
+        direct_url = extract_field(item, direct_key)
+        if direct_url:
+            return str(direct_url)
+
+    template = api_config.get("download_url_template")
+    if template:
+        item_id = extract_field(item, api_config["fields"]["id"])
+        return template.format(item_id=item_id)
+    return ""
+
+
+def build_filename(item: dict, api_config: dict, download_url: str, item_id: str) -> str:
+    filename_key = api_config["fields"].get("filename")
+    if filename_key:
+        filename = extract_field(item, filename_key)
+        if filename:
+            return sanitize_filename(str(filename))
+
+    parsed = urlparse(download_url)
+    name = Path(parsed.path).name
+    if name:
+        return sanitize_filename(name)
+    return f"{slugify(item_id)}.mp4"
+
+
+def download_to_file(session: requests.Session, url: str, target_path: Path, timeout: float) -> None:
+    if target_path.exists() and target_path.stat().st_size > 0:
+        return
+
+    with session.get(url, stream=True, timeout=timeout) as response:
+        response.raise_for_status()
+        with target_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
+def extract_field(data, path: str):
+    if not path:
+        return data
+    current = data
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^0-9a-zA-Z가-힣._-]+", "_", value)
+    return value.strip("._-") or "item"
+
+
+def sanitize_filename(filename: str) -> str:
+    filename = filename.replace("\\", "_").replace("/", "_")
+    if "." not in filename:
+        filename += ".mp4"
+    return slugify(filename.rsplit(".", 1)[0]) + "." + filename.rsplit(".", 1)[1]
+
+
+def get_target_labels(config: dict) -> list[str]:
+    labels = config.get("dataset", {}).get("target_labels")
+    if labels:
+        return list(labels)
+
+    mapped = set(config.get("dataset", {}).get("label_mapping", {}).values())
+    if not mapped:
+        raise RuntimeError("dataset.target_labels 또는 dataset.label_mapping 이 필요합니다.")
+    return sorted(mapped)
+
+
+if __name__ == "__main__":
+    main()

@@ -175,3 +175,23 @@ python app\inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 -
 ```bash
 python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --stt
 ```
+
+## 행동 학습 자동화
+
+API로 행동 영상을 받아서 다운로드, pose 전처리, 학습까지 자동으로 돌리고 싶다면 이 설정 파일을 먼저 복사해서 API 주소와 필드명을 채우면 됩니다.
+
+설정 파일 예시:
+
+[`configs/action_training.example.json`](/Users/jung-uiseok/Desktop/detectWarning/configs/action_training.example.json)
+
+전체 파이프라인 실행:
+
+```bash
+python3 app/action_training_pipeline.py --config configs/action_training.example.json --stage all
+```
+
+학습 진행 상황 대시보드 실행:
+
+```bash
+python3 app/training_dashboard.py --config configs/action_training.example.json --port 8010
+```
