@@ -190,6 +190,12 @@ API로 행동 영상을 받아서 다운로드, pose 전처리, 학습까지 자
 python3 app/action_training_pipeline.py --config configs/action_training.example.json --stage all
 ```
 
+AIHub `aihubshell`로 받으려면:
+
+```bash
+python3 app/action_training_pipeline.py --config configs/action_training.aihub_shell.example.json --stage all
+```
+
 학습 진행 상황 대시보드 실행:
 
 ```bash

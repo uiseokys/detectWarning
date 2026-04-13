@@ -6,6 +6,8 @@ import math
 import os
 import random
 import re
+import shutil
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,6 +65,7 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
+    validate_source_config(config, config_path)
     paths = resolve_paths(config, config_path.parent)
     write_pipeline_status(
         paths,
@@ -129,14 +132,16 @@ def main() -> None:
 def resolve_paths(config: dict, base_dir: Path) -> dict:
     workspace_dir = (base_dir / config.get("paths", {}).get("workspace_dir", "training_data/action_pipeline")).resolve()
     raw_dir = workspace_dir / "raw_videos"
+    import_dir = workspace_dir / "imported_dataset"
     manifests_dir = workspace_dir / "manifests"
     prepared_dir = workspace_dir / "prepared_pose"
     artifacts_dir = workspace_dir / "artifacts"
-    for path in (workspace_dir, raw_dir, manifests_dir, prepared_dir, artifacts_dir):
+    for path in (workspace_dir, raw_dir, import_dir, manifests_dir, prepared_dir, artifacts_dir):
         path.mkdir(parents=True, exist_ok=True)
     return {
         "workspace_dir": workspace_dir,
         "raw_dir": raw_dir,
+        "import_dir": import_dir,
         "manifests_dir": manifests_dir,
         "prepared_dir": prepared_dir,
         "artifacts_dir": artifacts_dir,
@@ -166,6 +171,10 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
 
 
 def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
+    source_mode = str(config.get("dataset_source", "json_api")).strip().lower()
+    if source_mode == "aihub_shell":
+        return download_dataset_via_aihub_shell(config, paths)
+
     api_config = config["api"]
     dataset_config = config["dataset"]
     raw_manifest_path = paths["raw_manifest"]
@@ -232,6 +241,96 @@ def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
 
     print(f"[download] saved {len(downloaded)} items -> {raw_manifest_path}")
     return downloaded
+
+
+def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[DownloadedItem]:
+    shell_config = config.get("aihub_shell", {})
+    shell_path = resolve_aihub_shell_path(shell_config)
+    api_key = resolve_aihub_api_key(shell_config)
+    mode = str(shell_config.get("mode", "d")).strip()
+    datasetkey = shell_config.get("datasetkey")
+    datapackagekey = shell_config.get("datapackagekey")
+    filekey = shell_config.get("filekey")
+    import_dir = paths["import_dir"]
+    raw_manifest_path = paths["raw_manifest"]
+
+    command = [shell_path, "-mode", mode, "-aihubapikey", api_key]
+    if datasetkey is not None:
+        command.extend(["-datasetkey", str(datasetkey)])
+    if datapackagekey is not None:
+        command.extend(["-datapckagekey", str(datapackagekey)])
+    if filekey:
+        if isinstance(filekey, list):
+            command.extend(["-filekey", "{" + ", ".join(str(item) for item in filekey) + "}"])
+        else:
+            command.extend(["-filekey", str(filekey)])
+
+    subprocess.run(command, cwd=str(import_dir), check=True)
+    downloaded = scan_local_video_dataset(config, paths)
+
+    with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
+        for item in downloaded:
+            manifest_handle.write(
+                json.dumps(
+                    {
+                        "item_id": item.item_id,
+                        "source_label": item.source_label,
+                        "target_label": item.target_label,
+                        "video_path": str(item.video_path),
+                        "download_url": item.download_url,
+                        "metadata": item.metadata,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    print(f"[download] aihubshell imported {len(downloaded)} videos -> {raw_manifest_path}")
+    return downloaded
+
+
+def scan_local_video_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
+    dataset_config = config["dataset"]
+    import_dir = paths["import_dir"]
+    raw_dir = paths["raw_dir"]
+    label_mapping = dataset_config.get("label_mapping", {})
+    extensions = tuple(
+        ext.lower()
+        for ext in dataset_config.get("video_extensions", [".mp4", ".avi", ".mov", ".mkv", ".wmv"])
+    )
+
+    scanned: list[DownloadedItem] = []
+    for video_path in sorted(import_dir.rglob("*")):
+        if not video_path.is_file():
+            continue
+        if video_path.suffix.lower() not in extensions:
+            continue
+
+        source_label, target_label = infer_label_from_path(video_path, label_mapping)
+        if not target_label:
+            continue
+
+        destination_dir = raw_dir / slugify(target_label)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / sanitize_filename(video_path.name)
+        if not destination_path.exists():
+            shutil.copy2(video_path, destination_path)
+
+        relative_id = str(video_path.relative_to(import_dir)).replace("\\", "/")
+        scanned.append(
+            DownloadedItem(
+                item_id=slugify(relative_id),
+                source_label=source_label,
+                target_label=target_label,
+                video_path=destination_path.resolve(),
+                download_url="aihubshell://local-import",
+                metadata={
+                    "source_path": str(video_path.resolve()),
+                    "relative_path": relative_id,
+                },
+            )
+        )
+    return scanned
 
 
 def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -> dict[str, Path]:
@@ -543,12 +642,23 @@ def fetch_api_items(session: requests.Session, api_config: dict) -> list[dict]:
         params = dict(static_params)
         if page_param:
             params[page_param] = page
-        response = session.get(
-            list_url,
-            params=params,
-            timeout=float(api_config.get("timeout_seconds", 60.0)),
-        )
-        response.raise_for_status()
+        try:
+            response = session.get(
+                list_url,
+                params=params,
+                timeout=float(api_config.get("timeout_seconds", 60.0)),
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                "API 목록 조회에 실패했습니다.\n"
+                f"- 요청 주소: {list_url}\n"
+                f"- 에러: {exc}\n\n"
+                "확인할 것:\n"
+                "1. config의 api.list_url 이 실제 주소로 바뀌었는지\n"
+                "2. items_path / next_path / fields 설정이 API 응답 구조와 맞는지\n"
+                "3. 비공개 API라면 auth_required / auth_token_env 설정이 맞는지"
+            ) from exc
         payload = response.json()
         items = extract_field(payload, api_config.get("items_path", "")) if api_config.get("items_path") else payload
         if not isinstance(items, list):
@@ -580,14 +690,119 @@ def build_headers(api_config: dict) -> dict:
     headers = dict(api_config.get("headers", {}))
     auth_env = api_config.get("auth_token_env")
     auth_header = api_config.get("auth_header", "Authorization")
+    auth_required = bool(api_config.get("auth_required", False))
     if auth_env:
         value = os.environ.get(auth_env)
         if not value:
-            raise RuntimeError(f"환경변수 {auth_env} 가 설정되지 않았습니다.")
+            if auth_required:
+                raise RuntimeError(
+                    f"환경변수 {auth_env} 가 설정되지 않았습니다. "
+                    "비공개 API라면 토큰을 export 하거나, 공개 API라면 config에서 "
+                    "`auth_required: false` 또는 `auth_token_env: \"\"` 로 설정해 주세요."
+                )
+            return headers
         if auth_header.lower() == "authorization" and not value.lower().startswith("bearer "):
             value = f"Bearer {value}"
         headers[auth_header] = value
     return headers
+
+
+def validate_source_config(config: dict, config_path: Path) -> None:
+    source_mode = str(config.get("dataset_source", "json_api")).strip().lower()
+    if source_mode == "aihub_shell":
+        validate_aihub_shell_config(config.get("aihub_shell", {}), config_path)
+        return
+    validate_api_config(config.get("api", {}), config_path)
+
+
+def validate_api_config(api_config: dict, config_path: Path) -> None:
+    list_url = str(api_config.get("list_url", "")).strip()
+    if not list_url:
+        raise RuntimeError(
+            f"API 설정이 비어 있습니다: {config_path}\n"
+            "config의 api.list_url 에 실제 데이터 목록 API 주소를 넣어 주세요."
+        )
+
+    parsed = urlparse(list_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            f"api.list_url 형식이 올바르지 않습니다: {list_url}\n"
+            "예: https://example.com/api/videos"
+        )
+
+    placeholder_hosts = {
+        "your-dataset-api.example.com",
+        "example.com",
+    }
+    if parsed.netloc in placeholder_hosts or "your-dataset-api" in parsed.netloc:
+        raise RuntimeError(
+            "예제용 placeholder API 주소가 그대로 들어 있습니다.\n"
+            f"- 현재 주소: {list_url}\n"
+            f"- 설정 파일: {config_path}\n\n"
+            "해야 할 일:\n"
+            "1. configs/action_training.example.json 의 api.list_url 을 실제 API 주소로 변경\n"
+            "2. API 응답에 맞게 items_path / fields.id / fields.label / fields.download_url 수정\n"
+            "3. 비공개 API라면 auth_required 와 auth_token_env 도 함께 설정"
+        )
+
+
+def validate_aihub_shell_config(shell_config: dict, config_path: Path) -> None:
+    if shell_config.get("datasetkey") in (None, "") and shell_config.get("datapackagekey") in (None, ""):
+        raise RuntimeError(
+            f"AIHub shell 설정이 부족합니다: {config_path}\n"
+            "aihub_shell.datasetkey 또는 aihub_shell.datapackagekey 중 하나는 필요합니다."
+        )
+    resolve_aihub_shell_path(shell_config)
+    resolve_aihub_api_key(shell_config)
+
+
+def resolve_aihub_shell_path(shell_config: dict) -> str:
+    configured = str(shell_config.get("path", "")).strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.exists():
+            return str(candidate.resolve())
+        raise RuntimeError(
+            f"aihubshell 경로를 찾지 못했습니다: {configured}\n"
+            "AIHub 공식 안내에 따라 aihubshell을 다운로드한 뒤 path에 넣어 주세요."
+        )
+
+    discovered = shutil.which("aihubshell")
+    if discovered:
+        return discovered
+
+    raise RuntimeError(
+        "aihubshell 실행 파일을 찾지 못했습니다.\n"
+        "AIHub 공식 안내처럼 aihubshell을 설치한 뒤,\n"
+        "1. PATH에 등록하거나\n"
+        "2. config의 aihub_shell.path 에 실행 파일 경로를 넣어 주세요."
+    )
+
+
+def resolve_aihub_api_key(shell_config: dict) -> str:
+    direct_key = str(shell_config.get("api_key", "")).strip()
+    if direct_key:
+        return direct_key
+
+    env_name = str(shell_config.get("api_key_env", "AIHUB_API_KEY")).strip()
+    value = os.environ.get(env_name)
+    if value:
+        return value
+
+    raise RuntimeError(
+        f"AIHub API 키를 찾지 못했습니다.\n"
+        f"- 환경변수 {env_name} 를 export 하거나\n"
+        "- config의 aihub_shell.api_key 에 직접 넣어 주세요.\n"
+        "또한 AIHub 데이터셋은 승인 완료 후 다운로드 가능합니다."
+    )
+
+
+def infer_label_from_path(video_path: Path, label_mapping: dict) -> tuple[str, str | None]:
+    relative_text = str(video_path).replace("\\", "/")
+    for source_label, target_label in label_mapping.items():
+        if source_label in relative_text:
+            return str(source_label), str(target_label)
+    return "", None
 
 
 def build_download_url(item: dict, api_config: dict) -> str:

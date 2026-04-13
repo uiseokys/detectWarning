@@ -1,28 +1,16 @@
 {
   "paths": {
-    "workspace_dir": "../training_data/action_pipeline"
+    "workspace_dir": "../training_data/action_pipeline_aihub"
   },
-  "api": {
-    "list_url": "https://your-dataset-api.example.com/videos",
-    "items_path": "results",
-    "next_path": "next",
-    "page_param": "page",
-    "page_start": 1,
-    "max_pages": 0,
-    "timeout_seconds": 120.0,
-    "auth_required": false,
-    "auth_header": "Authorization",
-    "auth_token_env": "",
-    "headers": {},
-    "params": {
-      "page_size": 100
-    },
-    "fields": {
-      "id": "id",
-      "label": "label",
-      "filename": "file_name",
-      "download_url": "download_url"
-    }
+  "dataset_source": "aihub_shell",
+  "aihub_shell": {
+    "path": "/Users/jung-uiseok/Desktop/detectWarning/aihubshell",
+    "mode": "d",
+    "datasetkey": 49825,
+    "datapackagekey": null,
+    "filekey": null,
+    "api_key_env": "AIHUB_API_KEY",
+    "api_key": "8E240FE5-06BE-4296-B2CB-CA93BA850081"
   },
   "dataset": {
     "target_labels": [
@@ -41,7 +29,13 @@
       "납치": "abduction",
       "배회": "loitering"
     },
-    "max_items_per_class": 0
+    "video_extensions": [
+      ".mp4",
+      ".avi",
+      ".mov",
+      ".mkv",
+      ".wmv"
+    ]
   },
   "split": {
     "train_ratio": 0.7,

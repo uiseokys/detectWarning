@@ -1,0 +1,7 @@
+{
+  "stage": "error",
+  "state": "error",
+  "message": "HTTPSConnectionPool(host='your-dataset-api.example.com', port=443): Max retries exceeded with url: /videos?page_size=100&page=1 (Caused by NameResolutionError(\"HTTPSConnection(host='your-dataset-api.example.com', port=443): Failed to resolve 'your-dataset-api.example.com' ([Errno 8] nodename nor servname provided, or not known)\"))",
+  "workspace_dir": "/Users/jung-uiseok/Desktop/detectWarning/training_data/action_pipeline",
+  "updated_at": "2026-04-14T00:50:48.585766+09:00"
+}
