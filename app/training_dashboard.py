@@ -92,12 +92,13 @@ def create_app(config_path: Path) -> FastAPI:
     def current_timestamp() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat()
 
-    def build_job(filekey: str, api_key: str = "") -> dict:
+    def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = "") -> dict:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", filekey).strip("_") or "filekey"
         return {
             "job_id": f"job_{stamp}_{safe_key}",
             "filekey": filekey,
+            "datasetkey": str(datasetkey).strip() if datasetkey not in (None, "") else None,
             "api_key": api_key,
             "queued_at": current_timestamp(),
             "started_at": None,
@@ -135,6 +136,7 @@ def create_app(config_path: Path) -> FastAPI:
         return {
             "job_id": job.get("job_id"),
             "filekey": job.get("filekey"),
+            "datasetkey": job.get("datasetkey"),
             "queued_at": job.get("queued_at"),
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
@@ -185,6 +187,8 @@ def create_app(config_path: Path) -> FastAPI:
         runtime_paths = runtime_config.setdefault("paths", {})
         runtime_paths["workspace_dir"] = str(paths["workspace_dir"])
         runtime_shell = runtime_config.setdefault("aihub_shell", {})
+        if job.get("datasetkey") not in (None, ""):
+            runtime_shell["datasetkey"] = job["datasetkey"]
         runtime_shell["filekey"] = job["filekey"]
         if job.get("api_key"):
             runtime_shell["api_key"] = str(job["api_key"])
@@ -198,8 +202,12 @@ def create_app(config_path: Path) -> FastAPI:
         write_dashboard_status(
             stage="queued",
             state="running",
-            message=f"filekey {job['filekey']} 작업을 시작합니다.",
+            message=(
+                f"datasetkey {job.get('datasetkey', '-')}"
+                f" | filekey {job['filekey']} 작업을 시작합니다."
+            ),
             current_filekey=job["filekey"],
+            current_datasetkey=job.get("datasetkey"),
         )
         with log_path.open("w", encoding="utf-8") as log_handle:
             process = subprocess.Popen(
@@ -228,7 +236,9 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_state"] = "running"
         launcher_state["last_exit_code"] = None
         launcher_state["log_path"] = log_path
-        launcher_state["last_message"] = f"filekey {job['filekey']} 학습을 진행 중입니다."
+        launcher_state["last_message"] = (
+            f"datasetkey {job.get('datasetkey', '-')} | filekey {job['filekey']} 학습을 진행 중입니다."
+        )
 
     def update_process_state() -> None:
         process = launcher_state.get("process")
@@ -238,7 +248,10 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["last_state"] = "running"
                 current_job = launcher_state.get("current_job") or {}
                 filekey = current_job.get("filekey", "-") if isinstance(current_job, dict) else "-"
-                launcher_state["last_message"] = f"filekey {filekey} 작업이 실행 중입니다."
+                datasetkey = current_job.get("datasetkey", "-") if isinstance(current_job, dict) else "-"
+                launcher_state["last_message"] = (
+                    f"datasetkey {datasetkey} | filekey {filekey} 작업이 실행 중입니다."
+                )
             else:
                 current_job = launcher_state.get("current_job")
                 if isinstance(current_job, dict):
@@ -835,13 +848,15 @@ def create_app(config_path: Path) -> FastAPI:
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
           <div class="meta-chip">workspace <span id="workspaceChip">-</span></div>
         </div>
+        <label class="form-label" for="datasetKeyInput">AIHub datasetkey</label>
+        <input id="datasetKeyInput" class="text-input" type="text" placeholder="예: 12345" />
         <label class="form-label" for="apiKeyInput">AIHub API 키</label>
         <input id="apiKeyInput" class="text-input" type="password" placeholder="AIHub API 키를 입력하세요" />
         <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
           <button id="startButton" class="primary-button" type="button">대기열에 추가</button>
-          <div class="helper">현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
+          <div class="helper">datasetkey는 AIHub 데이터셋 키이고, filekey는 분할 ZIP 목록의 key 값입니다. 현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
         </div>
       </div>
       <div class="launch-box">
@@ -852,6 +867,10 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="launch-item">
           <div class="launch-label">현재 실행 filekey</div>
           <div class="launch-value" id="currentFilekey">-</div>
+        </div>
+        <div class="launch-item">
+          <div class="launch-label">현재 실행 datasetkey</div>
+          <div class="launch-value" id="currentDatasetkey">-</div>
         </div>
         <div class="launch-item">
           <div class="launch-label">대기 중 filekey</div>
@@ -1016,6 +1035,19 @@ def create_app(config_path: Path) -> FastAPI:
       return filekeys.join(', ');
     }
 
+    function formatDatasetkeys(jobs) {
+      if (!jobs || !jobs.length) {
+        return '-';
+      }
+      const values = jobs
+        .map((job) => job?.datasetkey)
+        .filter((value) => value !== null && value !== undefined && value !== '');
+      if (!values.length) {
+        return '-';
+      }
+      return [...new Set(values)].join(', ');
+    }
+
     function formatJob(job) {
       if (!job || !job.filekey) {
         return '-';
@@ -1054,6 +1086,23 @@ def create_app(config_path: Path) -> FastAPI:
         window.localStorage.setItem('training_dashboard_aihub_api_key', value);
       } else {
         window.localStorage.removeItem('training_dashboard_aihub_api_key');
+      }
+      return value;
+    }
+
+    function loadSavedDatasetKey() {
+      const saved = window.localStorage.getItem('training_dashboard_aihub_datasetkey');
+      if (saved) {
+        document.getElementById('datasetKeyInput').value = saved;
+      }
+    }
+
+    function saveDatasetKey() {
+      const value = document.getElementById('datasetKeyInput').value.trim();
+      if (value) {
+        window.localStorage.setItem('training_dashboard_aihub_datasetkey', value);
+      } else {
+        window.localStorage.removeItem('training_dashboard_aihub_datasetkey');
       }
       return value;
     }
@@ -1194,7 +1243,7 @@ def create_app(config_path: Path) -> FastAPI:
       const current = logs?.current || {};
       const latestError = logs?.latest_error || {};
       const currentMeta = current.filekey
-        ? `filekey ${current.filekey}${current.path ? ' | ' + current.path : ''}`
+        ? `datasetkey ${current.datasetkey || '-'} | filekey ${current.filekey}${current.path ? ' | ' + current.path : ''}`
         : (current.path || launcher?.log_path || '실행 중인 작업이 없으면 최근 완료 로그를 표시합니다.');
       document.getElementById('currentLogMeta').textContent =
         currentMeta;
@@ -1202,7 +1251,7 @@ def create_app(config_path: Path) -> FastAPI:
         current.tail || '표시할 로그가 없습니다.';
 
       const errorMeta = latestError.filekey
-        ? `최근 실패 filekey: ${latestError.filekey}${latestError.path ? ' | ' + latestError.path : ''}`
+        ? `최근 실패 datasetkey: ${latestError.datasetkey || '-'} | filekey: ${latestError.filekey}${latestError.path ? ' | ' + latestError.path : ''}`
         : '최근 실패 작업이 있으면 마지막 로그를 표시합니다.';
       document.getElementById('errorLogMeta').textContent = errorMeta;
       document.getElementById('errorLogText').textContent =
@@ -1211,9 +1260,14 @@ def create_app(config_path: Path) -> FastAPI:
 
     async function startTraining() {
       const input = document.getElementById('filekeysInput').value.trim();
+      const datasetKey = saveDatasetKey();
       const apiKey = saveApiKey();
       if (!input) {
         setLaunchMessage('filekey를 하나 이상 입력해 주세요.', true);
+        return;
+      }
+      if (!datasetKey) {
+        setLaunchMessage('datasetkey를 입력해 주세요.', true);
         return;
       }
 
@@ -1225,7 +1279,7 @@ def create_app(config_path: Path) -> FastAPI:
         const response = await fetch('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filekeys: input, api_key: apiKey }),
+          body: JSON.stringify({ datasetkey: datasetKey, filekeys: input, api_key: apiKey }),
         });
         const data = await response.json();
         if (!response.ok) {
@@ -1258,10 +1312,16 @@ def create_app(config_path: Path) -> FastAPI:
       stateEl.textContent = pipeline.state || 'unknown';
       stateEl.className = `status-pill ${toneClass(pipeline.state)}`;
 
-      document.getElementById('datasetKeyChip').textContent = data.aihub?.datasetkey ?? '-';
+      const datasetKey = data.aihub?.datasetkey ?? '-';
+      document.getElementById('datasetKeyChip').textContent = datasetKey;
+      if (datasetKey !== '-' && !document.getElementById('datasetKeyInput').value.trim()) {
+        document.getElementById('datasetKeyInput').value = datasetKey;
+      }
       document.getElementById('workspaceChip').textContent = data.workspace_name || '-';
       document.getElementById('launcherState').textContent = launcher.state || 'idle';
       document.getElementById('currentFilekey').textContent = formatJob(launcher.current_job);
+      document.getElementById('currentDatasetkey').textContent =
+        launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || []);
       document.getElementById('pendingFilekeys').textContent = formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey));
       document.getElementById('completedJobs').textContent = formatCompletedJobs(launcher.completed_jobs || []);
       document.getElementById('launcherLogPath').textContent = launcher.log_path || '-';
@@ -1310,7 +1370,9 @@ def create_app(config_path: Path) -> FastAPI:
       renderLogPanels(logs, launcher);
     }
 
+    loadSavedDatasetKey();
     loadSavedApiKey();
+    document.getElementById('datasetKeyInput').addEventListener('change', saveDatasetKey);
     document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
     refresh();
@@ -1337,13 +1399,18 @@ def create_app(config_path: Path) -> FastAPI:
 
         payload = await request.json()
         filekeys = parse_filekeys(payload.get("filekeys", ""))
+        datasetkey = str(payload.get("datasetkey", "")).strip()
         api_key = str(payload.get("api_key", "")).strip()
         if not filekeys:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
-        datasetkey = config.get("aihub_shell", {}).get("datasetkey")
+        if not datasetkey:
+            datasetkey = str(config.get("aihub_shell", {}).get("datasetkey", "")).strip()
         if datasetkey in (None, ""):
-            raise HTTPException(status_code=400, detail="설정 파일에 aihub_shell.datasetkey 가 필요합니다.")
+            raise HTTPException(
+                status_code=400,
+                detail="datasetkey를 입력해 주세요. datasetkey는 filekey가 아니라 AIHub 데이터셋 키입니다.",
+            )
 
         with state_lock:
             update_process_state()
@@ -1351,32 +1418,42 @@ def create_app(config_path: Path) -> FastAPI:
             current_job = launcher_state.get("current_job")
             existing_keys = set()
             if isinstance(current_job, dict) and current_job.get("filekey"):
-                existing_keys.add(str(current_job["filekey"]))
+                existing_keys.add(f"{current_job.get('datasetkey', '')}:{current_job['filekey']}")
             if isinstance(pending_jobs, list):
-                existing_keys.update(str(job.get("filekey")) for job in pending_jobs if isinstance(job, dict))
+                existing_keys.update(
+                    f"{job.get('datasetkey', '')}:{job.get('filekey')}"
+                    for job in pending_jobs
+                    if isinstance(job, dict) and job.get("filekey")
+                )
 
             appended = []
             skipped = []
             for filekey in filekeys:
-                if filekey in existing_keys:
+                unique_key = f"{datasetkey}:{filekey}"
+                if unique_key in existing_keys:
                     skipped.append(filekey)
                     continue
-                job = build_job(filekey, api_key=api_key)
+                job = build_job(filekey, datasetkey=datasetkey, api_key=api_key)
                 if isinstance(pending_jobs, list):
                     pending_jobs.append(job)
                 appended.append(filekey)
-                existing_keys.add(filekey)
+                existing_keys.add(unique_key)
 
             if not appended:
-                raise HTTPException(status_code=409, detail="입력한 filekey가 모두 현재 작업 또는 대기열에 이미 있습니다.")
+                raise HTTPException(
+                    status_code=409,
+                    detail="입력한 filekey가 모두 현재 작업 또는 대기열에 이미 있습니다.",
+                )
 
             launcher_state["last_state"] = "queued"
-            launcher_state["last_message"] = f"{len(appended)}개 filekey를 대기열에 추가했습니다."
+            launcher_state["last_message"] = (
+                f"datasetkey {datasetkey} 에 대해 {len(appended)}개 filekey를 대기열에 추가했습니다."
+            )
 
         return {
             "ok": True,
             "message": (
-                f"filekey {', '.join(appended)} 를 대기열에 추가했습니다."
+                f"datasetkey {datasetkey} | filekey {', '.join(appended)} 를 대기열에 추가했습니다."
                 + (f" 중복으로 건너뜀: {', '.join(skipped)}" if skipped else "")
             ),
             "launcher": get_launcher_status(),
@@ -1435,7 +1512,11 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "completed_jobs": enriched_completed_jobs,
         },
         "aihub": {
-            "datasetkey": config.get("aihub_shell", {}).get("datasetkey"),
+            "datasetkey": (
+                (current_job.get("datasetkey") if isinstance(current_job, dict) else None)
+                or (pending_jobs[0].get("datasetkey") if isinstance(pending_jobs, list) and pending_jobs and isinstance(pending_jobs[0], dict) else None)
+                or config.get("aihub_shell", {}).get("datasetkey")
+            ),
         },
         "queue_progress": {
             "total": total_count,
@@ -1448,16 +1529,19 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         "logs": {
             "current": {
                 "filekey": current_log_source.get("filekey") if isinstance(current_log_source, dict) else None,
+                "datasetkey": current_log_source.get("datasetkey") if isinstance(current_log_source, dict) else None,
                 "path": current_log_path,
                 "tail": current_log_tail,
             },
             "latest_completed": {
                 "filekey": latest_completed_job.get("filekey") if isinstance(latest_completed_job, dict) else None,
+                "datasetkey": latest_completed_job.get("datasetkey") if isinstance(latest_completed_job, dict) else None,
                 "path": latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
                 "tail": read_log_tail(latest_completed_job.get("log_path")) if isinstance(latest_completed_job, dict) else "",
             },
             "latest_error": {
                 "filekey": latest_error_job.get("filekey") if isinstance(latest_error_job, dict) else None,
+                "datasetkey": latest_error_job.get("datasetkey") if isinstance(latest_error_job, dict) else None,
                 "path": latest_error_log_path,
                 "tail": latest_error_log_tail,
             },

@@ -189,6 +189,12 @@ Windows에서 파일명이 `aihubshell.exe`여도 자동으로 찾도록 되어 
 AIHub 분할 압축 파일(`.zip.part*`)은 학습 파이프라인에서 자동으로 병합한 뒤 압축 해제합니다.
 입력한 `filekey`가 실제 데이터셋 파일 목록에 없으면 다운로드 전에 먼저 검증해서 대시보드 로그에 안내합니다.
 
+중요:
+
+- `datasetkey` 는 AIHub 데이터셋 전체의 키입니다.
+- 대시보드에 넣는 `filekey` 는 `insidedoor_01.zip | key: 49825` 같은 분할 ZIP의 key 값입니다.
+- 예를 들어 `key: 49825` 는 보통 `filekey` 이고, `datasetkey` 로 넣는 값이 아닙니다.
+
 학습 대시보드 실행:
 
 ```bash
@@ -197,11 +203,12 @@ python3 app/training_dashboard.py --config configs/action_training.aihub_shell.e
 
 그 다음 브라우저에서 `http://127.0.0.1:8010` 을 열고:
 
-1. 분할 ZIP의 `filekey`를 입력합니다.
-2. 필요하면 대시보드에서 `AIHub API 키`를 직접 입력합니다.
-3. `대기열에 추가` 버튼을 누릅니다.
-4. 여러 `filekey`를 넣으면 하나가 끝난 뒤 다음 작업이 자동으로 이어집니다.
-5. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
+1. `datasetkey`를 입력합니다.
+2. 분할 ZIP의 `filekey`를 입력합니다.
+3. 필요하면 대시보드에서 `AIHub API 키`를 직접 입력합니다.
+4. `대기열에 추가` 버튼을 누릅니다.
+5. 여러 `filekey`를 넣으면 하나가 끝난 뒤 다음 작업이 자동으로 이어집니다.
+6. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
 
 노트북에서 확인하고 싶다면:
 

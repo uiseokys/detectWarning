@@ -6,11 +6,12 @@
   "aihub_shell": {
     "path": "aihubshell",
     "mode": "d",
-    "datasetkey": 49825,
+    "datasetkey": null,
     "datapackagekey": null,
     "filekey": null,
     "api_key_env": "AIHUB_API_KEY",
-    "api_key": "8E240FE5-06BE-4296-B2CB-CA93BA850081"
+    "api_key": "",
+    "note": "datasetkey는 AIHub 데이터셋 키이고, 대시보드에 입력하는 filekey는 분할 ZIP 목록의 key 값입니다."
   },
   "dataset": {
     "target_labels": [
