@@ -430,9 +430,15 @@ def validate_aihub_filekeys(shell_path: str, api_key: str, *, datasetkey, reques
     if not requested:
         return
 
-    payload = fetch_aihub_file_tree(shell_path, api_key, datasetkey=datasetkey)
+    try:
+        payload = fetch_aihub_file_tree(datasetkey=datasetkey)
+    except Exception as exc:
+        print(f"[aihubshell] filekey 목록 검증을 건너뜁니다: {exc}")
+        return
+
     available_entries = collect_aihub_file_entries(payload)
     if not available_entries:
+        print("[aihubshell] filekey 목록이 비어 있어 검증을 건너뜁니다.")
         return
 
     available_keys = {entry["filekey"] for entry in available_entries}
@@ -470,35 +476,20 @@ def normalize_requested_filekeys(requested_filekeys) -> list[str]:
     return normalized
 
 
-def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict | list:
-    command = build_aihub_shell_command(shell_path, api_key, mode="l")
-    command.extend(["-datasetkey", str(datasetkey)])
-    completed = subprocess.run(command, capture_output=True, text=False, check=True)
-    stdout = decode_subprocess_output(completed.stdout).strip()
-    stderr = decode_subprocess_output(completed.stderr).strip()
-    merged_output = "\n".join(part for part in (stdout, stderr) if part)
+def fetch_aihub_file_tree(*, datasetkey) -> dict | list:
+    filetree_url = f"https://api.aihub.or.kr/info/{datasetkey}.do"
+    response = requests.get(filetree_url, timeout=60)
+    response.raise_for_status()
+    merged_output = response.text.strip()
     payload_text = extract_json_payload(merged_output)
     if not payload_text:
         raise RuntimeError(
             "AIHub 파일 목록 조회 결과를 해석하지 못했습니다.\n"
             f"- datasetkey: {datasetkey}\n"
             f"- raw output: {merged_output[:1000] if merged_output else '(empty)'}\n"
-            "대시보드의 현재 작업 로그에서 목록 조회 결과를 확인해 주세요."
+            "AIHub 파일 목록 응답 형식이 예상과 다를 수 있습니다."
         )
     return json.loads(payload_text)
-
-
-def decode_subprocess_output(payload: bytes | str | None) -> str:
-    if payload is None:
-        return ""
-    if isinstance(payload, str):
-        return payload
-    for encoding in ("utf-8", "cp949", "euc-kr"):
-        try:
-            return payload.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return payload.decode("utf-8", errors="replace")
 
 
 def extract_json_payload(text: str) -> str:
