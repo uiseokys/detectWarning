@@ -474,12 +474,15 @@ def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict 
     command = build_aihub_shell_command(shell_path, api_key, mode="l")
     command.extend(["-datasetkey", str(datasetkey)])
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
-    stdout = completed.stdout.strip()
-    payload_text = extract_json_payload(stdout)
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    merged_output = "\n".join(part for part in (stdout, stderr) if part)
+    payload_text = extract_json_payload(merged_output)
     if not payload_text:
         raise RuntimeError(
             "AIHub 파일 목록 조회 결과를 해석하지 못했습니다.\n"
             f"- datasetkey: {datasetkey}\n"
+            f"- raw output: {merged_output[:1000] if merged_output else '(empty)'}\n"
             "대시보드의 현재 작업 로그에서 목록 조회 결과를 확인해 주세요."
         )
     return json.loads(payload_text)
