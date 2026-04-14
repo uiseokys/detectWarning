@@ -165,6 +165,30 @@ def format_duration(seconds: int | float | None) -> str:
     return f"{secs}초"
 
 
+def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> tuple[str, str]:
+    if exit_code == 0:
+        return "completed", "현재 작업이 정상 완료되었습니다."
+
+    pipeline_status = read_json(paths["pipeline_status"]) or {}
+    pipeline_state = str(pipeline_status.get("state", "")).strip().lower()
+    pipeline_stage = str(pipeline_status.get("stage", "")).strip().lower()
+    log_tail = read_log_tail(current_job.get("log_path") if isinstance(current_job, dict) else None, max_lines=60, max_chars=6000)
+    success_markers = (
+        "[train] best model:",
+        "[train] metrics:",
+        "[train] labels:",
+    )
+    has_success_markers = any(marker in log_tail for marker in success_markers)
+
+    if pipeline_state == "completed" or pipeline_stage == "completed" or has_success_markers:
+        return (
+            "completed_warning",
+            f"현재 작업은 산출물 저장까지 완료됐지만 종료 코드 {exit_code}로 경고 종료되었습니다.",
+        )
+
+    return "error", f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -186,6 +210,7 @@ def create_app(config_path: Path) -> FastAPI:
         "current_job": None,
         "queued_jobs": [],
         "completed_jobs": [],
+        "auto_start_enabled": True,
         "last_state": "idle",
         "last_exit_code": None,
         "last_message": "아직 실행 기록이 없습니다.",
@@ -221,6 +246,16 @@ def create_app(config_path: Path) -> FastAPI:
             "runtime_config_path": None,
             "log_path": None,
         }
+
+    def build_retry_job_from(job: dict) -> dict:
+        retry_job = build_job(
+            str(job.get("filekey", "")),
+            datasetkey=job.get("datasetkey"),
+            api_key=str(job.get("api_key", "") or ""),
+        )
+        retry_job["retry_of"] = job.get("job_id")
+        retry_job["retry_count"] = int(job.get("retry_count", 0) or 0) + 1
+        return retry_job
 
     def write_dashboard_status(stage: str, state: str, message: str, **extra) -> None:
         payload = {
@@ -285,6 +320,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["current_job"] = None
         launcher_state["queued_jobs"] = []
         launcher_state["completed_jobs"] = []
+        launcher_state["auto_start_enabled"] = True
         launcher_state["last_state"] = "idle"
         launcher_state["last_exit_code"] = None
         launcher_state["last_message"] = "학습 워크스페이스를 초기화했습니다. 처음부터 다시 시작할 수 있습니다."
@@ -305,6 +341,8 @@ def create_app(config_path: Path) -> FastAPI:
             "job_id": job.get("job_id"),
             "filekey": job.get("filekey"),
             "datasetkey": job.get("datasetkey"),
+            "retry_of": job.get("retry_of"),
+            "retry_count": job.get("retry_count"),
             "queued_at": job.get("queued_at"),
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
@@ -417,15 +455,25 @@ def create_app(config_path: Path) -> FastAPI:
                 current_job = launcher_state.get("current_job") or {}
                 filekey = current_job.get("filekey", "-") if isinstance(current_job, dict) else "-"
                 datasetkey = current_job.get("datasetkey", "-") if isinstance(current_job, dict) else "-"
-                launcher_state["last_message"] = (
-                    f"datasetkey {datasetkey} | filekey {filekey} 작업이 실행 중입니다."
-                )
+                pending_jobs = launcher_state.get("queued_jobs", [])
+                auto_start_enabled = bool(launcher_state.get("auto_start_enabled", True))
+                if not auto_start_enabled and isinstance(pending_jobs, list) and pending_jobs:
+                    launcher_state["last_message"] = (
+                        f"datasetkey {datasetkey} | filekey {filekey} 작업이 실행 중입니다. "
+                        "현재 작업이 끝나면 다음 큐 자동 시작은 멈춥니다."
+                    )
+                else:
+                    launcher_state["last_message"] = (
+                        f"datasetkey {datasetkey} | filekey {filekey} 작업이 실행 중입니다."
+                    )
             else:
                 current_job = launcher_state.get("current_job")
+                final_message = f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
                 if isinstance(current_job, dict):
                     current_job["finished_at"] = current_timestamp()
                     current_job["exit_code"] = exit_code
-                    current_job["state"] = "completed" if exit_code == 0 else "error"
+                    final_state, final_message = classify_job_exit(paths, current_job, exit_code)
+                    current_job["state"] = final_state
                     current_job["result_summary"] = collect_result_summary()
                     completed_jobs = launcher_state.setdefault("completed_jobs", [])
                     if isinstance(completed_jobs, list):
@@ -435,18 +483,25 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["process"] = None
                 launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
-                if exit_code == 0:
+                if isinstance(current_job, dict) and current_job.get("state") == "completed":
                     launcher_state["last_state"] = "completed"
-                    launcher_state["last_message"] = "현재 작업이 정상 완료되었습니다."
+                    launcher_state["last_message"] = final_message
+                elif isinstance(current_job, dict) and current_job.get("state") == "completed_warning":
+                    launcher_state["last_state"] = "completed_warning"
+                    launcher_state["last_message"] = final_message
                 else:
                     launcher_state["last_state"] = "error"
-                    launcher_state["last_message"] = f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
+                    launcher_state["last_message"] = final_message
 
         active_process = launcher_state.get("process")
         queued_jobs = launcher_state.get("queued_jobs", [])
         if active_process is None and isinstance(queued_jobs, list) and queued_jobs:
-            next_job = queued_jobs.pop(0)
-            start_pipeline_for_job(next_job)
+            if bool(launcher_state.get("auto_start_enabled", True)):
+                next_job = queued_jobs.pop(0)
+                start_pipeline_for_job(next_job)
+            else:
+                launcher_state["last_state"] = "paused"
+                launcher_state["last_message"] = "다음 큐 자동 시작이 중지되었습니다. 시작 버튼을 누르면 재개합니다."
 
     def queue_worker() -> None:
         while True:
@@ -467,6 +522,7 @@ def create_app(config_path: Path) -> FastAPI:
             "message": launcher_state.get("last_message", ""),
             "pid": active_pid,
             "started_at": launcher_state.get("started_at"),
+            "auto_start_enabled": bool(launcher_state.get("auto_start_enabled", True)),
             "runtime_config_path": str(launcher_state["runtime_config_path"])
             if launcher_state.get("runtime_config_path")
             else None,
@@ -1187,6 +1243,289 @@ def create_app(config_path: Path) -> FastAPI:
         width: 100%;
       }
     }
+
+    /* Design refresh overrides */
+    :root {
+      --bg: #08111f;
+      --bg-deep: #0d1728;
+      --panel: rgba(248, 250, 252, 0.96);
+      --panel-strong: rgba(255, 255, 255, 0.98);
+      --panel-soft: rgba(241, 245, 249, 0.98);
+      --ink: #0f172a;
+      --muted: #62748a;
+      --line: rgba(148, 163, 184, 0.18);
+      --line-strong: rgba(148, 163, 184, 0.28);
+      --accent: #38bdf8;
+      --accent-strong: #2563eb;
+      --accent-soft: rgba(56, 189, 248, 0.12);
+      --good: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --shadow: 0 28px 60px rgba(2, 8, 23, 0.28);
+      --shadow-soft: 0 20px 40px rgba(15, 23, 42, 0.12);
+    }
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 26%),
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.16), transparent 22%),
+        radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.08), transparent 30%),
+        linear-gradient(180deg, #07111f 0%, #0a1323 42%, #0f172a 100%);
+      color: #e5eef9;
+    }
+    body::before {
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 90%);
+    }
+    .wrap {
+      max-width: 1680px;
+      padding: 28px 28px 48px;
+    }
+    .hero {
+      background:
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 34%),
+        linear-gradient(135deg, rgba(9, 18, 33, 0.94), rgba(15, 23, 42, 0.88));
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      box-shadow: 0 30px 80px rgba(2, 8, 23, 0.34);
+      backdrop-filter: blur(24px);
+    }
+    .hero::after {
+      right: -20px;
+      top: -20px;
+      width: 260px;
+      height: 260px;
+      background: radial-gradient(circle, rgba(59,130,246,0.24), transparent 70%);
+    }
+    .eyebrow {
+      background: rgba(56, 189, 248, 0.14);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.18);
+    }
+    .hero h1 {
+      color: #f8fbff;
+      font-size: 48px;
+      line-height: 0.95;
+    }
+    .hero p,
+    .hero-side-copy,
+    .section-title p {
+      color: rgba(219, 234, 254, 0.72);
+    }
+    .hero-chip {
+      background: rgba(15, 23, 42, 0.4);
+      border-color: rgba(148, 163, 184, 0.18);
+      color: rgba(226, 232, 240, 0.86);
+      box-shadow: none;
+    }
+    .hero-chip strong {
+      color: #ffffff;
+    }
+    .hero-side {
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.76), rgba(15, 23, 42, 0.54));
+      border-color: rgba(148, 163, 184, 0.16);
+      box-shadow: none;
+    }
+    .hero-side-label {
+      color: #93c5fd;
+    }
+    .hero-side-title {
+      color: #f8fbff;
+    }
+    .dashboard-shell {
+      display: grid;
+      grid-template-columns: 390px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
+    }
+    .sidebar-stack {
+      display: grid;
+      align-content: start;
+      gap: 20px;
+      position: sticky;
+      top: 24px;
+    }
+    .main-stack {
+      min-width: 0;
+      display: grid;
+      gap: 20px;
+    }
+    .sidebar-stack .control-panel {
+      grid-template-columns: 1fr;
+      padding: 22px;
+      margin-bottom: 0;
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.86), rgba(15, 23, 42, 0.78)),
+        radial-gradient(circle at top right, rgba(37,99,235,0.20), transparent 34%);
+      border-color: rgba(148, 163, 184, 0.15);
+      box-shadow: 0 26px 60px rgba(2, 8, 23, 0.28);
+    }
+    .sidebar-stack .control-title,
+    .sidebar-stack .launch-value,
+    .sidebar-stack .helper strong {
+      color: #f8fbff;
+    }
+    .sidebar-stack .control-copy,
+    .sidebar-stack .helper,
+    .sidebar-stack .launch-message,
+    .sidebar-stack .launch-label,
+    .sidebar-stack .form-label,
+    .sidebar-stack .meta-chip {
+      color: rgba(226, 232, 240, 0.72);
+    }
+    .sidebar-stack .meta-chip,
+    .sidebar-stack .launch-item,
+    .sidebar-stack .launch-box {
+      background: rgba(15, 23, 42, 0.38);
+      border-color: rgba(148, 163, 184, 0.14);
+      box-shadow: none;
+    }
+    .sidebar-stack .text-input,
+    .sidebar-stack .input-area {
+      background: rgba(15, 23, 42, 0.46);
+      color: #f8fbff;
+      border-color: rgba(148, 163, 184, 0.18);
+    }
+    .sidebar-stack .text-input::placeholder,
+    .sidebar-stack .input-area::placeholder {
+      color: rgba(148, 163, 184, 0.82);
+    }
+    .sidebar-stack .text-input:focus,
+    .sidebar-stack .input-area:focus {
+      border-color: rgba(56, 189, 248, 0.42);
+      box-shadow: 0 0 0 5px rgba(56, 189, 248, 0.12);
+    }
+    .sidebar-stack .launch-message {
+      background: rgba(255,255,255,0.06);
+    }
+    .primary-button {
+      border-radius: 14px;
+      padding: 13px 16px;
+      box-shadow: 0 14px 28px rgba(2, 8, 23, 0.22);
+    }
+    .primary-button:hover:not(:disabled) {
+      transform: translateY(-2px);
+    }
+    .section-title h2 {
+      color: #f8fbff;
+      font-size: 19px;
+    }
+    .section-pill {
+      background: rgba(255,255,255,0.08);
+      color: #cbd5e1;
+      border-color: rgba(148, 163, 184, 0.14);
+    }
+    .grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .card,
+    .panel {
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.98), rgba(245,248,252,0.95));
+      border-color: rgba(203, 213, 225, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    .card-featured {
+      grid-column: span 2;
+      background:
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 34%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+    }
+    .card-progress {
+      background:
+        radial-gradient(circle at top right, rgba(16, 185, 129, 0.12), transparent 36%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+    }
+    .card-queue {
+      background:
+        radial-gradient(circle at top right, rgba(245, 158, 11, 0.12), transparent 36%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+    }
+    .label {
+      color: #64748b;
+    }
+    .value {
+      font-size: 32px;
+      line-height: 1.05;
+    }
+    .subvalue {
+      color: #6b7d92;
+    }
+    .main-grid {
+      grid-template-columns: minmax(0, 1.48fr) minmax(340px, 0.92fr);
+      gap: 18px;
+    }
+    .panel-head {
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.92), rgba(247,250,253,0.86));
+    }
+    .panel-title {
+      font-size: 22px;
+    }
+    .chart-wrap,
+    .mini-card,
+    .scroll-panel {
+      background: linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    }
+    .mini-card {
+      border-radius: 20px;
+    }
+    .panel.analytics-primary .chart-wrap:first-of-type {
+      background:
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 34%),
+        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    }
+    .panel.analytics-primary .chart-wrap:last-of-type {
+      background:
+        radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 34%),
+        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    }
+    .log-grid {
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+    }
+    .log-card {
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.96), rgba(245,248,252,0.92));
+    }
+    .log-pre {
+      min-height: 280px;
+      color: #d7e4ff;
+      background:
+        radial-gradient(circle at top right, rgba(59,130,246,0.14), transparent 30%),
+        linear-gradient(180deg, #08111f 0%, #0f172a 100%);
+    }
+    @media (max-width: 1380px) {
+      .dashboard-shell {
+        grid-template-columns: 1fr;
+      }
+      .sidebar-stack {
+        position: static;
+      }
+      .sidebar-stack .control-panel {
+        grid-template-columns: 1.1fr 0.9fr;
+      }
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .card-featured {
+        grid-column: span 1;
+      }
+    }
+    @media (max-width: 860px) {
+      .sidebar-stack .control-panel,
+      .main-grid,
+      .log-grid,
+      .grid,
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+      .value {
+        font-size: 28px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -1210,6 +1549,8 @@ def create_app(config_path: Path) -> FastAPI:
       </aside>
     </section>
 
+    <div class="dashboard-shell">
+    <aside class="sidebar-stack">
     <section class="card control-panel">
       <div>
         <h2 class="control-title">AIHub filekey 순차 학습 큐</h2>
@@ -1229,6 +1570,8 @@ def create_app(config_path: Path) -> FastAPI:
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
           <button id="startButton" class="primary-button" type="button">대기열에 추가</button>
+          <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">다음 큐 자동 시작 중지</button>
+          <button id="forceStopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 14px 28px rgba(239, 68, 68, 0.22);">현재 작업 강제 중단</button>
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
           <div class="helper">datasetkey는 AIHub 데이터셋 키이고, filekey는 분할 ZIP 목록의 key 값입니다. 현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
         </div>
@@ -1255,12 +1598,18 @@ def create_app(config_path: Path) -> FastAPI:
           <div class="launch-value" id="completedJobs">-</div>
         </div>
         <div class="launch-item">
+          <div class="launch-label">다음 큐 자동 시작</div>
+          <div class="launch-value" id="autoStartState">켜짐</div>
+        </div>
+        <div class="launch-item">
           <div class="launch-label">실행 로그</div>
           <div class="launch-value mono" id="launcherLogPath">-</div>
         </div>
         <div id="launchMessage" class="launch-message">여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.</div>
       </div>
     </section>
+    </aside>
+    <main class="main-stack">
 
     <div class="section-title">
       <div>
@@ -1270,12 +1619,12 @@ def create_app(config_path: Path) -> FastAPI:
       <div class="section-pill">Overview</div>
     </div>
     <section class="grid">
-      <article class="card">
+      <article class="card card-featured">
         <div class="label">현재 단계</div>
         <div class="value" id="currentStage">-</div>
         <div class="subvalue" id="currentMessage">-</div>
       </article>
-      <article class="card">
+      <article class="card card-progress">
         <div class="label">현재 filekey 진행률</div>
         <div class="value" id="currentJobProgressText">0%</div>
         <div class="subvalue" id="currentJobProgressMeta">대기 중</div>
@@ -1301,7 +1650,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="value" id="artifactState">-</div>
         <div class="subvalue" id="workspaceDir">-</div>
       </article>
-      <article class="card">
+      <article class="card card-queue">
         <div class="label">큐 진행률</div>
         <div class="value" id="queueProgressText">0 / 0</div>
         <div class="subvalue" id="queueProgressMeta">완료 0 / 실패 0 / 대기 0</div>
@@ -1317,7 +1666,7 @@ def create_app(config_path: Path) -> FastAPI:
       <div class="section-pill">Analytics</div>
     </div>
     <section class="main-grid">
-      <article class="panel">
+      <article class="panel analytics-primary">
         <div class="panel-head">
           <div>
             <h2 class="panel-title">학습 성능 그래프</h2>
@@ -1492,11 +1841,16 @@ def create_app(config_path: Path) -> FastAPI:
         <pre id="errorLogText" class="log-pre">오류 로그가 아직 없습니다.</pre>
       </article>
     </section>
+    </main>
+    </div>
   </div>
   <script>
     function toneClass(state) {
       if (state === 'completed') return 'tone-good';
+      if (state === 'completed_warning') return 'tone-warn';
       if (state === 'running') return 'tone-accent';
+      if (state === 'paused') return 'tone-warn';
+      if (state === 'aborted') return 'tone-danger';
       if (state === 'error') return 'tone-danger';
       if (state === 'download' || state === 'prepare' || state === 'train') return 'tone-warn';
       return 'tone-neutral';
@@ -1534,9 +1888,24 @@ def create_app(config_path: Path) -> FastAPI:
         return '-';
       }
       return jobs.slice(0, 3).map((job) => {
-        const state = job.state === 'completed' ? '완료' : '실패';
+        const state =
+          job.state === 'completed' ? '완료' :
+          job.state === 'completed_warning' ? '경고 종료' :
+          job.state === 'aborted' ? '강제 중단' :
+          '실패';
         return `${job.filekey} ${state}`;
       }).join(' / ');
+    }
+
+    function formatLauncherState(state) {
+      if (state === 'running') return '실행 중';
+      if (state === 'queued') return '대기열 준비';
+      if (state === 'paused') return '자동 시작 중지';
+      if (state === 'completed') return '완료';
+      if (state === 'completed_warning') return '경고 종료';
+      if (state === 'aborted') return '강제 중단';
+      if (state === 'error') return '오류';
+      return state || '대기 중';
     }
 
     function setLaunchMessage(message, isError) {
@@ -1545,6 +1914,32 @@ def create_app(config_path: Path) -> FastAPI:
       box.style.color = isError ? '#dc2626' : '#64748b';
       box.style.borderColor = isError ? 'rgba(220,38,38,0.18)' : 'rgba(148,163,184,0.18)';
       box.style.background = isError ? 'rgba(220,38,38,0.06)' : 'rgba(255,255,255,0.84)';
+    }
+
+    function updateControlButtons(launcher) {
+      const startButton = document.getElementById('startButton');
+      const stopButton = document.getElementById('stopButton');
+      const forceStopButton = document.getElementById('forceStopButton');
+      const autoStartEnabled = launcher?.auto_start_enabled !== false;
+      const hasCurrentJob = !!launcher?.current_job;
+      const pendingCount = (launcher?.pending_jobs || []).length;
+
+      if (!autoStartEnabled && (hasCurrentJob || pendingCount > 0)) {
+        startButton.textContent = hasCurrentJob ? '자동 시작 재개' : '대기열 시작';
+      } else {
+        startButton.textContent = '대기열에 추가';
+      }
+
+      if (hasCurrentJob || pendingCount > 0) {
+        stopButton.disabled = !autoStartEnabled;
+        stopButton.textContent = autoStartEnabled ? '다음 큐 자동 시작 중지' : '자동 시작 중지됨';
+      } else {
+        stopButton.disabled = true;
+        stopButton.textContent = '다음 큐 자동 시작 중지';
+      }
+
+      forceStopButton.disabled = !hasCurrentJob;
+      forceStopButton.textContent = hasCurrentJob ? '현재 작업 강제 중단' : '현재 작업 강제 중단';
     }
 
     function loadSavedApiKey() {
@@ -1802,7 +2197,11 @@ def create_app(config_path: Path) -> FastAPI:
           (summary.prepared_train_total ?? 0) +
           (summary.prepared_val_total ?? 0) +
           (summary.prepared_test_total ?? 0);
-        const stateLabel = job.state === 'completed' ? '완료' : '실패';
+        const stateLabel =
+          job.state === 'completed' ? '완료' :
+          job.state === 'completed_warning' ? '경고 종료' :
+          job.state === 'aborted' ? '강제 중단' :
+          '실패';
         const logPreview = job.log_preview || job.log_path || '-';
         return `
           <tr>
@@ -1839,11 +2238,17 @@ def create_app(config_path: Path) -> FastAPI:
       const input = document.getElementById('filekeysInput').value.trim();
       const datasetKey = saveDatasetKey();
       const apiKey = saveApiKey();
-      if (!input) {
+      const launcher = latestOverview?.launcher || {};
+      const pausedQueueExists =
+        launcher?.auto_start_enabled === false &&
+        ((launcher?.pending_jobs || []).length > 0 || !!launcher?.current_job);
+      const resumeOnly = !input && pausedQueueExists;
+
+      if (!input && !resumeOnly) {
         setLaunchMessage('filekey를 하나 이상 입력해 주세요.', true);
         return;
       }
-      if (!datasetKey) {
+      if (!resumeOnly && !datasetKey) {
         setLaunchMessage('datasetkey를 입력해 주세요.', true);
         return;
       }
@@ -1856,20 +2261,73 @@ def create_app(config_path: Path) -> FastAPI:
         const response = await fetch('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ datasetkey: datasetKey, filekeys: input, api_key: apiKey }),
+          body: JSON.stringify({ datasetkey: datasetKey, filekeys: input, api_key: apiKey, resume_only: resumeOnly }),
         });
         const data = await response.json();
         if (!response.ok) {
           throw new Error(data.detail || data.message || '학습 시작에 실패했습니다.');
         }
         setLaunchMessage(data.message || '학습을 시작했습니다.', false);
-        document.getElementById('filekeysInput').value = '';
+        if (!resumeOnly) {
+          document.getElementById('filekeysInput').value = '';
+        }
         await refresh();
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
         button.disabled = false;
-        button.textContent = '대기열에 추가';
+        updateControlButtons(latestOverview?.launcher || {});
+      }
+    }
+
+    async function pauseQueue() {
+      const button = document.getElementById('stopButton');
+      button.disabled = true;
+      button.textContent = '중지 요청 중...';
+
+      try {
+        const response = await fetch('/api/pause', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || data.message || '중지 요청에 실패했습니다.');
+        }
+        setLaunchMessage(data.message || '현재 작업까지만 진행하고 다음 큐 자동 시작을 멈춥니다.', false);
+        await refresh();
+      } catch (error) {
+        setLaunchMessage(error.message || String(error), true);
+      } finally {
+        updateControlButtons(latestOverview?.launcher || {});
+      }
+    }
+
+    async function forceStopCurrentJob() {
+      const confirmed = window.confirm('현재 진행 중인 filekey 작업을 즉시 강제 중단할까요? 현재 작업은 나중에 재시작 시 처음부터 다시 시도되며, 다음 큐 자동 시작은 멈춥니다.');
+      if (!confirmed) {
+        return;
+      }
+
+      const button = document.getElementById('forceStopButton');
+      button.disabled = true;
+      button.textContent = '강제 중단 중...';
+
+      try {
+        const response = await fetch('/api/force-stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || data.message || '강제 중단에 실패했습니다.');
+        }
+        setLaunchMessage(data.message || '현재 작업을 강제 중단했습니다.', false);
+        await refresh();
+      } catch (error) {
+        setLaunchMessage(error.message || String(error), true);
+      } finally {
+        updateControlButtons(latestOverview?.launcher || {});
       }
     }
 
@@ -1908,6 +2366,7 @@ def create_app(config_path: Path) -> FastAPI:
         return;
       }
       const data = await response.json();
+      latestOverview = data;
       const pipeline = data.pipeline_status || {};
       const progress = data.training_progress || {};
       const metrics = data.metrics || {};
@@ -1919,8 +2378,9 @@ def create_app(config_path: Path) -> FastAPI:
       const eta = data.eta || {};
 
       const stateEl = document.getElementById('pipelineState');
-      stateEl.textContent = pipeline.state || 'unknown';
-      stateEl.className = `status-pill ${toneClass(pipeline.state)}`;
+      const displayState = launcher.state || pipeline.state || 'unknown';
+      stateEl.textContent = formatLauncherState(displayState);
+      stateEl.className = `status-pill ${toneClass(displayState)}`;
 
       const datasetKey = data.aihub?.datasetkey ?? '-';
       document.getElementById('datasetKeyChip').textContent = datasetKey;
@@ -1928,14 +2388,17 @@ def create_app(config_path: Path) -> FastAPI:
         document.getElementById('datasetKeyInput').value = datasetKey;
       }
       document.getElementById('workspaceChip').textContent = data.workspace_name || '-';
-      document.getElementById('launcherState').textContent = launcher.state || 'idle';
+      document.getElementById('launcherState').textContent = formatLauncherState(launcher.state || 'idle');
       document.getElementById('currentFilekey').textContent = formatJob(launcher.current_job);
       document.getElementById('currentDatasetkey').textContent =
         launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || []);
       document.getElementById('pendingFilekeys').textContent = formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey));
       document.getElementById('completedJobs').textContent = formatCompletedJobs(launcher.completed_jobs || []);
+      document.getElementById('autoStartState').textContent =
+        launcher.auto_start_enabled === false ? '꺼짐' : '켜짐';
       document.getElementById('launcherLogPath').textContent = launcher.log_path || '-';
       setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
+      updateControlButtons(launcher);
 
       document.getElementById('currentStage').textContent = pipeline.stage || '-';
       document.getElementById('currentMessage').textContent = pipeline.message || '-';
@@ -2002,11 +2465,15 @@ def create_app(config_path: Path) -> FastAPI:
       renderLogPanels(logs, launcher);
     }
 
+    let latestOverview = null;
+
     loadSavedDatasetKey();
     loadSavedApiKey();
     document.getElementById('datasetKeyInput').addEventListener('change', saveDatasetKey);
     document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
+    document.getElementById('stopButton').addEventListener('click', pauseQueue);
+    document.getElementById('forceStopButton').addEventListener('click', forceStopCurrentJob);
     document.getElementById('resetButton').addEventListener('click', resetWorkspace);
     refresh();
     setInterval(refresh, 2000);
@@ -2034,12 +2501,13 @@ def create_app(config_path: Path) -> FastAPI:
         filekeys = parse_filekeys(payload.get("filekeys", ""))
         datasetkey = str(payload.get("datasetkey", "")).strip()
         api_key = str(payload.get("api_key", "")).strip()
-        if not filekeys:
+        resume_only = bool(payload.get("resume_only", False))
+        if not filekeys and not resume_only:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
         if not datasetkey:
             datasetkey = str(config.get("aihub_shell", {}).get("datasetkey", "")).strip()
-        if datasetkey in (None, ""):
+        if not resume_only and datasetkey in (None, ""):
             raise HTTPException(
                 status_code=400,
                 detail="datasetkey를 입력해 주세요. datasetkey는 filekey가 아니라 AIHub 데이터셋 키입니다.",
@@ -2049,6 +2517,23 @@ def create_app(config_path: Path) -> FastAPI:
             update_process_state()
             pending_jobs = launcher_state.setdefault("queued_jobs", [])
             current_job = launcher_state.get("current_job")
+            if resume_only:
+                has_pending = isinstance(pending_jobs, list) and len(pending_jobs) > 0
+                if not current_job and not has_pending:
+                    raise HTTPException(status_code=409, detail="재개할 작업이 없습니다.")
+                launcher_state["auto_start_enabled"] = True
+                if current_job:
+                    launcher_state["last_state"] = "running"
+                    launcher_state["last_message"] = "현재 작업 완료 후 다음 큐 자동 시작을 다시 허용합니다."
+                else:
+                    launcher_state["last_state"] = "queued"
+                    launcher_state["last_message"] = "대기열 자동 시작을 다시 켰습니다. 다음 큐를 이어서 시작합니다."
+                return {
+                    "ok": True,
+                    "message": "대기열 자동 시작을 재개했습니다.",
+                    "launcher": get_launcher_status(),
+                }
+
             existing_keys = set()
             if isinstance(current_job, dict) and current_job.get("filekey"):
                 existing_keys.add(f"{current_job.get('datasetkey', '')}:{current_job['filekey']}")
@@ -2078,6 +2563,7 @@ def create_app(config_path: Path) -> FastAPI:
                     detail="입력한 filekey가 모두 현재 작업 또는 대기열에 이미 있습니다.",
                 )
 
+            launcher_state["auto_start_enabled"] = True
             launcher_state["last_state"] = "queued"
             launcher_state["last_message"] = (
                 f"datasetkey {datasetkey} 에 대해 {len(appended)}개 filekey를 대기열에 추가했습니다."
@@ -2088,6 +2574,101 @@ def create_app(config_path: Path) -> FastAPI:
             "message": (
                 f"datasetkey {datasetkey} | filekey {', '.join(appended)} 를 대기열에 추가했습니다."
                 + (f" 중복으로 건너뜀: {', '.join(skipped)}" if skipped else "")
+            ),
+            "launcher": get_launcher_status(),
+        }
+
+    @app.post("/api/pause")
+    def pause_after_current() -> dict:
+        with state_lock:
+            update_process_state()
+            current_job = launcher_state.get("current_job")
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            has_pending = isinstance(pending_jobs, list) and len(pending_jobs) > 0
+            if not current_job and not has_pending:
+                raise HTTPException(status_code=409, detail="중지할 작업이 없습니다.")
+
+            launcher_state["auto_start_enabled"] = False
+            if current_job:
+                launcher_state["last_state"] = "running"
+                launcher_state["last_message"] = "현재 작업까지만 진행하고, 완료 후 다음 큐 자동 시작을 멈춥니다."
+            else:
+                launcher_state["last_state"] = "paused"
+                launcher_state["last_message"] = "다음 큐 자동 시작을 중지했습니다. 시작 버튼을 누르면 재개합니다."
+
+        return {
+            "ok": True,
+            "message": "현재 작업까지만 진행하고, 다음 큐 자동 시작을 멈춥니다.",
+            "launcher": get_launcher_status(),
+        }
+
+    @app.post("/api/force-stop")
+    def force_stop_current_job() -> dict:
+        with state_lock:
+            update_process_state()
+            active_process = launcher_state.get("process")
+            current_job = launcher_state.get("current_job")
+            if not isinstance(active_process, subprocess.Popen) or not isinstance(current_job, dict):
+                raise HTTPException(status_code=409, detail="현재 강제 중단할 작업이 없습니다.")
+
+            launcher_state["auto_start_enabled"] = False
+
+            try:
+                active_process.terminate()
+                active_process.wait(timeout=5)
+            except Exception:
+                try:
+                    active_process.kill()
+                    active_process.wait(timeout=5)
+                except Exception:
+                    pass
+
+            current_job["finished_at"] = current_timestamp()
+            current_job["exit_code"] = active_process.returncode if active_process.returncode is not None else -1
+            current_job["state"] = "aborted"
+            current_job["result_summary"] = collect_result_summary()
+
+            completed_jobs = launcher_state.setdefault("completed_jobs", [])
+            if isinstance(completed_jobs, list):
+                completed_jobs.insert(0, snapshot_job(current_job))
+                del completed_jobs[30:]
+            persist_launcher_history()
+
+            retry_job = build_retry_job_from(current_job)
+            pending_jobs = launcher_state.setdefault("queued_jobs", [])
+            if isinstance(pending_jobs, list):
+                pending_jobs.insert(0, retry_job)
+
+            launcher_state["process"] = None
+            launcher_state["started_at"] = None
+            launcher_state["runtime_config_path"] = None
+            launcher_state["current_job"] = None
+            launcher_state["last_state"] = "paused"
+            launcher_state["last_exit_code"] = current_job["exit_code"]
+            launcher_state["log_path"] = current_job.get("log_path")
+            launcher_state["last_message"] = (
+                f"filekey {current_job.get('filekey')} 작업을 강제 중단했습니다. "
+                "같은 작업을 대기열 맨 앞으로 다시 넣었고, 시작 버튼을 눌러야 재개됩니다."
+            )
+
+            reset_training_workspace(paths)
+            write_dashboard_status(
+                stage="paused",
+                state="paused",
+                message=(
+                    f"filekey {current_job.get('filekey')} 작업을 강제 중단했습니다. "
+                    "다시 시작하면 현재 filekey를 처음부터 재시도합니다."
+                ),
+                stage_progress=0.0,
+                current_filekey=current_job.get("filekey"),
+                current_datasetkey=current_job.get("datasetkey"),
+            )
+
+        return {
+            "ok": True,
+            "message": (
+                f"filekey {current_job.get('filekey')} 작업을 강제 중단했습니다. "
+                "같은 filekey를 큐 맨 앞으로 다시 넣었고, 시작 버튼을 누르면 처음부터 다시 시작합니다."
             ),
             "launcher": get_launcher_status(),
         }
@@ -2123,7 +2704,7 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     latest_completed_job = next(
         (
             job for job in completed_jobs
-            if isinstance(job, dict) and job.get("state") == "completed"
+            if isinstance(job, dict) and job.get("state") in {"completed", "completed_warning"}
         ),
         None,
     )
@@ -2148,7 +2729,10 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
         enriched_completed_jobs.append(enriched_job)
 
-    completed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "completed"])
+    completed_count = len([
+        job for job in completed_jobs
+        if isinstance(job, dict) and job.get("state") in {"completed", "completed_warning"}
+    ])
     failed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "error"])
     pending_count = len(pending_jobs) if isinstance(pending_jobs, list) else 0
     active_count = 1 if current_job else 0
