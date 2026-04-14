@@ -473,9 +473,9 @@ def normalize_requested_filekeys(requested_filekeys) -> list[str]:
 def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict | list:
     command = build_aihub_shell_command(shell_path, api_key, mode="l")
     command.extend(["-datasetkey", str(datasetkey)])
-    completed = subprocess.run(command, capture_output=True, text=True, check=True)
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
+    completed = subprocess.run(command, capture_output=True, text=False, check=True)
+    stdout = decode_subprocess_output(completed.stdout).strip()
+    stderr = decode_subprocess_output(completed.stderr).strip()
     merged_output = "\n".join(part for part in (stdout, stderr) if part)
     payload_text = extract_json_payload(merged_output)
     if not payload_text:
@@ -486,6 +486,19 @@ def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict 
             "대시보드의 현재 작업 로그에서 목록 조회 결과를 확인해 주세요."
         )
     return json.loads(payload_text)
+
+
+def decode_subprocess_output(payload: bytes | str | None) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8", errors="replace")
 
 
 def extract_json_payload(text: str) -> str:
