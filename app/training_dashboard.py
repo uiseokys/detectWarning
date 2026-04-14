@@ -135,6 +135,25 @@ def create_app(config_path: Path) -> FastAPI:
             "prepared_test_total": summarize_manifest(paths["prepared_test"], label_field="target_label").get("total", 0),
         }
 
+    def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_chars: int = 12000) -> str:
+        if not path_value:
+            return ""
+        path = Path(path_value)
+        if not path.exists() or not path.is_file():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = text.splitlines()
+        tail = "\n".join(lines[-max_lines:])
+        if len(tail) > max_chars:
+            tail = tail[-max_chars:]
+        return tail
+
+    def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_chars: int = 900) -> str:
+        return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
+
     def start_pipeline_for_job(job: dict) -> None:
         reset_training_workspace(paths)
         runtime_config_dir.mkdir(parents=True, exist_ok=True)
@@ -703,6 +722,48 @@ def create_app(config_path: Path) -> FastAPI:
       border: 1px solid rgba(148,163,184,0.12);
       background: var(--panel-soft);
     }
+    .log-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+    .log-card {
+      border-radius: 18px;
+      border: 1px solid rgba(148,163,184,0.12);
+      background: var(--panel-soft);
+      overflow: hidden;
+    }
+    .log-card-head {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(148,163,184,0.12);
+      background: rgba(255,255,255,0.7);
+    }
+    .log-card-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+    .log-card-copy {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .log-pre {
+      margin: 0;
+      padding: 14px 16px;
+      min-height: 220px;
+      max-height: 320px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "SF Mono", "JetBrains Mono", monospace;
+      font-size: 12px;
+      line-height: 1.65;
+      color: #0f172a;
+      background: rgba(255,255,255,0.74);
+    }
     @media (max-width: 1200px) {
       .control-panel,
       .main-grid {
@@ -710,6 +771,9 @@ def create_app(config_path: Path) -> FastAPI:
       }
       .grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .log-grid {
+        grid-template-columns: 1fr;
       }
     }
     @media (max-width: 720px) {
@@ -888,7 +952,7 @@ def create_app(config_path: Path) -> FastAPI:
                 <th>상태</th>
                 <th>원본 / 준비</th>
                 <th>시작 / 완료</th>
-                <th>로그</th>
+                <th>로그 내용</th>
               </tr>
             </thead>
             <tbody id="completedLogsTable"></tbody>
@@ -896,6 +960,23 @@ def create_app(config_path: Path) -> FastAPI:
         </div>
         <div id="completedLogsEmpty" class="empty" style="display:none; margin-top:14px;">아직 완료된 작업 로그가 없습니다.</div>
       </div>
+    </section>
+
+    <section class="log-grid">
+      <article class="log-card">
+        <div class="log-card-head">
+          <h3 class="log-card-title">현재 작업 로그</h3>
+          <div class="log-card-copy" id="currentLogMeta">실행 중인 작업이 없으면 가장 최근 로그를 표시합니다.</div>
+        </div>
+        <pre id="currentLogText" class="log-pre">로그를 불러오는 중입니다.</pre>
+      </article>
+      <article class="log-card">
+        <div class="log-card-head">
+          <h3 class="log-card-title">최근 오류 로그</h3>
+          <div class="log-card-copy" id="errorLogMeta">최근 실패 작업이 있으면 마지막 로그를 표시합니다.</div>
+        </div>
+        <pre id="errorLogText" class="log-pre">오류 로그가 아직 없습니다.</pre>
+      </article>
     </section>
   </div>
   <script>
@@ -1075,16 +1156,36 @@ def create_app(config_path: Path) -> FastAPI:
           (summary.prepared_val_total ?? 0) +
           (summary.prepared_test_total ?? 0);
         const stateLabel = job.state === 'completed' ? '완료' : '실패';
+        const logPreview = job.log_preview || job.log_path || '-';
         return `
           <tr>
             <td>${job.filekey || '-'}</td>
             <td>${stateLabel}${job.exit_code !== null && job.exit_code !== undefined ? ` (${job.exit_code})` : ''}</td>
             <td>${rawTotal} / ${preparedTotal}</td>
             <td>${formatDateTime(job.started_at)}<br>${formatDateTime(job.finished_at)}</td>
-            <td class="mono">${job.log_path || '-'}</td>
+            <td class="mono">${logPreview}</td>
           </tr>
         `;
       }).join('');
+    }
+
+    function renderLogPanels(logs, launcher) {
+      const current = logs?.current || {};
+      const latestError = logs?.latest_error || {};
+      const currentMeta = current.filekey
+        ? `filekey ${current.filekey}${current.path ? ' | ' + current.path : ''}`
+        : (current.path || launcher?.log_path || '실행 중인 작업이 없으면 최근 완료 로그를 표시합니다.');
+      document.getElementById('currentLogMeta').textContent =
+        currentMeta;
+      document.getElementById('currentLogText').textContent =
+        current.tail || '표시할 로그가 없습니다.';
+
+      const errorMeta = latestError.filekey
+        ? `최근 실패 filekey: ${latestError.filekey}${latestError.path ? ' | ' + latestError.path : ''}`
+        : '최근 실패 작업이 있으면 마지막 로그를 표시합니다.';
+      document.getElementById('errorLogMeta').textContent = errorMeta;
+      document.getElementById('errorLogText').textContent =
+        latestError.tail || '오류 로그가 아직 없습니다.';
     }
 
     async function startTraining() {
@@ -1130,6 +1231,7 @@ def create_app(config_path: Path) -> FastAPI:
       const progress = data.training_progress || {};
       const launcher = data.launcher || {};
       const queueProgress = data.queue_progress || {};
+      const logs = data.logs || {};
 
       const stateEl = document.getElementById('pipelineState');
       stateEl.textContent = pipeline.state || 'unknown';
@@ -1184,6 +1286,7 @@ def create_app(config_path: Path) -> FastAPI:
       renderChart(progress.history || []);
       renderDatasetTable(data.dataset || {});
       renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
+      renderLogPanels(logs, launcher);
     }
 
     loadSavedApiKey();
@@ -1266,6 +1369,34 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     completed_jobs = launcher_status.get("completed_jobs", []) if isinstance(launcher_status, dict) else []
     pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
     current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
+    latest_completed_job = next(
+        (
+            job for job in completed_jobs
+            if isinstance(job, dict) and job.get("state") == "completed"
+        ),
+        None,
+    )
+    current_log_source = current_job if isinstance(current_job, dict) else latest_completed_job
+    current_log_path = current_log_source.get("log_path") if isinstance(current_log_source, dict) else None
+    current_log_tail = read_log_tail(current_log_path)
+
+    latest_error_job = next(
+        (
+            job for job in completed_jobs
+            if isinstance(job, dict) and job.get("state") == "error"
+        ),
+        None,
+    )
+    latest_error_log_path = latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None
+    latest_error_log_tail = read_log_tail(latest_error_log_path)
+    enriched_completed_jobs = []
+    for job in completed_jobs:
+        if not isinstance(job, dict):
+            continue
+        enriched_job = dict(job)
+        enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
+        enriched_completed_jobs.append(enriched_job)
+
     completed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "completed"])
     failed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "error"])
     pending_count = len(pending_jobs) if isinstance(pending_jobs, list) else 0
@@ -1278,7 +1409,10 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         "config_path": str(config_path),
         "pipeline_status": read_json(paths["pipeline_status"]),
         "training_progress": read_json(paths["training_progress"]),
-        "launcher": launcher_status,
+        "launcher": {
+            **launcher_status,
+            "completed_jobs": enriched_completed_jobs,
+        },
         "aihub": {
             "datasetkey": config.get("aihub_shell", {}).get("datasetkey"),
         },
@@ -1289,6 +1423,23 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "pending": pending_count,
             "active": active_count,
             "ratio": round(progress_ratio, 4),
+        },
+        "logs": {
+            "current": {
+                "filekey": current_log_source.get("filekey") if isinstance(current_log_source, dict) else None,
+                "path": current_log_path,
+                "tail": current_log_tail,
+            },
+            "latest_completed": {
+                "filekey": latest_completed_job.get("filekey") if isinstance(latest_completed_job, dict) else None,
+                "path": latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
+                "tail": read_log_tail(latest_completed_job.get("log_path")) if isinstance(latest_completed_job, dict) else "",
+            },
+            "latest_error": {
+                "filekey": latest_error_job.get("filekey") if isinstance(latest_error_job, dict) else None,
+                "path": latest_error_log_path,
+                "tail": latest_error_log_tail,
+            },
         },
         "dataset": {
             "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),

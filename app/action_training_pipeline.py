@@ -258,6 +258,8 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
     raw_manifest_path = paths["raw_manifest"]
 
     command = build_aihub_shell_command(shell_path, api_key, mode=mode)
+    if datasetkey is not None and filekey:
+        validate_aihub_filekeys(shell_path, api_key, datasetkey=datasetkey, requested_filekeys=filekey)
     if datasetkey is not None:
         command.extend(["-datasetkey", str(datasetkey)])
     if datapackagekey is not None:
@@ -279,7 +281,14 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         paths,
         stage="download",
         state="running",
-        message="다운로드한 분할 ZIP을 압축 해제하는 중입니다.",
+        message="다운로드한 분할 ZIP 조각을 병합하는 중입니다.",
+    )
+    merge_split_archives(import_dir)
+    write_pipeline_status(
+        paths,
+        stage="download",
+        state="running",
+        message="병합된 ZIP 파일을 압축 해제하는 중입니다.",
     )
     source_root = extract_archives(import_dir, paths["extracted_dir"])
     write_pipeline_status(
@@ -289,6 +298,15 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         message="압축 해제된 영상 파일을 스캔하고 라벨을 정리하는 중입니다.",
     )
     downloaded = scan_local_video_dataset(config, paths, source_root=source_root)
+    if not downloaded:
+        raise RuntimeError(
+            "다운로드 후 학습용 영상 파일을 찾지 못했습니다.\n"
+            "확인할 것:\n"
+            "1. 입력한 filekey가 실제 승인된 분할 파일인지\n"
+            "2. AIHub에서 해당 데이터셋 다운로드 승인이 완료되었는지\n"
+            "3. 분할 압축 파일이 .zip.part* 형태로 정상 저장되었는지\n"
+            "4. label_mapping의 한글 라벨명이 압축 해제 폴더명과 일치하는지"
+        )
 
     with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
         for item in downloaded:
@@ -309,6 +327,59 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
 
     print(f"[download] aihubshell imported {len(downloaded)} videos -> {raw_manifest_path}")
     return downloaded
+
+
+def merge_split_archives(import_dir: Path) -> list[Path]:
+    part_groups: dict[Path, list[Path]] = defaultdict(list)
+    pattern = re.compile(r"^(?P<base>.+\.zip)\.part(?P<part>.+)$", re.IGNORECASE)
+
+    for path in import_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        base_name = match.group("base")
+        base_path = path.with_name(base_name)
+        part_groups[base_path].append(path)
+
+    merged_archives: list[Path] = []
+    for base_path, parts in sorted(part_groups.items(), key=lambda item: str(item[0])):
+        sorted_parts = sorted(parts, key=split_part_sort_key)
+        if not sorted_parts:
+            continue
+
+        needs_merge = True
+        if base_path.exists() and base_path.stat().st_size > 0:
+            latest_part_mtime = max(part.stat().st_mtime for part in sorted_parts)
+            if base_path.stat().st_mtime >= latest_part_mtime:
+                needs_merge = False
+
+        if needs_merge:
+            with base_path.open("wb") as merged_handle:
+                for part_path in sorted_parts:
+                    with part_path.open("rb") as part_handle:
+                        shutil.copyfileobj(part_handle, merged_handle, length=1024 * 1024)
+            if base_path.stat().st_size == 0:
+                raise RuntimeError(
+                    f"분할 압축 병합 결과가 0바이트입니다: {base_path}\n"
+                    "AIHub 안내처럼 filekey와 폴더 경로가 맞는지 다시 확인해 주세요."
+                )
+
+        merged_archives.append(base_path)
+
+    return merged_archives
+
+
+def split_part_sort_key(path: Path):
+    match = re.search(r"\.part(.+)$", path.name, re.IGNORECASE)
+    part_token = match.group(1) if match else path.name
+    if part_token.isdigit():
+        return (0, int(part_token))
+    numeric = re.sub(r"[^0-9]", "", part_token)
+    if numeric.isdigit():
+        return (1, int(numeric), part_token)
+    return (2, part_token)
 
 
 def build_aihub_shell_command(shell_path: str, api_key: str, *, mode: str) -> list[str]:
@@ -352,6 +423,116 @@ def resolve_windows_bash() -> str | None:
         if candidate_path.exists():
             return str(candidate_path)
     return None
+
+
+def validate_aihub_filekeys(shell_path: str, api_key: str, *, datasetkey, requested_filekeys) -> None:
+    requested = normalize_requested_filekeys(requested_filekeys)
+    if not requested:
+        return
+
+    payload = fetch_aihub_file_tree(shell_path, api_key, datasetkey=datasetkey)
+    available_entries = collect_aihub_file_entries(payload)
+    if not available_entries:
+        return
+
+    available_keys = {entry["filekey"] for entry in available_entries}
+    missing = [filekey for filekey in requested if filekey not in available_keys]
+    if not missing:
+        return
+
+    examples = ", ".join(entry["filekey"] for entry in available_entries[:10])
+    matched_names = "\n".join(
+        f"- {entry['filekey']}: {entry.get('name', '-')}"
+        for entry in available_entries[:10]
+    )
+    raise RuntimeError(
+        "입력한 filekey가 AIHub 파일 목록에 없습니다.\n"
+        f"- datasetkey: {datasetkey}\n"
+        f"- 요청 filekey: {', '.join(missing)}\n"
+        f"- 예시 filekey: {examples}\n"
+        "아래 목록을 먼저 확인해 주세요:\n"
+        f"{matched_names}"
+    )
+
+
+def normalize_requested_filekeys(requested_filekeys) -> list[str]:
+    if requested_filekeys is None:
+        return []
+    if isinstance(requested_filekeys, list):
+        values = requested_filekeys
+    else:
+        values = [requested_filekeys]
+    normalized = []
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() != "all":
+            normalized.append(text)
+    return normalized
+
+
+def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict | list:
+    command = build_aihub_shell_command(shell_path, api_key, mode="l")
+    command.append(str(datasetkey))
+    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    stdout = completed.stdout.strip()
+    payload_text = extract_json_payload(stdout)
+    if not payload_text:
+        raise RuntimeError(
+            "AIHub 파일 목록 조회 결과를 해석하지 못했습니다.\n"
+            f"- datasetkey: {datasetkey}\n"
+            "대시보드의 현재 작업 로그에서 목록 조회 결과를 확인해 주세요."
+        )
+    return json.loads(payload_text)
+
+
+def extract_json_payload(text: str) -> str:
+    candidates = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start >= 0 and end > start:
+            candidates.append(text[start:end + 1])
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+
+def collect_aihub_file_entries(payload) -> list[dict]:
+    entries: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            filekey = None
+            for key in ("fileSn", "filesn", "fileKey", "filekey"):
+                if key in node and node[key] not in (None, ""):
+                    filekey = str(node[key]).strip()
+                    break
+            if filekey:
+                entries.append(
+                    {
+                        "filekey": filekey,
+                        "name": str(
+                            node.get("fileNm")
+                            or node.get("fileName")
+                            or node.get("filePath")
+                            or node.get("path")
+                            or node.get("name")
+                            or ""
+                        ).strip(),
+                    }
+                )
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+
+    unique: dict[str, dict] = {}
+    for entry in entries:
+        unique.setdefault(entry["filekey"], entry)
+    return sorted(unique.values(), key=lambda item: item["filekey"])
 
 
 def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None = None) -> list[DownloadedItem]:

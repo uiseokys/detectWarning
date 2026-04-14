@@ -186,6 +186,8 @@ python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --s
 
 `aihubshell` 파일이 프로젝트 루트에 있으면 예제 설정 그대로 써도 됩니다.
 Windows에서 파일명이 `aihubshell.exe`여도 자동으로 찾도록 되어 있습니다.
+AIHub 분할 압축 파일(`.zip.part*`)은 학습 파이프라인에서 자동으로 병합한 뒤 압축 해제합니다.
+입력한 `filekey`가 실제 데이터셋 파일 목록에 없으면 다운로드 전에 먼저 검증해서 대시보드 로그에 안내합니다.
 
 학습 대시보드 실행:
 
