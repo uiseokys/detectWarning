@@ -184,6 +184,9 @@ python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --s
 
 [`configs/action_training.aihub_shell.example.json`](/Users/jung-uiseok/Desktop/detectWarning/configs/action_training.aihub_shell.example.json)
 
+`aihubshell` 파일이 프로젝트 루트에 있으면 예제 설정 그대로 써도 됩니다.
+Windows에서 파일명이 `aihubshell.exe`여도 자동으로 찾도록 되어 있습니다.
+
 학습 대시보드 실행:
 
 ```bash
@@ -193,8 +196,15 @@ python3 app/training_dashboard.py --config configs/action_training.aihub_shell.e
 그 다음 브라우저에서 `http://127.0.0.1:8010` 을 열고:
 
 1. 분할 ZIP의 `filekey`를 입력합니다.
-2. `다운로드 + 압축 해제 + 학습 시작` 버튼을 누릅니다.
-3. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
+2. `대기열에 추가` 버튼을 누릅니다.
+3. 여러 `filekey`를 넣으면 하나가 끝난 뒤 다음 작업이 자동으로 이어집니다.
+4. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
+
+노트북에서 확인하고 싶다면:
+
+1. 데스크탑에서 위 대시보드를 실행합니다.
+2. 노트북 브라우저에서 `http://데스크탑_Tailscale_IP:8010` 으로 접속합니다.
+3. 같은 대시보드를 원격으로 보면서 현재 작업, 대기열, 최근 완료 작업을 확인할 수 있습니다.
 
 터미널에서 바로 전체 파이프라인을 실행하고 싶다면:
 

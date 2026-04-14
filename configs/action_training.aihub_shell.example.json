@@ -4,7 +4,7 @@
   },
   "dataset_source": "aihub_shell",
   "aihub_shell": {
-    "path": "/Users/jung-uiseok/Desktop/detectWarning/aihubshell",
+    "path": "aihubshell",
     "mode": "d",
     "datasetkey": 49825,
     "datapackagekey": null,

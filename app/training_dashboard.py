@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,44 +36,204 @@ def create_app(config_path: Path) -> FastAPI:
     paths = resolve_paths(config, config_path.parent)
     project_root = Path(__file__).resolve().parent.parent
     pipeline_script = Path(__file__).resolve().with_name("action_training_pipeline.py")
-    launch_log_path = paths["workspace_dir"] / "launcher.log"
+    job_logs_dir = paths["workspace_dir"] / "job_logs"
+    job_logs_dir.mkdir(parents=True, exist_ok=True)
     runtime_config_dir = paths["workspace_dir"] / "runtime_configs"
     runtime_config_dir.mkdir(parents=True, exist_ok=True)
+    launcher_history_path = paths["workspace_dir"] / "launcher_history.json"
 
     app = FastAPI(title="detectWarning Training Dashboard")
+    state_lock = threading.Lock()
 
     launcher_state: dict[str, object] = {
         "process": None,
         "started_at": None,
         "runtime_config_path": None,
-        "requested_filekeys": [],
+        "current_job": None,
+        "queued_jobs": [],
+        "completed_jobs": [],
         "last_state": "idle",
         "last_exit_code": None,
         "last_message": "아직 실행 기록이 없습니다.",
+        "log_path": None,
     }
+
+    if launcher_history_path.exists():
+        try:
+            with launcher_history_path.open("r", encoding="utf-8") as handle:
+                history_payload = json.load(handle)
+            completed_jobs = history_payload.get("completed_jobs", [])
+            if isinstance(completed_jobs, list):
+                launcher_state["completed_jobs"] = completed_jobs
+        except (OSError, json.JSONDecodeError):
+            launcher_state["completed_jobs"] = []
 
     def current_timestamp() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat()
 
-    def get_launcher_status() -> dict:
+    def build_job(filekey: str) -> dict:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", filekey).strip("_") or "filekey"
+        return {
+            "job_id": f"job_{stamp}_{safe_key}",
+            "filekey": filekey,
+            "queued_at": current_timestamp(),
+            "started_at": None,
+            "finished_at": None,
+            "state": "queued",
+            "exit_code": None,
+            "runtime_config_path": None,
+            "log_path": None,
+        }
+
+    def write_dashboard_status(stage: str, state: str, message: str, **extra) -> None:
+        payload = {
+            "stage": stage,
+            "state": state,
+            "message": message,
+            "workspace_dir": str(paths["workspace_dir"]),
+            "updated_at": current_timestamp(),
+            **extra,
+        }
+        with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    def persist_launcher_history() -> None:
+        payload = {
+            "updated_at": current_timestamp(),
+            "completed_jobs": launcher_state.get("completed_jobs", []),
+        }
+        with launcher_history_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    def snapshot_job(job: dict | None) -> dict | None:
+        if not job:
+            return None
+        return {
+            "job_id": job.get("job_id"),
+            "filekey": job.get("filekey"),
+            "queued_at": job.get("queued_at"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "state": job.get("state"),
+            "exit_code": job.get("exit_code"),
+            "runtime_config_path": str(job["runtime_config_path"]) if job.get("runtime_config_path") else None,
+            "log_path": str(job["log_path"]) if job.get("log_path") else None,
+            "result_summary": job.get("result_summary"),
+        }
+
+    def collect_result_summary() -> dict:
+        return {
+            "raw_total": summarize_manifest(paths["raw_manifest"], label_field="target_label").get("total", 0),
+            "train_total": summarize_manifest(paths["split_train"], label_field="target_label").get("total", 0),
+            "val_total": summarize_manifest(paths["split_val"], label_field="target_label").get("total", 0),
+            "test_total": summarize_manifest(paths["split_test"], label_field="target_label").get("total", 0),
+            "prepared_train_total": summarize_manifest(paths["prepared_train"], label_field="target_label").get("total", 0),
+            "prepared_val_total": summarize_manifest(paths["prepared_val"], label_field="target_label").get("total", 0),
+            "prepared_test_total": summarize_manifest(paths["prepared_test"], label_field="target_label").get("total", 0),
+        }
+
+    def start_pipeline_for_job(job: dict) -> None:
+        reset_training_workspace(paths)
+        runtime_config_dir.mkdir(parents=True, exist_ok=True)
+        job_logs_dir.mkdir(parents=True, exist_ok=True)
+
+        runtime_config = json.loads(json.dumps(config))
+        runtime_config["dataset_source"] = "aihub_shell"
+        runtime_shell = runtime_config.setdefault("aihub_shell", {})
+        runtime_shell["filekey"] = job["filekey"]
+
+        runtime_config_path = runtime_config_dir / f"{job['job_id']}.json"
+        with runtime_config_path.open("w", encoding="utf-8") as handle:
+            json.dump(runtime_config, handle, ensure_ascii=False, indent=2)
+
+        log_path = job_logs_dir / f"{job['job_id']}.log"
+        write_dashboard_status(
+            stage="queued",
+            state="running",
+            message=f"filekey {job['filekey']} 작업을 시작합니다.",
+            current_filekey=job["filekey"],
+        )
+        with log_path.open("w", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pipeline_script),
+                    "--config",
+                    str(runtime_config_path),
+                    "--stage",
+                    "all",
+                ],
+                cwd=str(project_root),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+
+        job["started_at"] = current_timestamp()
+        job["state"] = "running"
+        job["runtime_config_path"] = runtime_config_path
+        job["log_path"] = log_path
+        launcher_state["process"] = process
+        launcher_state["started_at"] = job["started_at"]
+        launcher_state["runtime_config_path"] = runtime_config_path
+        launcher_state["current_job"] = job
+        launcher_state["last_state"] = "running"
+        launcher_state["last_exit_code"] = None
+        launcher_state["log_path"] = log_path
+        launcher_state["last_message"] = f"filekey {job['filekey']} 학습을 진행 중입니다."
+
+    def update_process_state() -> None:
         process = launcher_state.get("process")
         if process is not None and isinstance(process, subprocess.Popen):
             exit_code = process.poll()
             if exit_code is None:
                 launcher_state["last_state"] = "running"
-                launcher_state["last_message"] = "다운로드 + 압축 해제 + 학습 파이프라인이 실행 중입니다."
+                current_job = launcher_state.get("current_job") or {}
+                filekey = current_job.get("filekey", "-") if isinstance(current_job, dict) else "-"
+                launcher_state["last_message"] = f"filekey {filekey} 작업이 실행 중입니다."
             else:
+                current_job = launcher_state.get("current_job")
+                if isinstance(current_job, dict):
+                    current_job["finished_at"] = current_timestamp()
+                    current_job["exit_code"] = exit_code
+                    current_job["state"] = "completed" if exit_code == 0 else "error"
+                    current_job["result_summary"] = collect_result_summary()
+                    completed_jobs = launcher_state.setdefault("completed_jobs", [])
+                    if isinstance(completed_jobs, list):
+                        completed_jobs.insert(0, current_job)
+                        del completed_jobs[30:]
+                    persist_launcher_history()
                 launcher_state["process"] = None
+                launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
                 if exit_code == 0:
                     launcher_state["last_state"] = "completed"
-                    launcher_state["last_message"] = "파이프라인이 정상 완료되었습니다."
+                    launcher_state["last_message"] = "현재 작업이 정상 완료되었습니다."
                 else:
                     launcher_state["last_state"] = "error"
-                    launcher_state["last_message"] = f"파이프라인이 종료 코드 {exit_code}로 중단되었습니다."
+                    launcher_state["last_message"] = f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
 
         active_process = launcher_state.get("process")
-        active_pid = active_process.pid if isinstance(active_process, subprocess.Popen) else None
+        queued_jobs = launcher_state.get("queued_jobs", [])
+        if active_process is None and isinstance(queued_jobs, list) and queued_jobs:
+            next_job = queued_jobs.pop(0)
+            start_pipeline_for_job(next_job)
+
+    def queue_worker() -> None:
+        while True:
+            with state_lock:
+                update_process_state()
+            time.sleep(1.0)
+
+    def get_launcher_status() -> dict:
+        with state_lock:
+            update_process_state()
+            active_process = launcher_state.get("process")
+            active_pid = active_process.pid if isinstance(active_process, subprocess.Popen) else None
+            current_job = snapshot_job(launcher_state.get("current_job"))
+            queued_jobs = launcher_state.get("queued_jobs", [])
+            completed_jobs = launcher_state.get("completed_jobs", [])
         return {
             "state": launcher_state.get("last_state", "idle"),
             "message": launcher_state.get("last_message", ""),
@@ -80,10 +242,15 @@ def create_app(config_path: Path) -> FastAPI:
             "runtime_config_path": str(launcher_state["runtime_config_path"])
             if launcher_state.get("runtime_config_path")
             else None,
-            "requested_filekeys": list(launcher_state.get("requested_filekeys", [])),
+            "current_job": current_job,
+            "pending_jobs": [snapshot_job(job) for job in queued_jobs] if isinstance(queued_jobs, list) else [],
+            "completed_jobs": [snapshot_job(job) for job in completed_jobs] if isinstance(completed_jobs, list) else [],
             "last_exit_code": launcher_state.get("last_exit_code"),
-            "log_path": str(launch_log_path),
+            "log_path": str(launcher_state["log_path"]) if launcher_state.get("log_path") else None,
         }
+
+    worker = threading.Thread(target=queue_worker, daemon=True)
+    worker.start()
 
     def render_dashboard() -> str:
         return """<!DOCTYPE html>
@@ -313,7 +480,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 14px;
       margin-bottom: 18px;
     }
@@ -469,6 +636,48 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--muted);
       word-break: break-all;
     }
+    .progress-track {
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(148,163,184,0.18);
+      overflow: hidden;
+      margin-top: 10px;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #2563eb, #059669);
+      width: 0%;
+      transition: width 0.25s ease;
+    }
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .mini-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(15,23,42,0.05);
+      color: var(--muted);
+      border: 1px solid rgba(148,163,184,0.16);
+    }
+    .logs-section {
+      margin-top: 18px;
+    }
+    .scroll-panel {
+      max-height: 340px;
+      overflow: auto;
+      border-radius: 18px;
+      border: 1px solid rgba(148,163,184,0.12);
+      background: var(--panel-soft);
+    }
     @media (max-width: 1200px) {
       .control-panel,
       .main-grid {
@@ -500,17 +709,17 @@ def create_app(config_path: Path) -> FastAPI:
     <section class="hero">
       <div>
         <h1>행동 학습 진행 대시보드</h1>
-        <p>AIHub 분할 ZIP의 filekey를 직접 넣고, 다운로드부터 압축 해제, pose 전처리, 행동 학습까지 한 번에 실행할 수 있습니다.</p>
+        <p>AIHub 분할 ZIP의 filekey를 여러 개 넣고, 하나가 끝나면 다음 작업이 자동으로 이어지도록 순차 학습 큐를 운영할 수 있습니다.</p>
       </div>
       <div id="pipelineState" class="status-pill tone-neutral">상태 확인 중</div>
     </section>
 
     <section class="card control-panel">
       <div>
-        <h2 class="control-title">AIHub filekey로 바로 학습 시작</h2>
+        <h2 class="control-title">AIHub filekey 순차 학습 큐</h2>
         <div class="control-copy">
           여러 개의 분할 ZIP 파일 키를 쉼표 또는 줄바꿈으로 넣으면 됩니다.
-          대시보드가 작업 폴더를 초기화한 뒤, 선택한 파일만 다운로드하고 자동으로 압축을 해제해서 학습을 시작합니다.
+          대시보드가 한 번에 하나씩 작업을 꺼내서, 다운로드와 압축 해제, pose 전처리, 학습까지 순서대로 처리합니다.
         </div>
         <div class="meta-row">
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
@@ -519,8 +728,8 @@ def create_app(config_path: Path) -> FastAPI:
         <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
-          <button id="startButton" class="primary-button" type="button">다운로드 + 압축 해제 + 학습 시작</button>
-          <div class="helper">실행 중에는 같은 대시보드에서 중복 시작이 막힙니다.</div>
+          <button id="startButton" class="primary-button" type="button">대기열에 추가</button>
+          <div class="helper">현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
         </div>
       </div>
       <div class="launch-box">
@@ -529,8 +738,16 @@ def create_app(config_path: Path) -> FastAPI:
           <div class="launch-value" id="launcherState">대기 중</div>
         </div>
         <div class="launch-item">
-          <div class="launch-label">최근 요청 filekey</div>
-          <div class="launch-value" id="requestedFilekeys">-</div>
+          <div class="launch-label">현재 실행 filekey</div>
+          <div class="launch-value" id="currentFilekey">-</div>
+        </div>
+        <div class="launch-item">
+          <div class="launch-label">대기 중 filekey</div>
+          <div class="launch-value" id="pendingFilekeys">-</div>
+        </div>
+        <div class="launch-item">
+          <div class="launch-label">최근 완료 작업</div>
+          <div class="launch-value" id="completedJobs">-</div>
         </div>
         <div class="launch-item">
           <div class="launch-label">실행 로그</div>
@@ -560,6 +777,12 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="label">모델 산출물</div>
         <div class="value" id="artifactState">-</div>
         <div class="subvalue" id="workspaceDir">-</div>
+      </article>
+      <article class="card">
+        <div class="label">큐 진행률</div>
+        <div class="value" id="queueProgressText">0 / 0</div>
+        <div class="subvalue" id="queueProgressMeta">완료 0 / 실패 0 / 대기 0</div>
+        <div class="progress-track"><div id="queueProgressFill" class="progress-fill"></div></div>
       </article>
     </section>
 
@@ -616,6 +839,37 @@ def create_app(config_path: Path) -> FastAPI:
         </div>
       </article>
     </section>
+
+    <section class="panel logs-section">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">완료 데이터 로그</h2>
+          <div class="panel-copy">지금까지 처리된 filekey별 결과와 생성된 데이터 수를 확인합니다.</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="pill-row">
+          <div class="mini-pill" id="completedCountPill">완료 0</div>
+          <div class="mini-pill" id="failedCountPill">실패 0</div>
+          <div class="mini-pill" id="pendingCountPill">대기 0</div>
+        </div>
+        <div class="scroll-panel" style="margin-top:14px;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>filekey</th>
+                <th>상태</th>
+                <th>원본 / 준비</th>
+                <th>시작 / 완료</th>
+                <th>로그</th>
+              </tr>
+            </thead>
+            <tbody id="completedLogsTable"></tbody>
+          </table>
+        </div>
+        <div id="completedLogsEmpty" class="empty" style="display:none; margin-top:14px;">아직 완료된 작업 로그가 없습니다.</div>
+      </div>
+    </section>
   </div>
   <script>
     function toneClass(state) {
@@ -631,6 +885,23 @@ def create_app(config_path: Path) -> FastAPI:
         return '-';
       }
       return filekeys.join(', ');
+    }
+
+    function formatJob(job) {
+      if (!job || !job.filekey) {
+        return '-';
+      }
+      return `${job.filekey} (${job.state || 'unknown'})`;
+    }
+
+    function formatCompletedJobs(jobs) {
+      if (!jobs || !jobs.length) {
+        return '-';
+      }
+      return jobs.slice(0, 3).map((job) => {
+        const state = job.state === 'completed' ? '완료' : '실패';
+        return `${job.filekey} ${state}`;
+      }).join(' / ');
     }
 
     function setLaunchMessage(message, isError) {
@@ -723,6 +994,55 @@ def create_app(config_path: Path) -> FastAPI:
       tbody.innerHTML = rows.join('');
     }
 
+    function formatDateTime(value) {
+      if (!value) {
+        return '-';
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+      return date.toLocaleString('ko-KR', { hour12: false });
+    }
+
+    function renderCompletedLogs(jobs, queueProgress) {
+      const tbody = document.getElementById('completedLogsTable');
+      const empty = document.getElementById('completedLogsEmpty');
+      const completedCount = queueProgress?.completed ?? 0;
+      const failedCount = queueProgress?.failed ?? 0;
+      const pendingCount = queueProgress?.pending ?? 0;
+
+      document.getElementById('completedCountPill').textContent = `완료 ${completedCount}`;
+      document.getElementById('failedCountPill').textContent = `실패 ${failedCount}`;
+      document.getElementById('pendingCountPill').textContent = `대기 ${pendingCount}`;
+
+      if (!jobs || !jobs.length) {
+        tbody.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+      }
+
+      empty.style.display = 'none';
+      tbody.innerHTML = jobs.map((job) => {
+        const summary = job.result_summary || {};
+        const rawTotal = summary.raw_total ?? 0;
+        const preparedTotal =
+          (summary.prepared_train_total ?? 0) +
+          (summary.prepared_val_total ?? 0) +
+          (summary.prepared_test_total ?? 0);
+        const stateLabel = job.state === 'completed' ? '완료' : '실패';
+        return `
+          <tr>
+            <td>${job.filekey || '-'}</td>
+            <td>${stateLabel}${job.exit_code !== null && job.exit_code !== undefined ? ` (${job.exit_code})` : ''}</td>
+            <td>${rawTotal} / ${preparedTotal}</td>
+            <td>${formatDateTime(job.started_at)}<br>${formatDateTime(job.finished_at)}</td>
+            <td class="mono">${job.log_path || '-'}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     async function startTraining() {
       const input = document.getElementById('filekeysInput').value.trim();
       if (!input) {
@@ -745,12 +1065,13 @@ def create_app(config_path: Path) -> FastAPI:
           throw new Error(data.detail || data.message || '학습 시작에 실패했습니다.');
         }
         setLaunchMessage(data.message || '학습을 시작했습니다.', false);
+        document.getElementById('filekeysInput').value = '';
         await refresh();
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
         button.disabled = false;
-        button.textContent = '다운로드 + 압축 해제 + 학습 시작';
+        button.textContent = '대기열에 추가';
       }
     }
 
@@ -763,6 +1084,7 @@ def create_app(config_path: Path) -> FastAPI:
       const pipeline = data.pipeline_status || {};
       const progress = data.training_progress || {};
       const launcher = data.launcher || {};
+      const queueProgress = data.queue_progress || {};
 
       const stateEl = document.getElementById('pipelineState');
       stateEl.textContent = pipeline.state || 'unknown';
@@ -771,7 +1093,9 @@ def create_app(config_path: Path) -> FastAPI:
       document.getElementById('datasetKeyChip').textContent = data.aihub?.datasetkey ?? '-';
       document.getElementById('workspaceChip').textContent = data.workspace_name || '-';
       document.getElementById('launcherState').textContent = launcher.state || 'idle';
-      document.getElementById('requestedFilekeys').textContent = formatFilekeys(launcher.requested_filekeys || []);
+      document.getElementById('currentFilekey').textContent = formatJob(launcher.current_job);
+      document.getElementById('pendingFilekeys').textContent = formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey));
+      document.getElementById('completedJobs').textContent = formatCompletedJobs(launcher.completed_jobs || []);
       document.getElementById('launcherLogPath').textContent = launcher.log_path || '-';
       setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
 
@@ -793,6 +1117,12 @@ def create_app(config_path: Path) -> FastAPI:
 
       document.getElementById('artifactState').textContent = data.artifacts?.has_model ? 'ready' : 'pending';
       document.getElementById('workspaceDir').textContent = data.workspace_dir || '-';
+      document.getElementById('queueProgressText').textContent =
+        `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`;
+      document.getElementById('queueProgressMeta').textContent =
+        `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`;
+      document.getElementById('queueProgressFill').style.width =
+        `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`;
 
       if (progress.latest) {
         document.getElementById('latestEpoch').textContent = `Epoch ${progress.latest.epoch}`;
@@ -808,6 +1138,7 @@ def create_app(config_path: Path) -> FastAPI:
 
       renderChart(progress.history || []);
       renderDatasetTable(data.dataset || {});
+      renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
     }
 
     document.getElementById('startButton').addEventListener('click', startTraining);
@@ -833,10 +1164,6 @@ def create_app(config_path: Path) -> FastAPI:
                 detail="이 대시보드에서 직접 filekey 실행은 dataset_source가 aihub_shell일 때만 지원합니다.",
             )
 
-        launcher = get_launcher_status()
-        if launcher["state"] == "running":
-            raise HTTPException(status_code=409, detail="이미 학습 파이프라인이 실행 중입니다.")
-
         payload = await request.json()
         filekeys = parse_filekeys(payload.get("filekeys", ""))
         if not filekeys:
@@ -846,46 +1173,40 @@ def create_app(config_path: Path) -> FastAPI:
         if datasetkey in (None, ""):
             raise HTTPException(status_code=400, detail="설정 파일에 aihub_shell.datasetkey 가 필요합니다.")
 
-        reset_training_workspace(paths)
-        runtime_config_dir.mkdir(parents=True, exist_ok=True)
+        with state_lock:
+            update_process_state()
+            pending_jobs = launcher_state.setdefault("queued_jobs", [])
+            current_job = launcher_state.get("current_job")
+            existing_keys = set()
+            if isinstance(current_job, dict) and current_job.get("filekey"):
+                existing_keys.add(str(current_job["filekey"]))
+            if isinstance(pending_jobs, list):
+                existing_keys.update(str(job.get("filekey")) for job in pending_jobs if isinstance(job, dict))
 
-        runtime_config = json.loads(json.dumps(config))
-        runtime_config["dataset_source"] = "aihub_shell"
-        runtime_shell = runtime_config.setdefault("aihub_shell", {})
-        runtime_shell["filekey"] = filekeys if len(filekeys) > 1 else filekeys[0]
+            appended = []
+            skipped = []
+            for filekey in filekeys:
+                if filekey in existing_keys:
+                    skipped.append(filekey)
+                    continue
+                job = build_job(filekey)
+                if isinstance(pending_jobs, list):
+                    pending_jobs.append(job)
+                appended.append(filekey)
+                existing_keys.add(filekey)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        runtime_config_path = runtime_config_dir / f"launch_{timestamp}.json"
-        with runtime_config_path.open("w", encoding="utf-8") as handle:
-            json.dump(runtime_config, handle, ensure_ascii=False, indent=2)
+            if not appended:
+                raise HTTPException(status_code=409, detail="입력한 filekey가 모두 현재 작업 또는 대기열에 이미 있습니다.")
 
-        with launch_log_path.open("w", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(pipeline_script),
-                    "--config",
-                    str(runtime_config_path),
-                    "--stage",
-                    "all",
-                ],
-                cwd=str(project_root),
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-            )
-
-        launcher_state["process"] = process
-        launcher_state["started_at"] = current_timestamp()
-        launcher_state["runtime_config_path"] = runtime_config_path
-        launcher_state["requested_filekeys"] = filekeys
-        launcher_state["last_state"] = "running"
-        launcher_state["last_exit_code"] = None
-        launcher_state["last_message"] = "AIHub 다운로드와 학습 파이프라인을 시작했습니다."
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = f"{len(appended)}개 filekey를 대기열에 추가했습니다."
 
         return {
             "ok": True,
-            "message": f"filekey {', '.join(filekeys)} 기준으로 학습을 시작했습니다.",
+            "message": (
+                f"filekey {', '.join(appended)} 를 대기열에 추가했습니다."
+                + (f" 중복으로 건너뜀: {', '.join(skipped)}" if skipped else "")
+            ),
             "launcher": get_launcher_status(),
         }
 
@@ -893,15 +1214,33 @@ def create_app(config_path: Path) -> FastAPI:
 
 
 def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_status: dict | None = None) -> dict:
+    launcher_status = launcher_status or {}
+    completed_jobs = launcher_status.get("completed_jobs", []) if isinstance(launcher_status, dict) else []
+    pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
+    current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
+    completed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "completed"])
+    failed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "error"])
+    pending_count = len(pending_jobs) if isinstance(pending_jobs, list) else 0
+    active_count = 1 if current_job else 0
+    total_count = completed_count + failed_count + pending_count + active_count
+    progress_ratio = ((completed_count + failed_count) / total_count) if total_count > 0 else 0.0
     return {
         "workspace_dir": str(paths["workspace_dir"]),
         "workspace_name": paths["workspace_dir"].name,
         "config_path": str(config_path),
         "pipeline_status": read_json(paths["pipeline_status"]),
         "training_progress": read_json(paths["training_progress"]),
-        "launcher": launcher_status or {},
+        "launcher": launcher_status,
         "aihub": {
             "datasetkey": config.get("aihub_shell", {}).get("datasetkey"),
+        },
+        "queue_progress": {
+            "total": total_count,
+            "completed": completed_count,
+            "failed": failed_count,
+            "pending": pending_count,
+            "active": active_count,
+            "ratio": round(progress_ratio, 4),
         },
         "dataset": {
             "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),

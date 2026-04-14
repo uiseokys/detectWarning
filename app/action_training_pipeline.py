@@ -805,12 +805,25 @@ def validate_aihub_shell_config(shell_config: dict, config_path: Path) -> None:
 def resolve_aihub_shell_path(shell_config: dict) -> str:
     configured = str(shell_config.get("path", "")).strip()
     if configured:
-        candidate = Path(configured).expanduser()
-        if candidate.exists():
-            return str(candidate.resolve())
+        raw_candidate = Path(configured).expanduser()
+        candidates = [raw_candidate]
+        if raw_candidate.suffix == "":
+            candidates.extend(
+                [
+                    raw_candidate.with_suffix(".exe"),
+                    raw_candidate.with_suffix(".bat"),
+                    raw_candidate.with_suffix(".cmd"),
+                ]
+            )
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate.resolve())
         raise RuntimeError(
             f"aihubshell 경로를 찾지 못했습니다: {configured}\n"
-            "AIHub 공식 안내에 따라 aihubshell을 다운로드한 뒤 path에 넣어 주세요."
+            "확인할 것:\n"
+            "1. config의 aihub_shell.path 가 현재 PC 기준 경로인지\n"
+            "2. Windows라면 aihubshell.exe 인지\n"
+            "3. 프로젝트 루트에 있다면 path를 'aihubshell' 로 둘 수 있는지"
         )
 
     discovered = shutil.which("aihubshell")
