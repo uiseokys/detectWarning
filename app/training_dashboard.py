@@ -99,9 +99,10 @@ def create_app(config_path: Path) -> FastAPI:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     def persist_launcher_history() -> None:
+        completed_jobs = launcher_state.get("completed_jobs", [])
         payload = {
             "updated_at": current_timestamp(),
-            "completed_jobs": launcher_state.get("completed_jobs", []),
+            "completed_jobs": [snapshot_job(job) for job in completed_jobs] if isinstance(completed_jobs, list) else [],
         }
         with launcher_history_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -201,7 +202,7 @@ def create_app(config_path: Path) -> FastAPI:
                     current_job["result_summary"] = collect_result_summary()
                     completed_jobs = launcher_state.setdefault("completed_jobs", [])
                     if isinstance(completed_jobs, list):
-                        completed_jobs.insert(0, current_job)
+                        completed_jobs.insert(0, snapshot_job(current_job))
                         del completed_jobs[30:]
                     persist_launcher_history()
                 launcher_state["process"] = None
