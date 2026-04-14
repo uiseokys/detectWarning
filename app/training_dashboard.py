@@ -71,12 +71,13 @@ def create_app(config_path: Path) -> FastAPI:
     def current_timestamp() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat()
 
-    def build_job(filekey: str) -> dict:
+    def build_job(filekey: str, api_key: str = "") -> dict:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", filekey).strip("_") or "filekey"
         return {
             "job_id": f"job_{stamp}_{safe_key}",
             "filekey": filekey,
+            "api_key": api_key,
             "queued_at": current_timestamp(),
             "started_at": None,
             "finished_at": None,
@@ -145,6 +146,9 @@ def create_app(config_path: Path) -> FastAPI:
         runtime_paths["workspace_dir"] = str(paths["workspace_dir"])
         runtime_shell = runtime_config.setdefault("aihub_shell", {})
         runtime_shell["filekey"] = job["filekey"]
+        if job.get("api_key"):
+            runtime_shell["api_key"] = str(job["api_key"])
+            runtime_shell["api_key_env"] = ""
 
         runtime_config_path = runtime_config_dir / f"{job['job_id']}.json"
         with runtime_config_path.open("w", encoding="utf-8") as handle:
@@ -403,6 +407,24 @@ def create_app(config_path: Path) -> FastAPI:
       transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
     .input-area:focus {
+      outline: none;
+      border-color: rgba(37,99,235,0.36);
+      box-shadow: 0 0 0 5px rgba(37,99,235,0.10);
+    }
+    .text-input {
+      width: 100%;
+      height: 52px;
+      border: 1px solid rgba(148,163,184,0.24);
+      border-radius: 16px;
+      padding: 0 16px;
+      font: inherit;
+      font-size: 15px;
+      color: var(--ink);
+      background: rgba(255,255,255,0.92);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      margin-bottom: 14px;
+    }
+    .text-input:focus {
       outline: none;
       border-color: rgba(37,99,235,0.36);
       box-shadow: 0 0 0 5px rgba(37,99,235,0.10);
@@ -728,6 +750,8 @@ def create_app(config_path: Path) -> FastAPI:
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
           <div class="meta-chip">workspace <span id="workspaceChip">-</span></div>
         </div>
+        <label class="form-label" for="apiKeyInput">AIHub API 키</label>
+        <input id="apiKeyInput" class="text-input" type="password" placeholder="AIHub API 키를 입력하세요" />
         <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
@@ -915,6 +939,23 @@ def create_app(config_path: Path) -> FastAPI:
       box.style.background = isError ? 'rgba(220,38,38,0.06)' : 'rgba(255,255,255,0.84)';
     }
 
+    function loadSavedApiKey() {
+      const saved = window.localStorage.getItem('training_dashboard_aihub_api_key');
+      if (saved) {
+        document.getElementById('apiKeyInput').value = saved;
+      }
+    }
+
+    function saveApiKey() {
+      const value = document.getElementById('apiKeyInput').value.trim();
+      if (value) {
+        window.localStorage.setItem('training_dashboard_aihub_api_key', value);
+      } else {
+        window.localStorage.removeItem('training_dashboard_aihub_api_key');
+      }
+      return value;
+    }
+
     function renderChart(history) {
       const svg = document.getElementById('trainingChart');
       if (!history || !history.length) {
@@ -1048,6 +1089,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     async function startTraining() {
       const input = document.getElementById('filekeysInput').value.trim();
+      const apiKey = saveApiKey();
       if (!input) {
         setLaunchMessage('filekey를 하나 이상 입력해 주세요.', true);
         return;
@@ -1061,7 +1103,7 @@ def create_app(config_path: Path) -> FastAPI:
         const response = await fetch('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filekeys: input }),
+          body: JSON.stringify({ filekeys: input, api_key: apiKey }),
         });
         const data = await response.json();
         if (!response.ok) {
@@ -1144,6 +1186,8 @@ def create_app(config_path: Path) -> FastAPI:
       renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
     }
 
+    loadSavedApiKey();
+    document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
     refresh();
     setInterval(refresh, 2000);
@@ -1169,6 +1213,7 @@ def create_app(config_path: Path) -> FastAPI:
 
         payload = await request.json()
         filekeys = parse_filekeys(payload.get("filekeys", ""))
+        api_key = str(payload.get("api_key", "")).strip()
         if not filekeys:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
@@ -1192,7 +1237,7 @@ def create_app(config_path: Path) -> FastAPI:
                 if filekey in existing_keys:
                     skipped.append(filekey)
                     continue
-                job = build_job(filekey)
+                job = build_job(filekey, api_key=api_key)
                 if isinstance(pending_jobs, list):
                     pending_jobs.append(job)
                 appended.append(filekey)
