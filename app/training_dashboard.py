@@ -31,6 +31,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_chars: int = 12000) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
+def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_chars: int = 900) -> str:
+    return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
