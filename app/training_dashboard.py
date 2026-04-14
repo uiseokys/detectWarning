@@ -141,6 +141,8 @@ def create_app(config_path: Path) -> FastAPI:
 
         runtime_config = json.loads(json.dumps(config))
         runtime_config["dataset_source"] = "aihub_shell"
+        runtime_paths = runtime_config.setdefault("paths", {})
+        runtime_paths["workspace_dir"] = str(paths["workspace_dir"])
         runtime_shell = runtime_config.setdefault("aihub_shell", {})
         runtime_shell["filekey"] = job["filekey"]
 

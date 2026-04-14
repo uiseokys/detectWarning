@@ -257,7 +257,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
     import_dir = paths["import_dir"]
     raw_manifest_path = paths["raw_manifest"]
 
-    command = [shell_path, "-mode", mode, "-aihubapikey", api_key]
+    command = build_aihub_shell_command(shell_path, api_key, mode=mode)
     if datasetkey is not None:
         command.extend(["-datasetkey", str(datasetkey)])
     if datapackagekey is not None:
@@ -309,6 +309,49 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
 
     print(f"[download] aihubshell imported {len(downloaded)} videos -> {raw_manifest_path}")
     return downloaded
+
+
+def build_aihub_shell_command(shell_path: str, api_key: str, *, mode: str) -> list[str]:
+    shell_candidate = Path(shell_path)
+    if os.name == "nt" and is_probably_shell_script(shell_candidate):
+        bash_path = resolve_windows_bash()
+        if not bash_path:
+            raise RuntimeError(
+                "현재 aihubshell 파일이 Windows 실행 파일이 아니라 bash 스크립트입니다.\n"
+                "확인할 것:\n"
+                "1. Git Bash를 설치해서 bash.exe 를 사용할 수 있는지\n"
+                "2. 또는 Windows용 aihubshell.exe 가 있는지\n"
+                "3. 프로젝트 루트의 aihubshell 파일이 macOS/Linux용 스크립트가 아닌지"
+            )
+        return [bash_path, str(shell_candidate), "-mode", mode, "-aihubapikey", api_key]
+
+    return [shell_path, "-mode", mode, "-aihubapikey", api_key]
+
+
+def is_probably_shell_script(path: Path) -> bool:
+    if path.suffix.lower() in {".exe", ".bat", ".cmd", ".com"}:
+        return False
+    try:
+        header = path.read_bytes()[:128]
+    except OSError:
+        return False
+    return header.startswith(b"#!") or b"/bin/bash" in header or b"/bin/sh" in header
+
+
+def resolve_windows_bash() -> str | None:
+    candidates = [
+        shutil.which("bash"),
+        shutil.which("bash.exe"),
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return str(candidate_path)
+    return None
 
 
 def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None = None) -> list[DownloadedItem]:
