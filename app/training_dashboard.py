@@ -52,6 +52,119 @@ def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_c
     return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
 
 
+def derive_stage_ratio(pipeline_status: dict | None, training_progress: dict | None) -> float:
+    pipeline_status = pipeline_status or {}
+    training_progress = training_progress or {}
+    explicit = pipeline_status.get("stage_progress")
+    if isinstance(explicit, (int, float)):
+        ratio = float(explicit)
+    else:
+        stage = str(pipeline_status.get("stage", "")).strip().lower()
+        ratio = {
+            "starting": 0.0,
+            "queued": 0.0,
+            "download": 0.2,
+            "prepare": 0.6,
+            "train": 0.85,
+            "completed": 1.0,
+            "error": 1.0,
+        }.get(stage, 0.0)
+
+    stage = str(pipeline_status.get("stage", "")).strip().lower()
+    if stage == "train":
+        epochs_total = int(training_progress.get("epochs_total") or 0)
+        epochs_completed = int(training_progress.get("epochs_completed") or 0)
+        epoch_ratio = (epochs_completed / epochs_total) if epochs_total > 0 else 0.0
+        ratio = max(ratio, 0.8 + (0.2 * epoch_ratio))
+    return max(0.0, min(1.0, ratio))
+
+
+def build_current_job_progress(pipeline_status: dict | None, training_progress: dict | None, launcher_status: dict | None) -> dict:
+    pipeline_status = pipeline_status or {}
+    training_progress = training_progress or {}
+    launcher_status = launcher_status or {}
+
+    ratio = derive_stage_ratio(pipeline_status, training_progress)
+    stage = str(pipeline_status.get("stage", "")).strip().lower() or str(launcher_status.get("state", "idle"))
+    stage_label_map = {
+        "idle": "대기",
+        "queued": "대기",
+        "download": "다운로드",
+        "prepare": "전처리",
+        "train": "학습",
+        "completed": "완료",
+        "error": "오류",
+        "running": "실행 중",
+        "starting": "시작 중",
+    }
+    label = stage_label_map.get(stage, stage or "대기")
+
+    if stage == "prepare":
+        processed = int(pipeline_status.get("processed_items") or 0)
+        total = int(pipeline_status.get("total_items") or 0)
+        detail = f"{pipeline_status.get('current_split', '-')} split | {processed}/{total}"
+    elif stage == "train":
+        epochs_completed = int(training_progress.get("epochs_completed") or 0)
+        epochs_total = int(training_progress.get("epochs_total") or 0)
+        detail = f"epoch {epochs_completed}/{epochs_total}"
+    elif stage == "download":
+        found = pipeline_status.get("discovered_items")
+        detail = f"발견 샘플 {found}" if found not in (None, "") else str(pipeline_status.get("message") or "-")
+    else:
+        detail = str(pipeline_status.get("message") or launcher_status.get("message") or "-")
+
+    return {
+        "ratio": round(ratio, 4),
+        "percent": int(round(ratio * 100)),
+        "stage": stage,
+        "label": label,
+        "detail": detail,
+        "current_video": pipeline_status.get("current_video"),
+        "processed_items": pipeline_status.get("processed_items"),
+        "total_items": pipeline_status.get("total_items"),
+    }
+
+
+def estimate_eta(current_job_progress: dict | None, launcher_status: dict | None) -> dict:
+    current_job_progress = current_job_progress or {}
+    launcher_status = launcher_status or {}
+    current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
+    started_at = current_job.get("started_at") if isinstance(current_job, dict) else None
+    ratio = float(current_job_progress.get("ratio") or 0.0)
+    if not started_at or ratio <= 0.0 or ratio >= 1.0:
+        return {"seconds_remaining": None, "label": "-"}
+
+    try:
+        started_dt = datetime.fromisoformat(str(started_at))
+    except ValueError:
+        return {"seconds_remaining": None, "label": "-"}
+
+    now_dt = datetime.now(timezone.utc).astimezone()
+    elapsed_seconds = max(0.0, (now_dt - started_dt).total_seconds())
+    if elapsed_seconds <= 0.0:
+        return {"seconds_remaining": None, "label": "-"}
+
+    total_estimated = elapsed_seconds / ratio
+    remaining_seconds = max(0, int(round(total_estimated - elapsed_seconds)))
+    return {
+        "seconds_remaining": remaining_seconds,
+        "label": format_duration(remaining_seconds),
+    }
+
+
+def format_duration(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "-"
+    total_seconds = int(max(0, round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}시간 {minutes}분"
+    if minutes > 0:
+        return f"{minutes}분 {secs}초"
+    return f"{secs}초"
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -321,19 +434,27 @@ def create_app(config_path: Path) -> FastAPI:
   <title>Training Dashboard</title>
   <style>
     :root {
-      --bg: #f5f7fb;
-      --panel: rgba(255, 255, 255, 0.94);
-      --panel-soft: rgba(248, 250, 252, 0.98);
+      --bg: #eef3fb;
+      --bg-deep: #e3ebf8;
+      --panel: rgba(255, 255, 255, 0.92);
+      --panel-strong: rgba(255, 255, 255, 0.98);
+      --panel-soft: rgba(246, 249, 253, 0.92);
       --ink: #0f172a;
-      --muted: #64748b;
-      --line: rgba(148, 163, 184, 0.22);
+      --muted: #5f6f86;
+      --line: rgba(148, 163, 184, 0.18);
+      --line-strong: rgba(148, 163, 184, 0.28);
       --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --accent-soft: rgba(37, 99, 235, 0.12);
       --good: #059669;
       --warn: #d97706;
       --danger: #dc2626;
-      --shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+      --shadow: 0 20px 44px rgba(15, 23, 42, 0.08);
+      --shadow-soft: 0 12px 30px rgba(15, 23, 42, 0.05);
+      --radius-xl: 30px;
       --radius-lg: 24px;
       --radius-md: 18px;
+      --radius-sm: 14px;
     }
     * { box-sizing: border-box; }
     body {
@@ -341,38 +462,155 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--ink);
       font-family: "SF Pro Display", "Pretendard", "Apple SD Gothic Neo", sans-serif;
       background:
-        radial-gradient(circle at top left, rgba(37, 99, 235, 0.08), transparent 25%),
-        linear-gradient(180deg, #fbfdff 0%, var(--bg) 100%);
+        radial-gradient(circle at top left, rgba(37, 99, 235, 0.13), transparent 30%),
+        radial-gradient(circle at top right, rgba(14, 165, 233, 0.09), transparent 24%),
+        linear-gradient(180deg, #f8fbff 0%, var(--bg) 48%, var(--bg-deep) 100%);
+      min-height: 100vh;
+      position: relative;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.04) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.4), transparent 85%);
     }
     .wrap {
-      max-width: 1460px;
+      max-width: 1560px;
       margin: 0 auto;
-      padding: 28px;
+      padding: 30px 30px 40px;
     }
     .hero {
+      position: relative;
       display: flex;
       justify-content: space-between;
-      align-items: flex-end;
-      gap: 20px;
+      align-items: stretch;
+      gap: 24px;
       margin-bottom: 24px;
+      padding: 30px 32px;
+      border-radius: var(--radius-xl);
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.94), rgba(248,250,253,0.88)),
+        radial-gradient(circle at top right, rgba(37,99,235,0.14), transparent 32%);
+      border: 1px solid rgba(255,255,255,0.66);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(18px);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -60px;
+      top: -60px;
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(37,99,235,0.18), transparent 68%);
+      pointer-events: none;
+    }
+    .hero-copy {
+      position: relative;
+      z-index: 1;
+      flex: 1 1 auto;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #2563eb, #0ea5e9);
     }
     .hero h1 {
       margin: 0;
-      font-size: 42px;
-      line-height: 1.02;
+      font-size: 44px;
+      line-height: 0.98;
       letter-spacing: -0.04em;
     }
     .hero p {
-      margin: 10px 0 0;
+      margin: 14px 0 0;
       color: var(--muted);
       font-size: 15px;
       line-height: 1.7;
-      max-width: 760px;
+      max-width: 780px;
+    }
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .hero-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.8);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      box-shadow: var(--shadow-soft);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .hero-chip strong {
+      color: var(--ink);
+      font-weight: 800;
+    }
+    .hero-side {
+      position: relative;
+      z-index: 1;
+      min-width: 300px;
+      max-width: 340px;
+      padding: 22px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(245,248,253,0.88));
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      align-content: start;
+      gap: 14px;
+    }
+    .hero-side-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .hero-side-title {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.2;
+    }
+    .hero-side-copy {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
     }
     .status-pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
+      width: fit-content;
       padding: 10px 14px;
       border-radius: 999px;
       border: 1px solid transparent;
@@ -399,17 +637,30 @@ def create_app(config_path: Path) -> FastAPI:
       box-shadow: var(--shadow);
       overflow: hidden;
       backdrop-filter: blur(14px);
+      position: relative;
+    }
+    .card::before,
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 1px;
+      background: linear-gradient(90deg, rgba(255,255,255,0.85), rgba(255,255,255,0));
+      pointer-events: none;
     }
     .control-panel {
       display: grid;
       grid-template-columns: 1.2fr 0.8fr;
       gap: 18px;
-      margin-bottom: 18px;
-      padding: 22px;
+      margin-bottom: 20px;
+      padding: 24px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.95), rgba(250,252,255,0.9)),
+        radial-gradient(circle at right top, rgba(37,99,235,0.08), transparent 30%);
     }
     .control-title {
       margin: 0 0 10px;
-      font-size: 24px;
+      font-size: 26px;
       letter-spacing: -0.03em;
     }
     .control-copy {
@@ -422,17 +673,17 @@ def create_app(config_path: Path) -> FastAPI:
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-bottom: 12px;
+      margin-bottom: 16px;
     }
     .meta-chip {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 9px 13px;
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      background: rgba(37, 99, 235, 0.08);
+      background: rgba(37, 99, 235, 0.09);
       color: var(--accent);
       border: 1px solid rgba(37, 99, 235, 0.14);
     }
@@ -447,7 +698,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .input-area {
       width: 100%;
-      min-height: 120px;
+      min-height: 136px;
       border: 1px solid rgba(148,163,184,0.24);
       border-radius: 18px;
       padding: 16px;
@@ -466,7 +717,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .text-input {
       width: 100%;
-      height: 52px;
+      height: 54px;
       border: 1px solid rgba(148,163,184,0.24);
       border-radius: 16px;
       padding: 0 16px;
@@ -515,20 +766,22 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--muted);
       font-size: 13px;
       line-height: 1.7;
+      max-width: 620px;
     }
     .launch-box {
       display: grid;
       gap: 12px;
       align-content: start;
-      padding: 16px;
-      border-radius: 20px;
-      background: var(--panel-soft);
+      padding: 18px;
+      border-radius: 22px;
+      background:
+        linear-gradient(180deg, rgba(247,250,254,0.96), rgba(242,247,252,0.88));
       border: 1px solid rgba(148,163,184,0.14);
     }
     .launch-item {
-      padding: 12px 14px;
+      padding: 13px 15px;
       border-radius: 16px;
-      background: rgba(255,255,255,0.84);
+      background: rgba(255,255,255,0.86);
       border: 1px solid rgba(148,163,184,0.14);
     }
     .launch-label {
@@ -546,8 +799,8 @@ def create_app(config_path: Path) -> FastAPI:
       word-break: break-word;
     }
     .launch-message {
-      min-height: 46px;
-      padding: 12px 14px;
+      min-height: 52px;
+      padding: 14px 16px;
       border-radius: 16px;
       border: 1px solid rgba(148,163,184,0.18);
       background: rgba(255,255,255,0.84);
@@ -558,13 +811,15 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 14px;
-      margin-bottom: 18px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
     }
     .card {
-      padding: 18px;
-      min-height: 134px;
+      padding: 20px;
+      min-height: 146px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,251,255,0.92));
     }
     .label {
       color: var(--muted);
@@ -575,10 +830,11 @@ def create_app(config_path: Path) -> FastAPI:
       margin-bottom: 10px;
     }
     .value {
-      font-size: 28px;
+      font-size: 30px;
       font-weight: 800;
       letter-spacing: -0.04em;
       margin-bottom: 8px;
+      font-variant-numeric: tabular-nums;
     }
     .subvalue {
       color: var(--muted);
@@ -589,21 +845,21 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .main-grid {
       display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 18px;
+      grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.85fr);
+      gap: 20px;
       align-items: start;
     }
     .panel-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 18px 22px;
+      padding: 20px 24px;
       border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,0.80), rgba(255,255,255,0.58));
+      background: linear-gradient(180deg, rgba(255,255,255,0.86), rgba(251,253,255,0.74));
     }
     .panel-title {
       margin: 0;
-      font-size: 20px;
+      font-size: 21px;
       font-weight: 700;
       letter-spacing: -0.03em;
     }
@@ -613,14 +869,16 @@ def create_app(config_path: Path) -> FastAPI:
       margin-top: 4px;
     }
     .panel-body {
-      padding: 20px 22px 22px;
+      padding: 22px 24px 24px;
     }
     .chart-wrap {
-      padding: 14px;
-      border-radius: var(--radius-md);
-      background: var(--panel-soft);
+      padding: 16px;
+      border-radius: 22px;
+      background:
+        linear-gradient(180deg, rgba(248,250,253,0.96), rgba(244,248,252,0.9));
       border: 1px solid rgba(148,163,184,0.14);
-      margin-bottom: 14px;
+      margin-bottom: 16px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
     }
     .chart {
       width: 100%;
@@ -656,9 +914,10 @@ def create_app(config_path: Path) -> FastAPI:
       gap: 14px;
     }
     .mini-card {
-      padding: 14px 16px;
+      padding: 16px 18px;
       border-radius: 18px;
-      background: var(--panel-soft);
+      background:
+        linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
       border: 1px solid rgba(148,163,184,0.14);
     }
     .mini-title {
@@ -686,6 +945,12 @@ def create_app(config_path: Path) -> FastAPI:
       border-collapse: collapse;
       font-size: 14px;
     }
+    .table tbody tr {
+      transition: background 0.16s ease;
+    }
+    .table tbody tr:hover {
+      background: rgba(37, 99, 235, 0.04);
+    }
     .table th,
     .table td {
       text-align: left;
@@ -701,7 +966,7 @@ def create_app(config_path: Path) -> FastAPI:
       text-transform: uppercase;
     }
     .empty {
-      padding: 18px;
+      padding: 20px;
       border-radius: 18px;
       background: rgba(255,255,255,0.68);
       border: 1px dashed rgba(148,163,184,0.30);
@@ -716,18 +981,19 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .progress-track {
       width: 100%;
-      height: 10px;
+      height: 12px;
       border-radius: 999px;
-      background: rgba(148,163,184,0.18);
+      background: rgba(148,163,184,0.16);
       overflow: hidden;
-      margin-top: 10px;
+      margin-top: 12px;
     }
     .progress-fill {
       height: 100%;
       border-radius: 999px;
-      background: linear-gradient(90deg, #2563eb, #059669);
+      background: linear-gradient(90deg, #2563eb 0%, #0ea5e9 42%, #059669 100%);
       width: 0%;
       transition: width 0.25s ease;
+      box-shadow: 0 0 18px rgba(37, 99, 235, 0.18);
     }
     .pill-row {
       display: flex;
@@ -747,10 +1013,10 @@ def create_app(config_path: Path) -> FastAPI:
       border: 1px solid rgba(148,163,184,0.16);
     }
     .logs-section {
-      margin-top: 18px;
+      margin-top: 20px;
     }
     .scroll-panel {
-      max-height: 340px;
+      max-height: 360px;
       overflow: auto;
       border-radius: 18px;
       border: 1px solid rgba(148,163,184,0.12);
@@ -765,13 +1031,14 @@ def create_app(config_path: Path) -> FastAPI:
     .log-card {
       border-radius: 18px;
       border: 1px solid rgba(148,163,184,0.12);
-      background: var(--panel-soft);
+      background: linear-gradient(180deg, rgba(250,252,255,0.94), rgba(244,247,252,0.9));
       overflow: hidden;
+      box-shadow: var(--shadow-soft);
     }
     .log-card-head {
-      padding: 14px 16px;
+      padding: 16px 18px;
       border-bottom: 1px solid rgba(148,163,184,0.12);
-      background: rgba(255,255,255,0.7);
+      background: rgba(255,255,255,0.76);
     }
     .log-card-title {
       margin: 0;
@@ -786,19 +1053,52 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .log-pre {
       margin: 0;
-      padding: 14px 16px;
-      min-height: 220px;
-      max-height: 320px;
+      padding: 16px 18px;
+      min-height: 240px;
+      max-height: 340px;
       overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
       font-family: "SF Mono", "JetBrains Mono", monospace;
       font-size: 12px;
       line-height: 1.65;
-      color: #0f172a;
-      background: rgba(255,255,255,0.74);
+      color: #dbe7ff;
+      background:
+        radial-gradient(circle at top right, rgba(59,130,246,0.12), transparent 34%),
+        linear-gradient(180deg, #0f172a 0%, #111827 100%);
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin: 0 0 14px;
+    }
+    .section-title h2 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+    .section-title p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .section-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid rgba(148,163,184,0.16);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
     }
     @media (max-width: 1200px) {
+      .hero,
       .control-panel,
       .main-grid {
         grid-template-columns: 1fr;
@@ -809,10 +1109,17 @@ def create_app(config_path: Path) -> FastAPI:
       .log-grid {
         grid-template-columns: 1fr;
       }
+      .hero {
+        flex-direction: column;
+      }
+      .hero-side {
+        max-width: none;
+      }
     }
     @media (max-width: 720px) {
       .wrap { padding: 18px; }
-      .hero { flex-direction: column; align-items: stretch; }
+      .hero { padding: 24px 20px; }
+      .hero h1 { font-size: 34px; }
       .grid,
       .two-col {
         grid-template-columns: 1fr;
@@ -830,11 +1137,22 @@ def create_app(config_path: Path) -> FastAPI:
 <body>
   <div class="wrap">
     <section class="hero">
-      <div>
+      <div class="hero-copy">
+        <div class="eyebrow">AI Monitoring Workspace</div>
         <h1>행동 학습 진행 대시보드</h1>
-        <p>AIHub 분할 ZIP의 filekey를 여러 개 넣고, 하나가 끝나면 다음 작업이 자동으로 이어지도록 순차 학습 큐를 운영할 수 있습니다.</p>
+        <p>AIHub 분할 ZIP의 filekey를 여러 개 넣고, 하나가 끝나면 다음 작업이 자동으로 이어지도록 순차 학습 큐를 운영합니다. 다운로드, 병합, 압축 해제, pose 전처리, 누적 학습 흐름을 한 화면에서 정리해서 볼 수 있습니다.</p>
+        <div class="hero-meta">
+          <div class="hero-chip"><strong>큐 기반</strong> 여러 filekey를 순차 처리</div>
+          <div class="hero-chip"><strong>누적 학습</strong> prepared 데이터와 모델 유지</div>
+          <div class="hero-chip"><strong>원격 확인</strong> Tailscale로 노트북에서 모니터링</div>
+        </div>
       </div>
-      <div id="pipelineState" class="status-pill tone-neutral">상태 확인 중</div>
+      <aside class="hero-side">
+        <div class="hero-side-label">Live Status</div>
+        <div class="hero-side-title">현재 학습 파이프라인 상태를 한눈에</div>
+        <div class="hero-side-copy">현재 단계, filekey 진행률, ETA, 성능 지표와 오류 로그까지 발표 화면처럼 정돈된 형태로 확인할 수 있습니다.</div>
+        <div id="pipelineState" class="status-pill tone-neutral">상태 확인 중</div>
+      </aside>
     </section>
 
     <section class="card control-panel">
@@ -888,11 +1206,29 @@ def create_app(config_path: Path) -> FastAPI:
       </div>
     </section>
 
+    <div class="section-title">
+      <div>
+        <h2>실행 현황</h2>
+        <p>현재 작업 상태와 핵심 지표를 빠르게 확인하는 영역입니다.</p>
+      </div>
+      <div class="section-pill">Overview</div>
+    </div>
     <section class="grid">
       <article class="card">
         <div class="label">현재 단계</div>
         <div class="value" id="currentStage">-</div>
         <div class="subvalue" id="currentMessage">-</div>
+      </article>
+      <article class="card">
+        <div class="label">현재 filekey 진행률</div>
+        <div class="value" id="currentJobProgressText">0%</div>
+        <div class="subvalue" id="currentJobProgressMeta">대기 중</div>
+        <div class="progress-track"><div id="currentJobProgressFill" class="progress-fill"></div></div>
+      </article>
+      <article class="card">
+        <div class="label">예상 남은 시간</div>
+        <div class="value" id="etaText">-</div>
+        <div class="subvalue" id="etaMeta">진행률이 쌓이면 계산합니다.</div>
       </article>
       <article class="card">
         <div class="label">학습 진행</div>
@@ -917,12 +1253,19 @@ def create_app(config_path: Path) -> FastAPI:
       </article>
     </section>
 
+    <div class="section-title">
+      <div>
+        <h2>학습 분석</h2>
+        <p>성능 곡선, 데이터셋 구성, 현재 filekey 세부 상태를 함께 확인합니다.</p>
+      </div>
+      <div class="section-pill">Analytics</div>
+    </div>
     <section class="main-grid">
       <article class="panel">
         <div class="panel-head">
           <div>
-            <h2 class="panel-title">Epoch 진행 그래프</h2>
-            <div class="panel-copy">validation accuracy와 macro F1 변화를 함께 봅니다.</div>
+            <h2 class="panel-title">학습 성능 그래프</h2>
+            <div class="panel-copy">validation accuracy, macro F1, loss 변화를 함께 봅니다.</div>
           </div>
         </div>
         <div class="panel-body">
@@ -931,6 +1274,13 @@ def create_app(config_path: Path) -> FastAPI:
             <div class="legend">
               <span class="blue">Validation Accuracy</span>
               <span class="green">Validation Macro F1</span>
+            </div>
+          </div>
+          <div class="chart-wrap" style="margin-top:18px;">
+            <svg id="lossChart" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+            <div class="legend">
+              <span class="blue">Train Loss</span>
+              <span class="green">Validation Loss</span>
             </div>
           </div>
           <div class="two-col">
@@ -943,6 +1293,16 @@ def create_app(config_path: Path) -> FastAPI:
               <div class="mini-title">업데이트 시각</div>
               <div class="mini-value" id="updatedAt">-</div>
               <div class="mini-copy" id="configPath">-</div>
+            </div>
+            <div class="mini-card">
+              <div class="mini-title">최근 Loss / LR</div>
+              <div class="mini-value" id="latestLoss">-</div>
+              <div class="mini-copy" id="latestLearningRate">-</div>
+            </div>
+            <div class="mini-card">
+              <div class="mini-title">Resume / 샘플 수</div>
+              <div class="mini-value" id="resumeState">-</div>
+              <div class="mini-copy" id="sampleCounts">-</div>
             </div>
           </div>
         </div>
@@ -969,8 +1329,66 @@ def create_app(config_path: Path) -> FastAPI:
           <div id="datasetEmpty" class="empty" style="display:none; margin-top:14px;">아직 수집되거나 준비된 데이터가 없습니다.</div>
         </div>
       </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">현재 filekey 세부 진행</h2>
+            <div class="panel-copy">현재 job이 어느 단계에서 얼마나 진행됐는지와 누적 학습 상태를 확인합니다.</div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="mini-card">
+            <div class="mini-title">현재 처리 정보</div>
+            <div class="mini-value" id="jobStageDetail">-</div>
+            <div class="mini-copy" id="jobCurrentVideo">-</div>
+          </div>
+          <div class="two-col" style="margin-top:16px;">
+            <div class="mini-card">
+              <div class="mini-title">현재 filekey 원본 / 준비</div>
+              <div class="mini-value" id="currentDatasetTotals">0 / 0</div>
+              <div class="mini-copy" id="currentDatasetSummary">raw / prepared</div>
+            </div>
+            <div class="mini-card">
+              <div class="mini-title">누적 학습 상태</div>
+              <div class="mini-value" id="continualStateText">-</div>
+              <div class="mini-copy" id="continualStateMeta">-</div>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">클래스별 검증 지표</h2>
+            <div class="panel-copy">최종 validation 기준 precision, recall, F1을 클래스별로 보여줍니다.</div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>클래스</th>
+                <th>Precision</th>
+                <th>Recall</th>
+                <th>F1</th>
+              </tr>
+            </thead>
+            <tbody id="perClassMetricsTable"></tbody>
+          </table>
+          <div id="perClassMetricsEmpty" class="empty" style="display:none; margin-top:14px;">클래스별 지표가 아직 없습니다.</div>
+        </div>
+      </article>
     </section>
 
+    <div class="section-title">
+      <div>
+        <h2>작업 로그</h2>
+        <p>완료 이력과 현재 로그, 최근 오류 로그를 한 번에 확인합니다.</p>
+      </div>
+      <div class="section-pill">Logs</div>
+    </div>
     <section class="panel logs-section">
       <div class="panel-head">
         <div>
@@ -1157,6 +1575,61 @@ def create_app(config_path: Path) -> FastAPI:
       `;
     }
 
+    function renderLossChart(history) {
+      const svg = document.getElementById('lossChart');
+      if (!history || !history.length) {
+        svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">아직 손실 기록이 없습니다</text>';
+        return;
+      }
+
+      const width = 800;
+      const height = 260;
+      const padLeft = 52;
+      const padRight = 20;
+      const padTop = 16;
+      const padBottom = 30;
+      const innerW = width - padLeft - padRight;
+      const innerH = height - padTop - padBottom;
+
+      const maxLoss = Math.max(
+        0.001,
+        ...history.flatMap((row) => [Number(row.train_loss || 0), Number(row.val_loss || 0)])
+      );
+      const maxX = Math.max(history.length - 1, 1);
+      const trainPoints = [];
+      const valPoints = [];
+
+      history.forEach((row, index) => {
+        const x = padLeft + (index / maxX) * innerW;
+        const trainY = padTop + (1 - Math.min(1, Number(row.train_loss || 0) / maxLoss)) * innerH;
+        const valY = padTop + (1 - Math.min(1, Number(row.val_loss || 0) / maxLoss)) * innerH;
+        trainPoints.push(`${x},${trainY}`);
+        valPoints.push(`${x},${valY}`);
+      });
+
+      const ticks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = padTop + (1 - ratio) * innerH;
+        const value = (maxLoss * ratio).toFixed(3);
+        return `
+          <line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(148,163,184,0.18)" />
+          <text x="8" y="${y + 4}" fill="#94a3b8" font-size="11">${value}</text>
+        `;
+      }).join('');
+
+      const xLabels = history.map((row, index) => {
+        const x = padLeft + (index / maxX) * innerW;
+        return `<text x="${x}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${row.epoch}</text>`;
+      }).join('');
+
+      svg.innerHTML = `
+        <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"></rect>
+        ${ticks}
+        <polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${trainPoints.join(' ')}"></polyline>
+        <polyline fill="none" stroke="#059669" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${valPoints.join(' ')}"></polyline>
+        ${xLabels}
+      `;
+    }
+
     function renderDatasetTable(dataset) {
       const tbody = document.getElementById('datasetTable');
       const empty = document.getElementById('datasetEmpty');
@@ -1187,6 +1660,54 @@ def create_app(config_path: Path) -> FastAPI:
       }
       empty.style.display = 'none';
       tbody.innerHTML = rows.join('');
+    }
+
+    function renderCurrentJobProgress(jobProgress, currentDataset, continualState, progress) {
+      const ratio = Math.max(0, Math.min(100, Math.round((jobProgress?.ratio ?? 0) * 100)));
+      document.getElementById('currentJobProgressText').textContent = `${ratio}%`;
+      document.getElementById('currentJobProgressMeta').textContent =
+        `${jobProgress?.label || '-'} | ${jobProgress?.detail || '-'}`;
+      document.getElementById('currentJobProgressFill').style.width = `${ratio}%`;
+
+      const currentRaw = currentDataset?.raw?.total ?? 0;
+      const currentPrepared =
+        (currentDataset?.prepared_train?.total ?? 0) +
+        (currentDataset?.prepared_val?.total ?? 0) +
+        (currentDataset?.prepared_test?.total ?? 0);
+      document.getElementById('currentDatasetTotals').textContent = `${currentRaw} / ${currentPrepared}`;
+      document.getElementById('currentDatasetSummary').textContent = 'current raw / current prepared';
+
+      document.getElementById('jobStageDetail').textContent = jobProgress?.detail || '-';
+      document.getElementById('jobCurrentVideo').textContent = jobProgress?.current_video || '-';
+
+      const continualTrain = continualState?.prepared_train_total ?? (progress?.train_samples ?? 0);
+      const continualVal = continualState?.prepared_val_total ?? (progress?.val_samples ?? 0);
+      const resumed = progress?.resumed_from_checkpoint ? 'resume on' : 'resume off';
+      document.getElementById('continualStateText').textContent = resumed;
+      document.getElementById('continualStateMeta').textContent =
+        `누적 prepared train ${continualTrain} / val ${continualVal}`;
+    }
+
+    function renderPerClassMetrics(labels, perClass) {
+      const tbody = document.getElementById('perClassMetricsTable');
+      const empty = document.getElementById('perClassMetricsEmpty');
+      if (!perClass || !perClass.length) {
+        tbody.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+      }
+      empty.style.display = 'none';
+      tbody.innerHTML = perClass.map((row) => {
+        const label = labels?.[row.class_index] || `class_${row.class_index}`;
+        return `
+          <tr>
+            <td>${label}</td>
+            <td>${row.precision ?? '-'}</td>
+            <td>${row.recall ?? '-'}</td>
+            <td>${row.f1 ?? '-'}</td>
+          </tr>
+        `;
+      }).join('');
     }
 
     function formatDateTime(value) {
@@ -1304,9 +1825,13 @@ def create_app(config_path: Path) -> FastAPI:
       const data = await response.json();
       const pipeline = data.pipeline_status || {};
       const progress = data.training_progress || {};
+      const metrics = data.metrics || {};
       const launcher = data.launcher || {};
       const queueProgress = data.queue_progress || {};
       const logs = data.logs || {};
+      const currentJobProgress = data.current_job_progress || {};
+      const continualState = data.continual_state || {};
+      const eta = data.eta || {};
 
       const stateEl = document.getElementById('pipelineState');
       stateEl.textContent = pipeline.state || 'unknown';
@@ -1329,6 +1854,11 @@ def create_app(config_path: Path) -> FastAPI:
 
       document.getElementById('currentStage').textContent = pipeline.stage || '-';
       document.getElementById('currentMessage').textContent = pipeline.message || '-';
+      document.getElementById('etaText').textContent = eta.label || '-';
+      document.getElementById('etaMeta').textContent =
+        eta.seconds_remaining !== null && eta.seconds_remaining !== undefined
+          ? `현재 filekey 기준 예상 남은 시간`
+          : '진행률이 쌓이면 계산합니다.';
 
       document.getElementById('epochProgress').textContent =
         `${progress.epochs_completed ?? 0} / ${progress.epochs_total ?? 0}`;
@@ -1356,16 +1886,33 @@ def create_app(config_path: Path) -> FastAPI:
         document.getElementById('latestEpoch').textContent = `Epoch ${progress.latest.epoch}`;
         document.getElementById('latestMetrics').textContent =
           `train loss ${progress.latest.train_loss} / val acc ${progress.latest.val_accuracy} / val f1 ${progress.latest.val_macro_f1}`;
+        document.getElementById('latestLoss').textContent =
+          `train ${progress.latest.train_loss} / val ${progress.latest.val_loss}`;
+        document.getElementById('latestLearningRate').textContent =
+          `lr ${progress.latest.learning_rate ?? '-'}`;
       } else {
         document.getElementById('latestEpoch').textContent = '-';
         document.getElementById('latestMetrics').textContent = '-';
+        document.getElementById('latestLoss').textContent = '-';
+        document.getElementById('latestLearningRate').textContent = '-';
       }
+
+      document.getElementById('resumeState').textContent =
+        progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습';
+      document.getElementById('sampleCounts').textContent =
+        `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`;
 
       document.getElementById('updatedAt').textContent = pipeline.updated_at || progress.updated_at || '-';
       document.getElementById('configPath').textContent = launcher.runtime_config_path || data.config_path || '-';
 
       renderChart(progress.history || []);
+      renderLossChart(progress.history || []);
       renderDatasetTable(data.dataset || {});
+      renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
+      renderPerClassMetrics(
+        progress.labels || metrics.labels || [],
+        progress.final_validation?.per_class || metrics.final_validation?.per_class || []
+      );
       renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
       renderLogPanels(logs, launcher);
     }
@@ -1464,6 +2011,8 @@ def create_app(config_path: Path) -> FastAPI:
 
 def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_status: dict | None = None) -> dict:
     launcher_status = launcher_status or {}
+    pipeline_status = read_json(paths["pipeline_status"])
+    training_progress = read_json(paths["training_progress"])
     completed_jobs = launcher_status.get("completed_jobs", []) if isinstance(launcher_status, dict) else []
     pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
     current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
@@ -1501,12 +2050,15 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     active_count = 1 if current_job else 0
     total_count = completed_count + failed_count + pending_count + active_count
     progress_ratio = ((completed_count + failed_count) / total_count) if total_count > 0 else 0.0
+    current_job_progress = build_current_job_progress(pipeline_status, training_progress, launcher_status)
+    eta = estimate_eta(current_job_progress, launcher_status)
+
     return {
         "workspace_dir": str(paths["workspace_dir"]),
         "workspace_name": paths["workspace_dir"].name,
         "config_path": str(config_path),
-        "pipeline_status": read_json(paths["pipeline_status"]),
-        "training_progress": read_json(paths["training_progress"]),
+        "pipeline_status": pipeline_status,
+        "training_progress": training_progress,
         "launcher": {
             **launcher_status,
             "completed_jobs": enriched_completed_jobs,
@@ -1526,6 +2078,8 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "active": active_count,
             "ratio": round(progress_ratio, 4),
         },
+        "current_job_progress": current_job_progress,
+        "eta": eta,
         "logs": {
             "current": {
                 "filekey": current_log_source.get("filekey") if isinstance(current_log_source, dict) else None,
@@ -1555,11 +2109,22 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
             "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
         },
+        "current_dataset": {
+            "raw": summarize_manifest(paths["current_raw_manifest"], label_field="target_label"),
+            "train": summarize_manifest(paths["current_split_train"], label_field="target_label"),
+            "val": summarize_manifest(paths["current_split_val"], label_field="target_label"),
+            "test": summarize_manifest(paths["current_split_test"], label_field="target_label"),
+            "prepared_train": summarize_manifest(paths["current_prepared_train"], label_field="target_label"),
+            "prepared_val": summarize_manifest(paths["current_prepared_val"], label_field="target_label"),
+            "prepared_test": summarize_manifest(paths["current_prepared_test"], label_field="target_label"),
+        },
+        "continual_state": read_json(paths["continual_state"]),
         "artifacts": {
             "has_model": (paths["artifacts_dir"] / "best_action_model.pt").exists(),
             "has_metrics": (paths["artifacts_dir"] / "metrics.json").exists(),
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
+        "metrics": read_json(paths["artifacts_dir"] / "metrics.json"),
     }
 
 
@@ -1608,21 +2173,36 @@ def parse_filekeys(raw_value) -> list[str]:
 
 
 def reset_training_workspace(paths: dict) -> None:
-    reset_keys = (
-        "raw_dir",
-        "import_dir",
-        "extracted_dir",
-        "manifests_dir",
-        "prepared_dir",
-        "artifacts_dir",
+    transient_dirs = ("raw_dir", "import_dir", "extracted_dir")
+    transient_files = (
+        "current_raw_manifest",
+        "current_split_train",
+        "current_split_val",
+        "current_split_test",
+        "current_prepared_train",
+        "current_prepared_val",
+        "current_prepared_test",
     )
-    for key in reset_keys:
+
+    for key in transient_dirs:
         target = paths.get(key)
         if not isinstance(target, Path):
             continue
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
+
+    for key in transient_files:
+        target = paths.get(key)
+        if not isinstance(target, Path):
+            continue
+        if target.exists():
+            target.unlink()
+
+    for key in ("manifests_dir", "prepared_dir", "artifacts_dir"):
+        target = paths.get(key)
+        if isinstance(target, Path):
+            target.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> None:

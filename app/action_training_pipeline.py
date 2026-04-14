@@ -68,33 +68,67 @@ def main() -> None:
     config = load_config(config_path)
     validate_source_config(config, config_path)
     paths = resolve_paths(config, config_path.parent)
+    continual_config = get_continual_config(config)
     write_pipeline_status(
         paths,
         stage="starting",
         state="running",
         message="학습 파이프라인을 시작합니다.",
         config_path=str(config_path),
+        stage_progress=0.0,
     )
 
     try:
+        downloaded: list[DownloadedItem] = []
+        split_manifests: dict[str, Path] | None = None
+        training_manifests: dict[str, Path] | None = None
+
         if args.stage in {"all", "download"}:
-            write_pipeline_status(paths, stage="download", state="running", message="API에서 영상을 다운로드하는 중입니다.")
+            write_pipeline_status(
+                paths,
+                stage="download",
+                state="running",
+                message="API에서 영상을 다운로드하는 중입니다.",
+                stage_progress=0.05,
+            )
             downloaded = download_dataset(config, paths)
             split_manifests = split_dataset(downloaded, config, paths)
-        else:
-            split_manifests = load_existing_split_manifests(paths)
+        elif args.stage == "prepare":
+            split_manifests = load_existing_current_split_manifests(paths)
 
         if args.stage in {"all", "prepare"}:
-            write_pipeline_status(paths, stage="prepare", state="running", message="영상에서 pose 시퀀스를 추출하는 중입니다.")
+            if split_manifests is None:
+                split_manifests = load_existing_current_split_manifests(paths)
+            write_pipeline_status(
+                paths,
+                stage="prepare",
+                state="running",
+                message="영상에서 pose 시퀀스를 추출하는 중입니다.",
+                stage_progress=0.55,
+            )
             prepared_manifests = prepare_pose_dataset(config, paths, split_manifests)
-        else:
-            prepared_manifests = load_existing_prepared_manifests(paths)
+            training_manifests = update_cumulative_manifests(config, paths, split_manifests, prepared_manifests)
+        elif args.stage == "train":
+            training_manifests = load_training_manifests(paths, continual_enabled=continual_config["enabled"])
 
         if args.stage in {"all", "train"}:
-            write_pipeline_status(paths, stage="train", state="running", message="행동 분류 모델을 학습하는 중입니다.")
+            if training_manifests is None:
+                training_manifests = load_training_manifests(paths, continual_enabled=continual_config["enabled"])
+            write_pipeline_status(
+                paths,
+                stage="train",
+                state="running",
+                message="행동 분류 모델을 학습하는 중입니다.",
+                stage_progress=0.8,
+            )
             labels = get_target_labels(config)
-            train_manifest = prepared_manifests["train"]
-            val_manifest = prepared_manifests["val"]
+            train_manifest = training_manifests["train"]
+            val_manifest = training_manifests["val"]
+            resume_from = None
+            if continual_config["enabled"] and continual_config["resume_from_best"]:
+                candidate_checkpoint = paths["artifacts_dir"] / "best_action_model.pt"
+                if candidate_checkpoint.exists():
+                    resume_from = candidate_checkpoint
             artifacts = train_action_classifier(
                 train_manifest=train_manifest,
                 val_manifest=val_manifest,
@@ -109,16 +143,21 @@ def main() -> None:
                 num_workers=int(config.get("training", {}).get("num_workers", 0)),
                 device=str(config.get("training", {}).get("device", "cuda")),
                 progress_path=paths["training_progress"],
+                resume_from=resume_from,
             )
             print(f"[train] best model: {artifacts.best_model_path}")
             print(f"[train] metrics: {artifacts.metrics_path}")
             print(f"[train] labels: {artifacts.labels_path}")
+
+            if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
+                cleanup_transient_job_data(paths)
 
         write_pipeline_status(
             paths,
             stage="completed",
             state="completed",
             message="학습 파이프라인이 완료되었습니다.",
+            stage_progress=1.0,
         )
     except Exception as exc:
         write_pipeline_status(
@@ -126,6 +165,7 @@ def main() -> None:
             stage="error",
             state="error",
             message=str(exc),
+            stage_progress=1.0,
         )
         raise
 
@@ -150,13 +190,21 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "artifacts_dir": artifacts_dir,
         "pipeline_status": workspace_dir / "pipeline_status.json",
         "training_progress": artifacts_dir / "training_progress.json",
-        "raw_manifest": manifests_dir / "raw_items.jsonl",
-        "split_train": manifests_dir / "split_train.jsonl",
-        "split_val": manifests_dir / "split_val.jsonl",
-        "split_test": manifests_dir / "split_test.jsonl",
-        "prepared_train": manifests_dir / "prepared_train.jsonl",
-        "prepared_val": manifests_dir / "prepared_val.jsonl",
-        "prepared_test": manifests_dir / "prepared_test.jsonl",
+        "raw_manifest": manifests_dir / "cumulative_raw_items.jsonl",
+        "split_train": manifests_dir / "cumulative_split_train.jsonl",
+        "split_val": manifests_dir / "cumulative_split_val.jsonl",
+        "split_test": manifests_dir / "cumulative_split_test.jsonl",
+        "prepared_train": manifests_dir / "cumulative_prepared_train.jsonl",
+        "prepared_val": manifests_dir / "cumulative_prepared_val.jsonl",
+        "prepared_test": manifests_dir / "cumulative_prepared_test.jsonl",
+        "current_raw_manifest": manifests_dir / "current_raw_items.jsonl",
+        "current_split_train": manifests_dir / "current_split_train.jsonl",
+        "current_split_val": manifests_dir / "current_split_val.jsonl",
+        "current_split_test": manifests_dir / "current_split_test.jsonl",
+        "current_prepared_train": manifests_dir / "current_prepared_train.jsonl",
+        "current_prepared_val": manifests_dir / "current_prepared_val.jsonl",
+        "current_prepared_test": manifests_dir / "current_prepared_test.jsonl",
+        "continual_state": manifests_dir / "continual_state.json",
     }
 
 
@@ -180,7 +228,7 @@ def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
 
     api_config = config["api"]
     dataset_config = config["dataset"]
-    raw_manifest_path = paths["raw_manifest"]
+    raw_manifest_path = paths["current_raw_manifest"]
 
     session = requests.Session()
     headers = build_headers(api_config)
@@ -255,7 +303,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
     datapackagekey = shell_config.get("datapackagekey")
     filekey = shell_config.get("filekey")
     import_dir = paths["import_dir"]
-    raw_manifest_path = paths["raw_manifest"]
+    raw_manifest_path = paths["current_raw_manifest"]
 
     command = build_aihub_shell_command(shell_path, api_key, mode=mode)
     if datasetkey is not None and filekey:
@@ -275,6 +323,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         stage="download",
         state="running",
         message="AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다.",
+        stage_progress=0.08,
     )
     subprocess.run(command, cwd=str(import_dir), check=True)
     write_pipeline_status(
@@ -282,6 +331,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         stage="download",
         state="running",
         message="다운로드한 분할 ZIP 조각을 병합하는 중입니다.",
+        stage_progress=0.22,
     )
     merge_split_archives(import_dir)
     write_pipeline_status(
@@ -289,6 +339,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         stage="download",
         state="running",
         message="병합된 ZIP 파일을 압축 해제하는 중입니다.",
+        stage_progress=0.38,
     )
     source_root = extract_archives(import_dir, paths["extracted_dir"])
     write_pipeline_status(
@@ -296,8 +347,17 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         stage="download",
         state="running",
         message="압축 해제된 영상 파일을 스캔하고 라벨을 정리하는 중입니다.",
+        stage_progress=0.5,
     )
     downloaded = scan_local_video_dataset(config, paths, source_root=source_root)
+    write_pipeline_status(
+        paths,
+        stage="download",
+        state="running",
+        message=f"압축 해제 영상 스캔이 완료되었습니다. {len(downloaded)}개 샘플을 찾았습니다.",
+        stage_progress=0.55,
+        discovered_items=len(downloaded),
+    )
     if not downloaded:
         raise RuntimeError(
             "다운로드 후 학습용 영상 파일을 찾지 못했습니다.\n"
@@ -553,14 +613,19 @@ def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None
     )
 
     scanned: list[DownloadedItem] = []
+    unlabeled_examples: list[str] = []
+    candidate_video_count = 0
     for video_path in sorted(import_dir.rglob("*")):
         if not video_path.is_file():
             continue
         if video_path.suffix.lower() not in extensions:
             continue
+        candidate_video_count += 1
 
         source_label, target_label = infer_label_from_path(video_path, label_mapping)
         if not target_label:
+            if len(unlabeled_examples) < 12:
+                unlabeled_examples.append(str(video_path))
             continue
 
         destination_dir = raw_dir / slugify(target_label)
@@ -583,6 +648,15 @@ def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None
                 },
             )
         )
+    if candidate_video_count and not scanned:
+        print("[scan] 영상 파일은 찾았지만 label_mapping과 경로가 맞지 않아 학습 데이터로 분류되지 않았습니다.")
+        print(f"[scan] candidate videos: {candidate_video_count}")
+        if unlabeled_examples:
+            print("[scan] unlabeled examples:")
+            for sample_path in unlabeled_examples:
+                print(f"  - {sample_path}")
+    elif scanned:
+        print(f"[scan] labeled videos: {len(scanned)} / candidates: {candidate_video_count}")
     return scanned
 
 
@@ -634,9 +708,9 @@ def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -
         split_items["test"].extend(items[val_end:])
 
     split_paths = {
-        "train": paths["split_train"],
-        "val": paths["split_val"],
-        "test": paths["split_test"],
+        "train": paths["current_split_train"],
+        "val": paths["current_split_val"],
+        "test": paths["current_split_test"],
     }
     for split_name, target_path in split_paths.items():
         with target_path.open("w", encoding="utf-8") as handle:
@@ -667,11 +741,11 @@ def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -
     return split_paths
 
 
-def load_existing_split_manifests(paths: dict) -> dict[str, Path]:
+def load_existing_current_split_manifests(paths: dict) -> dict[str, Path]:
     split_paths = {
-        "train": paths["split_train"],
-        "val": paths["split_val"],
-        "test": paths["split_test"],
+        "train": paths["current_split_train"],
+        "val": paths["current_split_val"],
+        "test": paths["current_split_test"],
     }
     for split_name, path in split_paths.items():
         if not path.exists():
@@ -713,22 +787,56 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     min_frames_with_person = int(preprocess_config.get("min_frames_with_person", 4))
 
     prepared_paths = {
-        "train": paths["prepared_train"],
-        "val": paths["prepared_val"],
-        "test": paths["prepared_test"],
+        "train": paths["current_prepared_train"],
+        "val": paths["current_prepared_val"],
+        "test": paths["current_prepared_test"],
     }
 
+    manifest_rows: dict[str, list[dict]] = {}
+    overall_total = 0
     for split_name, manifest_path in split_manifests.items():
-        target_manifest_path = prepared_paths[split_name]
-        with manifest_path.open("r", encoding="utf-8") as source_handle, target_manifest_path.open("w", encoding="utf-8") as target_handle:
-            kept = 0
+        rows: list[dict] = []
+        with manifest_path.open("r", encoding="utf-8") as source_handle:
             for line in source_handle:
                 line = line.strip()
                 if not line:
                     continue
-                sample = json.loads(line)
+                rows.append(json.loads(line))
+        manifest_rows[split_name] = rows
+        overall_total += len(rows)
+
+    processed_total = 0
+
+    for split_name, manifest_path in split_manifests.items():
+        target_manifest_path = prepared_paths[split_name]
+        rows = manifest_rows.get(split_name, [])
+        split_total = len(rows)
+        with target_manifest_path.open("w", encoding="utf-8") as target_handle:
+            kept = 0
+            for split_index, sample in enumerate(rows, start=1):
                 video_path = Path(sample["video_path"])
                 target_label = sample["target_label"]
+                processed_total += 1
+                if (
+                    processed_total == 1
+                    or processed_total == overall_total
+                    or processed_total % 5 == 0
+                ):
+                    prepare_ratio = processed_total / max(overall_total, 1)
+                    write_pipeline_status(
+                        paths,
+                        stage="prepare",
+                        state="running",
+                        message=f"{split_name} split에서 pose 시퀀스를 추출하는 중입니다.",
+                        stage_progress=round(0.55 + (0.25 * prepare_ratio), 4),
+                        processed_items=processed_total,
+                        total_items=overall_total,
+                        current_split=split_name,
+                        split_index=split_index,
+                        split_total=split_total,
+                        current_video=video_path.name,
+                        kept_items=kept,
+                    )
                 sequence = extract_pose_sequence(
                     video_path=video_path,
                     person_detector=person_detector,
@@ -764,21 +872,230 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                     + "\n"
                 )
                 kept += 1
+            write_pipeline_status(
+                paths,
+                stage="prepare",
+                state="running",
+                message=f"{split_name} split pose 추출이 완료되었습니다.",
+                stage_progress=round(0.55 + (0.25 * (processed_total / max(overall_total, 1))), 4) if overall_total else 0.8,
+                processed_items=processed_total,
+                total_items=overall_total,
+                current_split=split_name,
+                split_index=split_total,
+                split_total=split_total,
+                kept_items=kept,
+            )
         print(f"[prepare] {split_name}: {kept} samples -> {target_manifest_path}")
 
     return prepared_paths
 
 
-def load_existing_prepared_manifests(paths: dict) -> dict[str, Path]:
+def load_existing_current_prepared_manifests(paths: dict) -> dict[str, Path]:
     prepared_paths = {
-        "train": paths["prepared_train"],
-        "val": paths["prepared_val"],
-        "test": paths["prepared_test"],
+        "train": paths["current_prepared_train"],
+        "val": paths["current_prepared_val"],
+        "test": paths["current_prepared_test"],
     }
     for split_name, path in prepared_paths.items():
         if split_name in {"train", "val"} and not path.exists():
             raise RuntimeError(f"기존 prepared manifest를 찾지 못했습니다: {split_name} -> {path}")
     return prepared_paths
+
+
+def get_continual_config(config: dict) -> dict:
+    continual = config.get("continual_learning", {})
+    return {
+        "enabled": bool(continual.get("enabled", True)),
+        "resume_from_best": bool(continual.get("resume_from_best", True)),
+        "cleanup_raw_after_job": bool(continual.get("cleanup_raw_after_job", True)),
+    }
+
+
+def load_training_manifests(paths: dict, *, continual_enabled: bool) -> dict[str, Path]:
+    if continual_enabled and paths["prepared_train"].exists() and paths["prepared_val"].exists():
+        return {
+            "train": paths["prepared_train"],
+            "val": paths["prepared_val"],
+            "test": paths["prepared_test"],
+        }
+    return {
+        "train": paths["current_prepared_train"],
+        "val": paths["current_prepared_val"],
+        "test": paths["current_prepared_test"],
+    }
+
+
+def update_cumulative_manifests(
+    config: dict,
+    paths: dict,
+    split_manifests: dict[str, Path],
+    prepared_manifests: dict[str, Path],
+) -> dict[str, Path]:
+    continual_config = get_continual_config(config)
+    if not continual_config["enabled"]:
+        return prepared_manifests
+
+    shell_config = config.get("aihub_shell", {})
+    job_meta = {
+        "job_datasetkey": str(shell_config.get("datasetkey", "")).strip() or None,
+        "job_filekey": normalize_requested_filekeys(shell_config.get("filekey")),
+        "job_added_at": datetime.now(timezone.utc).astimezone().isoformat(),
+    }
+
+    merge_jsonl_entries(
+        paths["current_raw_manifest"],
+        paths["raw_manifest"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        split_manifests["train"],
+        paths["split_train"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        split_manifests["val"],
+        paths["split_val"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        split_manifests["test"],
+        paths["split_test"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        prepared_manifests["train"],
+        paths["prepared_train"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        prepared_manifests["val"],
+        paths["prepared_val"],
+        extra_fields=job_meta,
+    )
+    merge_jsonl_entries(
+        prepared_manifests["test"],
+        paths["prepared_test"],
+        extra_fields=job_meta,
+    )
+
+    with paths["continual_state"].open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "updated_at": job_meta["job_added_at"],
+                "datasetkey": job_meta["job_datasetkey"],
+                "filekeys": job_meta["job_filekey"],
+                "raw_total": count_manifest_lines(paths["raw_manifest"]),
+                "prepared_train_total": count_manifest_lines(paths["prepared_train"]),
+                "prepared_val_total": count_manifest_lines(paths["prepared_val"]),
+                "prepared_test_total": count_manifest_lines(paths["prepared_test"]),
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(
+        "[continual] cumulative prepared samples "
+        f"train={count_manifest_lines(paths['prepared_train'])}, "
+        f"val={count_manifest_lines(paths['prepared_val'])}, "
+        f"test={count_manifest_lines(paths['prepared_test'])}"
+    )
+    return {
+        "train": paths["prepared_train"],
+        "val": paths["prepared_val"],
+        "test": paths["prepared_test"],
+    }
+
+
+def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: dict | None = None) -> int:
+    source_entries = read_jsonl_entries(source_path)
+    if not source_entries:
+        return 0
+
+    existing_entries = read_jsonl_entries(target_path)
+    seen = {build_manifest_unique_key(entry) for entry in existing_entries}
+    merged_entries = list(existing_entries)
+    added = 0
+
+    for entry in source_entries:
+        merged_entry = dict(entry)
+        if extra_fields:
+            merged_entry.update(extra_fields)
+        unique_key = build_manifest_unique_key(merged_entry)
+        if unique_key in seen:
+            continue
+        merged_entries.append(merged_entry)
+        seen.add(unique_key)
+        added += 1
+
+    write_jsonl_entries(target_path, merged_entries)
+    return added
+
+
+def read_jsonl_entries(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    entries: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
+def write_jsonl_entries(path: Path, entries: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def build_manifest_unique_key(entry: dict) -> str:
+    metadata = entry.get("metadata") or {}
+    pose_path = entry.get("pose_path")
+    if pose_path:
+        return f"pose::{pose_path}"
+    relative_path = metadata.get("relative_path")
+    if relative_path:
+        return f"relative::{relative_path}"
+    source_path = metadata.get("source_path")
+    if source_path:
+        return f"source::{source_path}"
+    item_id = entry.get("item_id")
+    target_label = entry.get("target_label")
+    if item_id:
+        return f"item::{item_id}::{target_label}"
+    return json.dumps(entry, sort_keys=True, ensure_ascii=False)
+
+
+def count_manifest_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def cleanup_transient_job_data(paths: dict) -> None:
+    for key in ("raw_dir", "import_dir", "extracted_dir"):
+        target = paths.get(key)
+        if isinstance(target, Path) and target.exists():
+            shutil.rmtree(target)
+            target.mkdir(parents=True, exist_ok=True)
+
+    for key in (
+        "current_raw_manifest",
+        "current_split_train",
+        "current_split_val",
+        "current_split_test",
+        "current_prepared_train",
+        "current_prepared_val",
+        "current_prepared_test",
+    ):
+        target = paths.get(key)
+        if isinstance(target, Path) and target.exists():
+            target.unlink()
 
 
 def extract_pose_sequence(
@@ -1089,8 +1406,12 @@ def resolve_aihub_api_key(shell_config: dict) -> str:
 
 def infer_label_from_path(video_path: Path, label_mapping: dict) -> tuple[str, str | None]:
     relative_text = str(video_path).replace("\\", "/")
+    relative_text_lower = relative_text.lower()
     for source_label, target_label in label_mapping.items():
-        if source_label in relative_text:
+        source_text = str(source_label).strip()
+        if not source_text:
+            continue
+        if source_text in relative_text or source_text.lower() in relative_text_lower:
             return str(source_label), str(target_label)
     return "", None
 

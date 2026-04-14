@@ -107,6 +107,7 @@ def train_action_classifier(
     num_workers: int = 0,
     device: str = "cuda",
     progress_path: Path | None = None,
+    resume_from: Path | None = None,
 ) -> TrainingArtifacts:
     output_dir.mkdir(parents=True, exist_ok=True)
     labels_path = output_dir / "labels.json"
@@ -141,6 +142,20 @@ def train_action_classifier(
         dropout=dropout,
     ).to(device)
 
+    resumed_from_checkpoint = False
+    if resume_from is not None and resume_from.exists():
+        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint_labels = list(checkpoint.get("labels", []))
+        if checkpoint_labels == list(labels):
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            resumed_from_checkpoint = True
+        else:
+            print(
+                "[train] 기존 체크포인트 라벨 구성이 현재 설정과 달라서 resume을 건너뜁니다.\n"
+                f"- checkpoint labels: {checkpoint_labels}\n"
+                f"- current labels: {labels}"
+            )
+
     class_weights = _build_class_weights(train_dataset.samples, len(labels)).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -149,6 +164,8 @@ def train_action_classifier(
     history: list[dict] = []
     best_val_f1 = -1.0
     best_epoch = 0
+    train_sample_count = len(train_dataset)
+    val_sample_count = len(val_dataset)
 
     if progress_path is not None:
         _write_progress(
@@ -163,10 +180,14 @@ def train_action_classifier(
                 "latest": None,
                 "history": history,
                 "labels": labels,
+                "resumed_from_checkpoint": resumed_from_checkpoint,
+                "train_samples": train_sample_count,
+                "val_samples": val_sample_count,
             },
         )
 
     for epoch in range(1, epochs + 1):
+        current_lr = float(optimizer.param_groups[0]["lr"])
         train_loss = _run_epoch(
             model=model,
             loader=train_loader,
@@ -190,6 +211,7 @@ def train_action_classifier(
             "val_loss": round(val_metrics["loss"], 6),
             "val_accuracy": round(val_metrics["accuracy"], 6),
             "val_macro_f1": round(val_metrics["macro_f1"], 6),
+            "learning_rate": round(current_lr, 8),
         }
         history.append(epoch_metrics)
 
@@ -222,6 +244,9 @@ def train_action_classifier(
                     "latest": epoch_metrics,
                     "history": history,
                     "labels": labels,
+                    "resumed_from_checkpoint": resumed_from_checkpoint,
+                    "train_samples": train_sample_count,
+                    "val_samples": val_sample_count,
                 },
             )
 
@@ -242,6 +267,7 @@ def train_action_classifier(
                 "final_validation": final_metrics,
                 "labels": labels,
                 "best_epoch": best_epoch,
+                "resumed_from_checkpoint": resumed_from_checkpoint,
             },
             handle,
             ensure_ascii=False,
@@ -262,6 +288,9 @@ def train_action_classifier(
                 "history": history,
                 "labels": labels,
                 "final_validation": final_metrics,
+                "resumed_from_checkpoint": resumed_from_checkpoint,
+                "train_samples": train_sample_count,
+                "val_samples": val_sample_count,
             },
         )
 

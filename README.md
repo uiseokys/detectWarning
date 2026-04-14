@@ -210,6 +210,13 @@ python3 app/training_dashboard.py --config configs/action_training.aihub_shell.e
 5. 여러 `filekey`를 넣으면 하나가 끝난 뒤 다음 작업이 자동으로 이어집니다.
 6. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
 
+현재 기본 동작은 누적 학습입니다.
+
+- 각 `filekey` 작업이 끝나면 원본 다운로드/압축해제 데이터는 정리합니다.
+- 대신 이전 작업에서 만든 `prepared pose` 데이터와 `best_action_model.pt` 는 유지합니다.
+- 다음 `filekey` 학습 때는 새 데이터와 이전 prepared 데이터를 함께 복습하면서 이어서 학습합니다.
+- 즉 저장 공간은 아끼면서도, 이전에 학습한 내용을 계속 누적하는 방식입니다.
+
 노트북에서 확인하고 싶다면:
 
 1. 데스크탑에서 위 대시보드를 실행합니다.

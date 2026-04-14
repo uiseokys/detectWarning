@@ -23,12 +23,26 @@
     ],
     "label_mapping": {
       "일반행동": "normal",
+      "normal": "normal",
       "폭행": "violence",
+      "assault": "violence",
+      "fight": "violence",
+      "fighting": "violence",
+      "violence": "violence",
       "싸움": "violence",
       "데이트폭력 및 폭행": "violence",
+      "datingviolence": "violence",
+      "dating_violence": "violence",
       "실신": "collapse",
+      "fainting": "collapse",
+      "collapse": "collapse",
       "납치": "abduction",
-      "배회": "loitering"
+      "kidnap": "abduction",
+      "kidnapping": "abduction",
+      "abduction": "abduction",
+      "배회": "loitering",
+      "loitering": "loitering",
+      "wandering": "loitering"
     },
     "video_extensions": [
       ".mp4",
@@ -61,5 +75,10 @@
     "num_layers": 2,
     "dropout": 0.2,
     "num_workers": 0
+  },
+  "continual_learning": {
+    "enabled": true,
+    "resume_from_best": true,
+    "cleanup_raw_after_job": true
   }
 }
