@@ -472,7 +472,7 @@ def normalize_requested_filekeys(requested_filekeys) -> list[str]:
 
 def fetch_aihub_file_tree(shell_path: str, api_key: str, *, datasetkey) -> dict | list:
     command = build_aihub_shell_command(shell_path, api_key, mode="l")
-    command.append(str(datasetkey))
+    command.extend(["-datasetkey", str(datasetkey)])
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
     stdout = completed.stdout.strip()
     payload_text = extract_json_payload(stdout)
