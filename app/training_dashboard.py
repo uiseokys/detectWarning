@@ -243,6 +243,61 @@ def create_app(config_path: Path) -> FastAPI:
         with launcher_history_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
 
+    def hard_reset_workspace() -> None:
+        for key in (
+            "raw_dir",
+            "import_dir",
+            "extracted_dir",
+            "manifests_dir",
+            "prepared_dir",
+            "artifacts_dir",
+        ):
+            target = paths.get(key)
+            if isinstance(target, Path) and target.exists():
+                shutil.rmtree(target)
+
+        for target in (job_logs_dir, runtime_config_dir):
+            if target.exists():
+                shutil.rmtree(target)
+
+        if launcher_history_path.exists():
+            launcher_history_path.unlink()
+
+        for key in (
+            "workspace_dir",
+            "raw_dir",
+            "import_dir",
+            "extracted_dir",
+            "manifests_dir",
+            "prepared_dir",
+            "artifacts_dir",
+        ):
+            target = paths.get(key)
+            if isinstance(target, Path):
+                target.mkdir(parents=True, exist_ok=True)
+
+        job_logs_dir.mkdir(parents=True, exist_ok=True)
+        runtime_config_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_state["process"] = None
+        launcher_state["started_at"] = None
+        launcher_state["runtime_config_path"] = None
+        launcher_state["current_job"] = None
+        launcher_state["queued_jobs"] = []
+        launcher_state["completed_jobs"] = []
+        launcher_state["last_state"] = "idle"
+        launcher_state["last_exit_code"] = None
+        launcher_state["last_message"] = "학습 워크스페이스를 초기화했습니다. 처음부터 다시 시작할 수 있습니다."
+        launcher_state["log_path"] = None
+
+        write_dashboard_status(
+            stage="idle",
+            state="idle",
+            message="학습 워크스페이스를 초기화했습니다.",
+            stage_progress=0.0,
+        )
+        persist_launcher_history()
+
     def snapshot_job(job: dict | None) -> dict | None:
         if not job:
             return None
@@ -1174,6 +1229,7 @@ def create_app(config_path: Path) -> FastAPI:
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
           <button id="startButton" class="primary-button" type="button">대기열에 추가</button>
+          <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
           <div class="helper">datasetkey는 AIHub 데이터셋 키이고, filekey는 분할 ZIP 목록의 key 값입니다. 현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
         </div>
       </div>
@@ -1817,6 +1873,35 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
+    async function resetWorkspace() {
+      const confirmed = window.confirm('현재 학습 워크스페이스를 전부 초기화할까요? 누적 prepared 데이터, 모델, 메트릭, 완료 로그, 대기열이 모두 삭제됩니다.');
+      if (!confirmed) {
+        return;
+      }
+
+      const button = document.getElementById('resetButton');
+      button.disabled = true;
+      button.textContent = '초기화 중...';
+
+      try {
+        const response = await fetch('/api/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || data.message || '초기화에 실패했습니다.');
+        }
+        setLaunchMessage(data.message || '학습 워크스페이스를 초기화했습니다.', false);
+        await refresh();
+      } catch (error) {
+        setLaunchMessage(error.message || String(error), true);
+      } finally {
+        button.disabled = false;
+        button.textContent = '처음부터 다시 시작';
+      }
+    }
+
     async function refresh() {
       const response = await fetch('/api/overview');
       if (!response.ok) {
@@ -1922,6 +2007,7 @@ def create_app(config_path: Path) -> FastAPI:
     document.getElementById('datasetKeyInput').addEventListener('change', saveDatasetKey);
     document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
+    document.getElementById('resetButton').addEventListener('click', resetWorkspace);
     refresh();
     setInterval(refresh, 2000);
   </script>
@@ -2003,6 +2089,24 @@ def create_app(config_path: Path) -> FastAPI:
                 f"datasetkey {datasetkey} | filekey {', '.join(appended)} 를 대기열에 추가했습니다."
                 + (f" 중복으로 건너뜀: {', '.join(skipped)}" if skipped else "")
             ),
+            "launcher": get_launcher_status(),
+        }
+
+    @app.post("/api/reset")
+    def reset_training_data() -> dict:
+        with state_lock:
+            update_process_state()
+            active_process = launcher_state.get("process")
+            if isinstance(active_process, subprocess.Popen) and active_process.poll() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="현재 학습이 실행 중입니다. 종료 후 다시 시도해 주세요.",
+                )
+            hard_reset_workspace()
+
+        return {
+            "ok": True,
+            "message": "학습 워크스페이스를 초기화했습니다. datasetkey와 filekey를 다시 넣어 처음부터 시작할 수 있습니다.",
             "launcher": get_launcher_status(),
         }
 
