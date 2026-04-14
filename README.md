@@ -178,26 +178,26 @@ python3 app/camera_uploader.py --source 0 --server-url http://100.x.x.x:8000 --s
 
 ## 행동 학습 자동화
 
-API로 행동 영상을 받아서 다운로드, pose 전처리, 학습까지 자동으로 돌리고 싶다면 이 설정 파일을 먼저 복사해서 API 주소와 필드명을 채우면 됩니다.
+행동 학습은 AIHub `aihubshell` 설정 파일을 기준으로 실행하는 것을 추천합니다.
 
-설정 파일 예시:
+설정 파일:
 
-[`configs/action_training.example.json`](/Users/jung-uiseok/Desktop/detectWarning/configs/action_training.example.json)
+[`configs/action_training.aihub_shell.example.json`](/Users/jung-uiseok/Desktop/detectWarning/configs/action_training.aihub_shell.example.json)
 
-전체 파이프라인 실행:
+학습 대시보드 실행:
 
 ```bash
-python3 app/action_training_pipeline.py --config configs/action_training.example.json --stage all
+python3 app/training_dashboard.py --config configs/action_training.aihub_shell.example.json --port 8010
 ```
 
-AIHub `aihubshell`로 받으려면:
+그 다음 브라우저에서 `http://127.0.0.1:8010` 을 열고:
+
+1. 분할 ZIP의 `filekey`를 입력합니다.
+2. `다운로드 + 압축 해제 + 학습 시작` 버튼을 누릅니다.
+3. 같은 화면에서 다운로드, 압축 해제, pose 전처리, 학습 진행률을 확인합니다.
+
+터미널에서 바로 전체 파이프라인을 실행하고 싶다면:
 
 ```bash
 python3 app/action_training_pipeline.py --config configs/action_training.aihub_shell.example.json --stage all
-```
-
-학습 진행 상황 대시보드 실행:
-
-```bash
-python3 app/training_dashboard.py --config configs/action_training.example.json --port 8010
 ```

@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -133,15 +134,17 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
     workspace_dir = (base_dir / config.get("paths", {}).get("workspace_dir", "training_data/action_pipeline")).resolve()
     raw_dir = workspace_dir / "raw_videos"
     import_dir = workspace_dir / "imported_dataset"
+    extracted_dir = workspace_dir / "extracted_dataset"
     manifests_dir = workspace_dir / "manifests"
     prepared_dir = workspace_dir / "prepared_pose"
     artifacts_dir = workspace_dir / "artifacts"
-    for path in (workspace_dir, raw_dir, import_dir, manifests_dir, prepared_dir, artifacts_dir):
+    for path in (workspace_dir, raw_dir, import_dir, extracted_dir, manifests_dir, prepared_dir, artifacts_dir):
         path.mkdir(parents=True, exist_ok=True)
     return {
         "workspace_dir": workspace_dir,
         "raw_dir": raw_dir,
         "import_dir": import_dir,
+        "extracted_dir": extracted_dir,
         "manifests_dir": manifests_dir,
         "prepared_dir": prepared_dir,
         "artifacts_dir": artifacts_dir,
@@ -261,12 +264,31 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         command.extend(["-datapckagekey", str(datapackagekey)])
     if filekey:
         if isinstance(filekey, list):
-            command.extend(["-filekey", "{" + ", ".join(str(item) for item in filekey) + "}"])
+            command.extend(["-filekey", "{" + ",".join(str(item) for item in filekey) + "}"])
         else:
             command.extend(["-filekey", str(filekey)])
 
+    write_pipeline_status(
+        paths,
+        stage="download",
+        state="running",
+        message="AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다.",
+    )
     subprocess.run(command, cwd=str(import_dir), check=True)
-    downloaded = scan_local_video_dataset(config, paths)
+    write_pipeline_status(
+        paths,
+        stage="download",
+        state="running",
+        message="다운로드한 분할 ZIP을 압축 해제하는 중입니다.",
+    )
+    source_root = extract_archives(import_dir, paths["extracted_dir"])
+    write_pipeline_status(
+        paths,
+        stage="download",
+        state="running",
+        message="압축 해제된 영상 파일을 스캔하고 라벨을 정리하는 중입니다.",
+    )
+    downloaded = scan_local_video_dataset(config, paths, source_root=source_root)
 
     with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
         for item in downloaded:
@@ -289,9 +311,9 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
     return downloaded
 
 
-def scan_local_video_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
+def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None = None) -> list[DownloadedItem]:
     dataset_config = config["dataset"]
-    import_dir = paths["import_dir"]
+    import_dir = source_root or paths["import_dir"]
     raw_dir = paths["raw_dir"]
     label_mapping = dataset_config.get("label_mapping", {})
     extensions = tuple(
@@ -331,6 +353,30 @@ def scan_local_video_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
             )
         )
     return scanned
+
+
+def extract_archives(import_dir: Path, extracted_dir: Path) -> Path:
+    zip_files = sorted(
+        path for path in import_dir.rglob("*") if path.is_file() and path.suffix.lower() == ".zip"
+    )
+    if not zip_files:
+        return import_dir
+
+    extracted_any = False
+    for zip_path in zip_files:
+        target_dir = extracted_dir / sanitize_filename(zip_path.stem)
+        marker = target_dir / ".extracted_ok"
+        if marker.exists():
+            extracted_any = True
+            continue
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(target_dir)
+        marker.write_text("ok", encoding="utf-8")
+        extracted_any = True
+
+    return extracted_dir if extracted_any else import_dir
 
 
 def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -> dict[str, Path]:
