@@ -700,6 +700,16 @@ def create_app(config_path: Path) -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Training Dashboard</title>
+  <script>
+    (function () {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('viewer') === '1') {
+          document.documentElement.classList.add('viewer-mode-page');
+        }
+      } catch (error) {}
+    })();
+  </script>
   <style>
     :root {
       --bg: #eef3fb;
@@ -1570,22 +1580,28 @@ def create_app(config_path: Path) -> FastAPI:
       color: #7c8aa0;
       cursor: not-allowed;
     }
+    html.viewer-mode-page #controlPanel .queue-editor,
+    html.viewer-mode-page #controlPanel .control-actions,
     .viewer-mode .queue-editor,
     .viewer-mode .control-actions {
       display: none !important;
     }
+    html.viewer-mode-page #controlPanel,
     .viewer-mode {
       padding: 16px;
     }
+    html.viewer-mode-page #controlPanel .launch-box,
     .viewer-mode .launch-box {
       padding: 0;
       background: transparent;
       border: none;
       gap: 8px;
     }
+    html.viewer-mode-page #controlPanel .launch-item,
     .viewer-mode .launch-item {
       background: rgba(248, 250, 253, 0.98);
     }
+    html.viewer-mode-page #controlPanel .primary-button,
     .viewer-mode .primary-button {
       opacity: 0.55;
       box-shadow: none !important;
