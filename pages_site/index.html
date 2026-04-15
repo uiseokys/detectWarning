@@ -904,6 +904,8 @@
     function startLiveRedirect(status) {
       if (status.status !== "online" || !status.live_url) return;
 
+      const liveUrl = buildViewerLiveUrl(status.live_url);
+
       const delay = Number(status.redirect_delay_seconds || 3);
       let countdown = Number.isNaN(delay) ? 3 : delay;
       const message = document.getElementById("redirectMessage");
@@ -914,11 +916,23 @@
         countdown -= 1;
         if (countdown <= 0) {
           clearInterval(timer);
-          window.location.href = status.live_url;
+          window.location.href = liveUrl;
           return;
         }
         message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
       }, 1000);
+    }
+
+    function buildViewerLiveUrl(url) {
+      if (!url) return url;
+      try {
+        const target = new URL(url);
+        target.searchParams.set("viewer", "1");
+        return target.toString();
+      } catch (_) {
+        const joiner = url.includes("?") ? "&" : "?";
+        return `${url}${joiner}viewer=1`;
+      }
     }
 
     function renderLiveStatus(status) {
@@ -929,6 +943,7 @@
       const liveLink = document.getElementById("liveLink");
 
       if (status.status === "online" && status.live_url) {
+        const liveUrl = buildViewerLiveUrl(status.live_url);
         pill.className = "status-pill tone-online";
         pill.textContent = "online";
         title.textContent = status.live_title || "실시간 연결 가능";
@@ -937,7 +952,7 @@
           : (status.message || "실시간 대시보드가 연결되어 있습니다.");
         detail.textContent = "실시간 화면을 사용할 수 있습니다.";
         liveLink.style.display = "inline-flex";
-        liveLink.href = status.live_url;
+        liveLink.href = liveUrl;
         startLiveRedirect(status);
         return;
       }

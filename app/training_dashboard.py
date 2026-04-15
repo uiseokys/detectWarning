@@ -5,6 +5,7 @@ import atexit
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -440,6 +441,48 @@ def create_app(config_path: Path) -> FastAPI:
         persist_launcher_history()
         sync_pages_report()
 
+    def stop_process_tree(process: subprocess.Popen | None) -> int | None:
+        if not isinstance(process, subprocess.Popen):
+            return None
+
+        if process.poll() is not None:
+            return process.returncode
+
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except Exception:
+                    process.terminate()
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+        try:
+            process.wait(timeout=8)
+        except Exception:
+            try:
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                pass
+        return process.returncode
+
     def snapshot_job(job: dict | None) -> dict | None:
         if not job:
             return None
@@ -535,6 +578,8 @@ def create_app(config_path: Path) -> FastAPI:
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                start_new_session=(os.name != "nt"),
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
             )
 
         job["started_at"] = current_timestamp()
@@ -1032,6 +1077,18 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--muted);
       white-space: pre-line;
     }
+    .readonly-banner {
+      display: none;
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(37, 99, 235, 0.08);
+      border: 1px solid rgba(37, 99, 235, 0.14);
+      color: #1d4ed8;
+      font-size: 12.5px;
+      font-weight: 700;
+      line-height: 1.55;
+    }
     .grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1519,6 +1576,22 @@ def create_app(config_path: Path) -> FastAPI:
     .sidebar-stack .launch-message {
       background: rgba(255,255,255,0.92);
     }
+    .viewer-mode .text-input,
+    .viewer-mode .input-area {
+      background: rgba(241, 245, 249, 0.9);
+      color: #7c8aa0;
+      cursor: not-allowed;
+    }
+    .viewer-mode .primary-button {
+      opacity: 0.55;
+      box-shadow: none !important;
+      cursor: not-allowed;
+      pointer-events: none;
+      filter: grayscale(0.08);
+    }
+    .viewer-mode .readonly-banner {
+      display: block;
+    }
     .helper {
       font-size: 12.5px;
       line-height: 1.65;
@@ -1737,7 +1810,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     <div class="dashboard-shell">
     <aside class="sidebar-stack">
-    <section class="card control-panel">
+    <section id="controlPanel" class="card control-panel">
       <div>
         <h2 class="control-title">학습 큐</h2>
         <div class="control-copy">datasetkey와 filekey를 넣으면 다운로드, 전처리, 학습이 순차로 이어집니다.</div>
@@ -1758,6 +1831,7 @@ def create_app(config_path: Path) -> FastAPI:
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
           <div class="helper">datasetkey는 데이터셋 키, filekey는 분할 ZIP key입니다.</div>
         </div>
+        <div id="readonlyBanner" class="readonly-banner">공유용 읽기 전용 화면입니다. 팀원은 현재 상태와 결과만 확인할 수 있습니다.</div>
       </div>
       <div class="launch-box">
         <div class="launch-item">
@@ -2091,6 +2165,39 @@ def create_app(config_path: Path) -> FastAPI:
       return state || '대기 중';
     }
 
+    const viewerMode = new URLSearchParams(window.location.search).get('viewer') === '1';
+
+    function applyViewerMode() {
+      if (!viewerMode) {
+        return;
+      }
+
+      const panel = document.getElementById('controlPanel');
+      if (panel) {
+        panel.classList.add('viewer-mode');
+      }
+
+      [
+        'datasetKeyInput',
+        'apiKeyInput',
+        'filekeysInput',
+        'startButton',
+        'stopButton',
+        'forceStopButton',
+        'resetButton',
+      ].forEach((id) => {
+        const element = document.getElementById(id);
+        if (!element) return;
+        element.disabled = true;
+        if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
+          element.setAttribute('readonly', 'readonly');
+          element.setAttribute('tabindex', '-1');
+        }
+      });
+
+      setLaunchMessage('읽기 전용 공유 화면입니다. 조작은 데스크탑 관리자 화면에서만 가능합니다.', false);
+    }
+
     function setLaunchMessage(message, isError) {
       const box = document.getElementById('launchMessage');
       box.textContent = message || '-';
@@ -2103,6 +2210,13 @@ def create_app(config_path: Path) -> FastAPI:
       const startButton = document.getElementById('startButton');
       const stopButton = document.getElementById('stopButton');
       const forceStopButton = document.getElementById('forceStopButton');
+      if (viewerMode) {
+        startButton.disabled = true;
+        stopButton.disabled = true;
+        forceStopButton.disabled = true;
+        document.getElementById('resetButton').disabled = true;
+        return;
+      }
       const autoStartEnabled = launcher?.auto_start_enabled !== false;
       const hasCurrentJob = !!launcher?.current_job;
       const pendingCount = (launcher?.pending_jobs || []).length;
@@ -2126,6 +2240,9 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     function loadSavedApiKey() {
+      if (viewerMode) {
+        return;
+      }
       const saved = window.localStorage.getItem('training_dashboard_aihub_api_key');
       if (saved) {
         document.getElementById('apiKeyInput').value = saved;
@@ -2133,6 +2250,9 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     function saveApiKey() {
+      if (viewerMode) {
+        return '';
+      }
       const value = document.getElementById('apiKeyInput').value.trim();
       if (value) {
         window.localStorage.setItem('training_dashboard_aihub_api_key', value);
@@ -2143,6 +2263,9 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     function loadSavedDatasetKey() {
+      if (viewerMode) {
+        return;
+      }
       const saved = window.localStorage.getItem('training_dashboard_aihub_datasetkey');
       if (saved) {
         document.getElementById('datasetKeyInput').value = saved;
@@ -2150,6 +2273,9 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     function saveDatasetKey() {
+      if (viewerMode) {
+        return document.getElementById('datasetKeyInput').value.trim();
+      }
       const value = document.getElementById('datasetKeyInput').value.trim();
       if (value) {
         window.localStorage.setItem('training_dashboard_aihub_datasetkey', value);
@@ -2418,6 +2544,10 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     async function startTraining() {
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 작업을 시작할 수 없습니다.', true);
+        return;
+      }
       const input = document.getElementById('filekeysInput').value.trim();
       const datasetKey = saveDatasetKey();
       const apiKey = saveApiKey();
@@ -2464,6 +2594,10 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     async function pauseQueue() {
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 큐를 중지할 수 없습니다.', true);
+        return;
+      }
       const button = document.getElementById('stopButton');
       button.disabled = true;
       button.textContent = '중지 요청 중...';
@@ -2487,6 +2621,10 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     async function forceStopCurrentJob() {
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 강제 중단을 할 수 없습니다.', true);
+        return;
+      }
       const confirmed = window.confirm('현재 진행 중인 filekey 작업을 즉시 강제 중단할까요? 현재 작업은 나중에 재시작 시 처음부터 다시 시도되며, 다음 큐 자동 시작은 멈춥니다.');
       if (!confirmed) {
         return;
@@ -2515,7 +2653,11 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     async function resetWorkspace() {
-      const confirmed = window.confirm('현재 학습 워크스페이스를 전부 초기화할까요? 누적 prepared 데이터, 모델, 메트릭, 완료 로그, 대기열이 모두 삭제됩니다.');
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 초기화를 할 수 없습니다.', true);
+        return;
+      }
+      const confirmed = window.confirm('현재 작업과 다운로드를 중단하고 처음부터 다시 시작할까요? 누적 prepared 데이터, 모델, 메트릭, 완료 로그, 대기열이 모두 삭제됩니다.');
       if (!confirmed) {
         return;
       }
@@ -2658,6 +2800,7 @@ def create_app(config_path: Path) -> FastAPI:
     document.getElementById('stopButton').addEventListener('click', pauseQueue);
     document.getElementById('forceStopButton').addEventListener('click', forceStopCurrentJob);
     document.getElementById('resetButton').addEventListener('click', resetWorkspace);
+    applyViewerMode();
     refresh();
     setInterval(refresh, 2000);
   </script>
@@ -2796,15 +2939,7 @@ def create_app(config_path: Path) -> FastAPI:
 
             launcher_state["auto_start_enabled"] = False
 
-            try:
-                active_process.terminate()
-                active_process.wait(timeout=5)
-            except Exception:
-                try:
-                    active_process.kill()
-                    active_process.wait(timeout=5)
-                except Exception:
-                    pass
+            stop_process_tree(active_process)
 
             current_job["finished_at"] = current_timestamp()
             current_job["exit_code"] = active_process.returncode if active_process.returncode is not None else -1
@@ -2862,15 +2997,17 @@ def create_app(config_path: Path) -> FastAPI:
             update_process_state()
             active_process = launcher_state.get("process")
             if isinstance(active_process, subprocess.Popen) and active_process.poll() is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="현재 학습이 실행 중입니다. 종료 후 다시 시도해 주세요.",
-                )
+                launcher_state["auto_start_enabled"] = False
+                stop_process_tree(active_process)
+                launcher_state["process"] = None
+                launcher_state["started_at"] = None
+                launcher_state["runtime_config_path"] = None
+                launcher_state["current_job"] = None
             hard_reset_workspace()
 
         return {
             "ok": True,
-            "message": "학습 워크스페이스를 초기화했습니다. datasetkey와 filekey를 다시 넣어 처음부터 시작할 수 있습니다.",
+            "message": "현재 작업과 대기열을 중단하고 학습 워크스페이스를 초기화했습니다. datasetkey와 filekey를 다시 넣어 처음부터 시작할 수 있습니다.",
             "launcher": get_launcher_status(),
         }
 
