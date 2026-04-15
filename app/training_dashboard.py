@@ -1356,260 +1356,326 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
-    /* Design refresh overrides */
+    /* Readability + layout overrides */
     :root {
-      --bg: #08111f;
-      --bg-deep: #0d1728;
-      --panel: rgba(248, 250, 252, 0.96);
-      --panel-strong: rgba(255, 255, 255, 0.98);
-      --panel-soft: rgba(241, 245, 249, 0.98);
+      --bg: #f2f6fc;
+      --bg-deep: #e7eef8;
+      --panel: rgba(255, 255, 255, 0.98);
+      --panel-strong: rgba(255, 255, 255, 1);
+      --panel-soft: rgba(248, 250, 253, 0.98);
       --ink: #0f172a;
-      --muted: #62748a;
+      --muted: #435267;
       --line: rgba(148, 163, 184, 0.18);
-      --line-strong: rgba(148, 163, 184, 0.28);
-      --accent: #38bdf8;
-      --accent-strong: #2563eb;
-      --accent-soft: rgba(56, 189, 248, 0.12);
-      --good: #10b981;
-      --warn: #f59e0b;
-      --danger: #ef4444;
-      --shadow: 0 28px 60px rgba(2, 8, 23, 0.28);
-      --shadow-soft: 0 20px 40px rgba(15, 23, 42, 0.12);
+      --line-strong: rgba(148, 163, 184, 0.26);
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --accent-soft: rgba(37, 99, 235, 0.12);
+      --good: #059669;
+      --warn: #d97706;
+      --danger: #dc2626;
+      --shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
+      --shadow-soft: 0 10px 24px rgba(15, 23, 42, 0.05);
+      --radius-xl: 24px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --radius-sm: 12px;
     }
     body {
       background:
-        radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 26%),
-        radial-gradient(circle at top right, rgba(37, 99, 235, 0.16), transparent 22%),
-        radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.08), transparent 30%),
-        linear-gradient(180deg, #07111f 0%, #0a1323 42%, #0f172a 100%);
-      color: #e5eef9;
+        radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 26%),
+        radial-gradient(circle at top right, rgba(14, 165, 233, 0.08), transparent 22%),
+        linear-gradient(180deg, #f8fbff 0%, var(--bg) 46%, var(--bg-deep) 100%);
+      color: var(--ink);
     }
     body::before {
       background-image:
-        linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
-      mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 90%);
+        linear-gradient(rgba(148, 163, 184, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.03) 1px, transparent 1px);
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.35), transparent 90%);
     }
     .wrap {
-      max-width: 1680px;
-      padding: 28px 28px 48px;
+      max-width: 1660px;
+      padding: 20px 20px 34px;
     }
     .hero {
+      margin-bottom: 16px;
+      padding: 22px 24px;
       background:
-        radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 34%),
-        linear-gradient(135deg, rgba(9, 18, 33, 0.94), rgba(15, 23, 42, 0.88));
-      border: 1px solid rgba(148, 163, 184, 0.16);
-      box-shadow: 0 30px 80px rgba(2, 8, 23, 0.34);
-      backdrop-filter: blur(24px);
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.12), transparent 28%),
+        linear-gradient(135deg, rgba(255,255,255,0.98), rgba(247,250,253,0.95));
+      border: 1px solid rgba(203, 213, 225, 0.78);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
     }
     .hero::after {
-      right: -20px;
-      top: -20px;
-      width: 260px;
-      height: 260px;
-      background: radial-gradient(circle, rgba(59,130,246,0.24), transparent 70%);
+      right: -30px;
+      top: -30px;
+      width: 220px;
+      height: 220px;
+      background: radial-gradient(circle, rgba(37,99,235,0.12), transparent 70%);
     }
     .eyebrow {
-      background: rgba(56, 189, 248, 0.14);
-      color: #7dd3fc;
-      border: 1px solid rgba(56, 189, 248, 0.18);
+      background: rgba(37, 99, 235, 0.08);
+      color: #1d4ed8;
+      border: 1px solid rgba(37, 99, 235, 0.12);
     }
     .hero h1 {
-      color: #f8fbff;
-      font-size: 48px;
-      line-height: 0.95;
+      color: var(--ink);
+      font-size: 38px;
+      line-height: 1;
     }
     .hero p,
     .hero-side-copy,
-    .section-title p {
-      color: rgba(219, 234, 254, 0.72);
+    .section-title p,
+    .panel-copy,
+    .control-copy {
+      color: var(--muted);
+      font-size: 13.5px;
+      line-height: 1.6;
     }
     .hero-chip {
-      background: rgba(15, 23, 42, 0.4);
-      border-color: rgba(148, 163, 184, 0.18);
-      color: rgba(226, 232, 240, 0.86);
+      background: rgba(255, 255, 255, 0.9);
+      border-color: rgba(148, 163, 184, 0.16);
+      color: var(--muted);
       box-shadow: none;
     }
     .hero-chip strong {
-      color: #ffffff;
+      color: var(--ink);
     }
     .hero-side {
-      background:
-        linear-gradient(180deg, rgba(15, 23, 42, 0.76), rgba(15, 23, 42, 0.54));
-      border-color: rgba(148, 163, 184, 0.16);
+      background: linear-gradient(180deg, rgba(249,251,255,0.98), rgba(244,248,252,0.94));
+      border-color: rgba(203, 213, 225, 0.72);
       box-shadow: none;
+      min-width: 300px;
+      max-width: 340px;
     }
     .hero-side-label {
-      color: #93c5fd;
+      color: #2563eb;
     }
     .hero-side-title {
-      color: #f8fbff;
+      color: var(--ink);
+      font-size: 24px;
     }
     .dashboard-shell {
       display: grid;
-      grid-template-columns: 390px minmax(0, 1fr);
-      gap: 24px;
+      grid-template-columns: 370px minmax(0, 1fr);
+      gap: 16px;
       align-items: start;
     }
     .sidebar-stack {
       display: grid;
-      align-content: start;
-      gap: 20px;
+      gap: 14px;
       position: sticky;
-      top: 24px;
+      top: 22px;
     }
     .main-stack {
       min-width: 0;
       display: grid;
-      gap: 20px;
+      gap: 16px;
     }
     .sidebar-stack .control-panel {
       grid-template-columns: 1fr;
-      padding: 22px;
+      padding: 18px;
       margin-bottom: 0;
-      background:
-        linear-gradient(180deg, rgba(15, 23, 42, 0.86), rgba(15, 23, 42, 0.78)),
-        radial-gradient(circle at top right, rgba(37,99,235,0.20), transparent 34%);
-      border-color: rgba(148, 163, 184, 0.15);
-      box-shadow: 0 26px 60px rgba(2, 8, 23, 0.28);
+      background: linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
+      border-color: rgba(203, 213, 225, 0.72);
+      box-shadow: var(--shadow);
     }
     .sidebar-stack .control-title,
     .sidebar-stack .launch-value,
-    .sidebar-stack .helper strong {
-      color: #f8fbff;
+    .sidebar-stack .helper strong,
+    .sidebar-stack .launch-message {
+      color: var(--ink);
     }
     .sidebar-stack .control-copy,
     .sidebar-stack .helper,
-    .sidebar-stack .launch-message,
     .sidebar-stack .launch-label,
     .sidebar-stack .form-label,
     .sidebar-stack .meta-chip {
-      color: rgba(226, 232, 240, 0.72);
+      color: var(--muted);
     }
     .sidebar-stack .meta-chip,
     .sidebar-stack .launch-item,
     .sidebar-stack .launch-box {
-      background: rgba(15, 23, 42, 0.38);
-      border-color: rgba(148, 163, 184, 0.14);
+      background: rgba(248, 250, 253, 0.98);
+      border-color: rgba(203, 213, 225, 0.72);
       box-shadow: none;
     }
     .sidebar-stack .text-input,
     .sidebar-stack .input-area {
-      background: rgba(15, 23, 42, 0.46);
-      color: #f8fbff;
-      border-color: rgba(148, 163, 184, 0.18);
+      background: #ffffff;
+      color: var(--ink);
+      border-color: rgba(148, 163, 184, 0.24);
     }
     .sidebar-stack .text-input::placeholder,
     .sidebar-stack .input-area::placeholder {
-      color: rgba(148, 163, 184, 0.82);
+      color: #94a3b8;
     }
     .sidebar-stack .text-input:focus,
     .sidebar-stack .input-area:focus {
-      border-color: rgba(56, 189, 248, 0.42);
-      box-shadow: 0 0 0 5px rgba(56, 189, 248, 0.12);
+      border-color: rgba(37, 99, 235, 0.34);
+      box-shadow: 0 0 0 5px rgba(37, 99, 235, 0.10);
     }
     .sidebar-stack .launch-message {
-      background: rgba(255,255,255,0.06);
+      background: rgba(255,255,255,0.92);
+    }
+    .helper {
+      font-size: 12.5px;
+      line-height: 1.65;
+      color: var(--muted);
+    }
+    .launch-box {
+      gap: 10px;
+    }
+    .launch-item {
+      padding: 11px 13px;
+    }
+    .launch-value {
+      font-size: 14px;
+      line-height: 1.45;
     }
     .primary-button {
-      border-radius: 14px;
-      padding: 13px 16px;
-      box-shadow: 0 14px 28px rgba(2, 8, 23, 0.22);
+      border-radius: 12px;
+      padding: 12px 15px;
+      box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18);
     }
     .primary-button:hover:not(:disabled) {
-      transform: translateY(-2px);
+      transform: translateY(-1px);
     }
     .section-title h2 {
-      color: #f8fbff;
-      font-size: 19px;
+      color: var(--ink);
+      font-size: 18px;
+    }
+    .section-title p {
+      margin-top: 2px;
+      font-size: 12.5px;
+      color: #64748b;
     }
     .section-pill {
-      background: rgba(255,255,255,0.08);
-      color: #cbd5e1;
-      border-color: rgba(148, 163, 184, 0.14);
+      background: rgba(255,255,255,0.86);
+      color: var(--muted);
+      border-color: rgba(148, 163, 184, 0.16);
     }
     .grid {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 18px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      grid-auto-flow: dense;
     }
     .card,
-    .panel {
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.98), rgba(245,248,252,0.95));
-      border-color: rgba(203, 213, 225, 0.72);
+    .panel,
+    .log-card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
+      border-color: rgba(203, 213, 225, 0.74);
       box-shadow: var(--shadow-soft);
+    }
+    .card {
+      padding: 16px;
+      min-height: 124px;
     }
     .card-featured {
       grid-column: span 2;
       background:
-        radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 34%),
-        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 34%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
     }
     .card-progress {
       background:
-        radial-gradient(circle at top right, rgba(16, 185, 129, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+        radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 36%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
     }
     .card-queue {
+      grid-column: span 2;
       background:
-        radial-gradient(circle at top right, rgba(245, 158, 11, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+        radial-gradient(circle at top right, rgba(245, 158, 11, 0.10), transparent 36%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
     }
-    .label {
-      color: #64748b;
+    .label,
+    .mini-title,
+    .table th {
+      color: #5b6d82;
     }
     .value {
-      font-size: 32px;
-      line-height: 1.05;
+      color: var(--ink);
+      font-size: 28px;
+      line-height: 1.08;
+    }
+    .subvalue,
+    .mini-copy,
+    .table td,
+    .empty {
+      color: var(--muted);
     }
     .subvalue {
-      color: #6b7d92;
+      font-size: 13.5px;
+      line-height: 1.55;
     }
     .main-grid {
-      grid-template-columns: minmax(0, 1.48fr) minmax(340px, 0.92fr);
-      gap: 18px;
+      grid-template-columns: minmax(0, 1.52fr) minmax(340px, 0.92fr);
+      gap: 14px;
     }
     .panel-head {
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.92), rgba(247,250,253,0.86));
+      background: linear-gradient(180deg, rgba(255,255,255,0.94), rgba(248,250,253,0.92));
+      border-bottom-color: rgba(148,163,184,0.12);
     }
     .panel-title {
-      font-size: 22px;
+      font-size: 20px;
+      color: var(--ink);
+    }
+    .panel-copy {
+      font-size: 12.5px;
+      line-height: 1.55;
     }
     .chart-wrap,
     .mini-card,
-    .scroll-panel {
-      background: linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    .scroll-panel,
+    .log-card {
+      background: linear-gradient(180deg, rgba(249,251,254,0.98), rgba(244,248,252,0.95));
+    }
+    .chart-wrap {
+      border-color: rgba(148,163,184,0.12);
     }
     .mini-card {
-      border-radius: 20px;
+      border-radius: 16px;
     }
-    .panel.analytics-primary .chart-wrap:first-of-type {
-      background:
-        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 34%),
-        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
-    }
-    .panel.analytics-primary .chart-wrap:last-of-type {
-      background:
-        radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 34%),
-        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    .legend {
+      color: #5b6d82;
+      font-weight: 700;
     }
     .log-grid {
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 20px;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
     }
-    .log-card {
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.96), rgba(245,248,252,0.92));
+    .log-card-head {
+      background: rgba(255,255,255,0.92);
+    }
+    .log-card-title {
+      color: var(--ink);
+    }
+    .log-card-copy {
+      color: var(--muted);
     }
     .log-pre {
       min-height: 280px;
-      color: #d7e4ff;
+      color: #edf4ff;
+      font-size: 12.5px;
+      line-height: 1.72;
       background:
-        radial-gradient(circle at top right, rgba(59,130,246,0.14), transparent 30%),
-        linear-gradient(180deg, #08111f 0%, #0f172a 100%);
+        radial-gradient(circle at top right, rgba(59,130,246,0.12), transparent 30%),
+        linear-gradient(180deg, #0f172a 0%, #111827 100%);
     }
-    @media (max-width: 1380px) {
+    @media (max-width: 1480px) {
+      .dashboard-shell {
+        grid-template-columns: 380px minmax(0, 1fr);
+      }
+      .grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .card-featured,
+      .card-queue {
+        grid-column: span 2;
+      }
+    }
+    @media (max-width: 1260px) {
       .dashboard-shell {
         grid-template-columns: 1fr;
       }
@@ -1617,16 +1683,14 @@ def create_app(config_path: Path) -> FastAPI:
         position: static;
       }
       .sidebar-stack .control-panel {
-        grid-template-columns: 1.1fr 0.9fr;
+        grid-template-columns: 1.15fr 0.85fr;
       }
       .grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
-      .card-featured {
-        grid-column: span 1;
-      }
     }
     @media (max-width: 860px) {
+      .hero,
       .sidebar-stack .control-panel,
       .main-grid,
       .log-grid,
@@ -1634,8 +1698,18 @@ def create_app(config_path: Path) -> FastAPI:
       .two-col {
         grid-template-columns: 1fr;
       }
+      .hero {
+        flex-direction: column;
+      }
+      .hero-side {
+        max-width: none;
+      }
+      .card-featured,
+      .card-queue {
+        grid-column: span 1;
+      }
       .value {
-        font-size: 28px;
+        font-size: 27px;
       }
     }
   </style>
@@ -1644,19 +1718,19 @@ def create_app(config_path: Path) -> FastAPI:
   <div class="wrap">
     <section class="hero">
       <div class="hero-copy">
-        <div class="eyebrow">AI Monitoring Workspace</div>
-        <h1>행동 학습 진행 대시보드</h1>
-        <p>AIHub 분할 ZIP의 filekey를 여러 개 넣고, 하나가 끝나면 다음 작업이 자동으로 이어지도록 순차 학습 큐를 운영합니다. 다운로드, 병합, 압축 해제, pose 전처리, 누적 학습 흐름을 한 화면에서 정리해서 볼 수 있습니다.</p>
+        <div class="eyebrow">Training Queue</div>
+        <h1>detectWarning Training Dashboard</h1>
+        <p>현재 학습 상태, 큐 진행률, 최신 성능을 한 화면에서 확인합니다.</p>
         <div class="hero-meta">
-          <div class="hero-chip"><strong>큐 기반</strong> 여러 filekey를 순차 처리</div>
-          <div class="hero-chip"><strong>누적 학습</strong> prepared 데이터와 모델 유지</div>
-          <div class="hero-chip"><strong>원격 확인</strong> Tailscale로 노트북에서 모니터링</div>
+          <div class="hero-chip"><strong>순차 큐</strong> filekey 자동 처리</div>
+          <div class="hero-chip"><strong>누적 학습</strong> prepared 데이터 유지</div>
+          <div class="hero-chip"><strong>원격 확인</strong> 실시간 상태 공유</div>
         </div>
       </div>
       <aside class="hero-side">
         <div class="hero-side-label">Live Status</div>
-        <div class="hero-side-title">현재 학습 파이프라인 상태를 한눈에</div>
-        <div class="hero-side-copy">현재 단계, filekey 진행률, ETA, 성능 지표와 오류 로그까지 발표 화면처럼 정돈된 형태로 확인할 수 있습니다.</div>
+        <div class="hero-side-title">현재 파이프라인 상태</div>
+        <div class="hero-side-copy">진행률, ETA, 성능, 오류 로그를 바로 확인합니다.</div>
         <div id="pipelineState" class="status-pill tone-neutral">상태 확인 중</div>
       </aside>
     </section>
@@ -1665,11 +1739,8 @@ def create_app(config_path: Path) -> FastAPI:
     <aside class="sidebar-stack">
     <section class="card control-panel">
       <div>
-        <h2 class="control-title">AIHub filekey 순차 학습 큐</h2>
-        <div class="control-copy">
-          여러 개의 분할 ZIP 파일 키를 쉼표 또는 줄바꿈으로 넣으면 됩니다.
-          대시보드가 한 번에 하나씩 작업을 꺼내서, 다운로드와 압축 해제, pose 전처리, 학습까지 순서대로 처리합니다.
-        </div>
+        <h2 class="control-title">학습 큐</h2>
+        <div class="control-copy">datasetkey와 filekey를 넣으면 다운로드, 전처리, 학습이 순차로 이어집니다.</div>
         <div class="meta-row">
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
           <div class="meta-chip">workspace <span id="workspaceChip">-</span></div>
@@ -1681,11 +1752,11 @@ def create_app(config_path: Path) -> FastAPI:
         <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
         <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
         <div class="control-actions">
-          <button id="startButton" class="primary-button" type="button">대기열에 추가</button>
-          <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">다음 큐 자동 시작 중지</button>
-          <button id="forceStopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 14px 28px rgba(239, 68, 68, 0.22);">현재 작업 강제 중단</button>
+          <button id="startButton" class="primary-button" type="button">큐 시작 / 추가</button>
+          <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">현재 작업 후 중지</button>
+          <button id="forceStopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 14px 28px rgba(239, 68, 68, 0.22);">지금 중단</button>
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
-          <div class="helper">datasetkey는 AIHub 데이터셋 키이고, filekey는 분할 ZIP 목록의 key 값입니다. 현재 실행 중이어도 새 filekey를 추가하면 자동으로 다음 순서에 이어서 학습합니다.</div>
+          <div class="helper">datasetkey는 데이터셋 키, filekey는 분할 ZIP key입니다.</div>
         </div>
       </div>
       <div class="launch-box">
@@ -1717,7 +1788,7 @@ def create_app(config_path: Path) -> FastAPI:
           <div class="launch-label">실행 로그</div>
           <div class="launch-value mono" id="launcherLogPath">-</div>
         </div>
-        <div id="launchMessage" class="launch-message">여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.</div>
+        <div id="launchMessage" class="launch-message">최근 실행 메시지가 여기에 표시됩니다.</div>
       </div>
     </section>
     </aside>
@@ -1726,7 +1797,7 @@ def create_app(config_path: Path) -> FastAPI:
     <div class="section-title">
       <div>
         <h2>실행 현황</h2>
-        <p>현재 작업 상태와 핵심 지표를 빠르게 확인하는 영역입니다.</p>
+        <p>핵심 상태</p>
       </div>
       <div class="section-pill">Overview</div>
     </div>
@@ -1773,7 +1844,7 @@ def create_app(config_path: Path) -> FastAPI:
     <div class="section-title">
       <div>
         <h2>학습 분석</h2>
-        <p>성능 곡선, 데이터셋 구성, 현재 filekey 세부 상태를 함께 확인합니다.</p>
+        <p>성능과 데이터</p>
       </div>
       <div class="section-pill">Analytics</div>
     </div>
@@ -1782,7 +1853,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">학습 성능 그래프</h2>
-            <div class="panel-copy">validation accuracy, macro F1, loss 변화를 함께 봅니다.</div>
+            <div class="panel-copy">성능과 loss 추이</div>
           </div>
         </div>
         <div class="panel-body">
@@ -1829,7 +1900,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">데이터셋 요약</h2>
-            <div class="panel-copy">split별 샘플 수와 클래스 분포를 확인합니다.</div>
+            <div class="panel-copy">split과 클래스 분포</div>
           </div>
         </div>
         <div class="panel-body">
@@ -1851,7 +1922,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">현재 filekey 세부 진행</h2>
-            <div class="panel-copy">현재 job이 어느 단계에서 얼마나 진행됐는지와 누적 학습 상태를 확인합니다.</div>
+            <div class="panel-copy">현재 작업 진행 상태</div>
           </div>
         </div>
         <div class="panel-body">
@@ -1879,7 +1950,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">클래스별 검증 지표</h2>
-            <div class="panel-copy">최종 validation 기준 precision, recall, F1을 클래스별로 보여줍니다.</div>
+            <div class="panel-copy">precision / recall / F1</div>
           </div>
         </div>
         <div class="panel-body">
@@ -1902,7 +1973,7 @@ def create_app(config_path: Path) -> FastAPI:
     <div class="section-title">
       <div>
         <h2>작업 로그</h2>
-        <p>완료 이력과 현재 로그, 최근 오류 로그를 한 번에 확인합니다.</p>
+        <p>이력과 로그</p>
       </div>
       <div class="section-pill">Logs</div>
     </div>
@@ -1910,7 +1981,7 @@ def create_app(config_path: Path) -> FastAPI:
       <div class="panel-head">
         <div>
           <h2 class="panel-title">완료 데이터 로그</h2>
-          <div class="panel-copy">지금까지 처리된 filekey별 결과와 생성된 데이터 수를 확인합니다.</div>
+          <div class="panel-copy">최근 처리 결과</div>
         </div>
       </div>
       <div class="panel-body">
@@ -1941,14 +2012,14 @@ def create_app(config_path: Path) -> FastAPI:
       <article class="log-card">
         <div class="log-card-head">
           <h3 class="log-card-title">현재 작업 로그</h3>
-          <div class="log-card-copy" id="currentLogMeta">실행 중인 작업이 없으면 가장 최근 로그를 표시합니다.</div>
+          <div class="log-card-copy" id="currentLogMeta">현재 로그 또는 최근 로그</div>
         </div>
         <pre id="currentLogText" class="log-pre">로그를 불러오는 중입니다.</pre>
       </article>
       <article class="log-card">
         <div class="log-card-head">
           <h3 class="log-card-title">최근 오류 로그</h3>
-          <div class="log-card-copy" id="errorLogMeta">최근 실패 작업이 있으면 마지막 로그를 표시합니다.</div>
+          <div class="log-card-copy" id="errorLogMeta">최근 실패 로그</div>
         </div>
         <pre id="errorLogText" class="log-pre">오류 로그가 아직 없습니다.</pre>
       </article>
@@ -2037,21 +2108,21 @@ def create_app(config_path: Path) -> FastAPI:
       const pendingCount = (launcher?.pending_jobs || []).length;
 
       if (!autoStartEnabled && (hasCurrentJob || pendingCount > 0)) {
-        startButton.textContent = hasCurrentJob ? '자동 시작 재개' : '대기열 시작';
+        startButton.textContent = hasCurrentJob ? '큐 재개' : '대기열 시작';
       } else {
-        startButton.textContent = '대기열에 추가';
+        startButton.textContent = '큐 시작 / 추가';
       }
 
       if (hasCurrentJob || pendingCount > 0) {
         stopButton.disabled = !autoStartEnabled;
-        stopButton.textContent = autoStartEnabled ? '다음 큐 자동 시작 중지' : '자동 시작 중지됨';
+        stopButton.textContent = autoStartEnabled ? '현재 작업 후 중지' : '중지 예약됨';
       } else {
         stopButton.disabled = true;
-        stopButton.textContent = '다음 큐 자동 시작 중지';
+        stopButton.textContent = '현재 작업 후 중지';
       }
 
       forceStopButton.disabled = !hasCurrentJob;
-      forceStopButton.textContent = hasCurrentJob ? '현재 작업 강제 중단' : '현재 작업 강제 중단';
+      forceStopButton.textContent = '지금 중단';
     }
 
     function loadSavedApiKey() {

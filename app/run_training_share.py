@@ -13,6 +13,10 @@ from pathlib import Path
 
 
 URL_PATTERN = re.compile(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+LIVE_URL_PATTERNS = (
+    re.compile(r"^https://[A-Za-z0-9-]+\.trycloudflare\.com/?$"),
+    re.compile(r"^https://[A-Za-z0-9.-]+\.workers\.dev/?$"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,9 +122,12 @@ def start_tunnel(cloudflared_cmd: str, tunnel_url: str) -> tuple[subprocess.Pope
             time.sleep(0.1)
             continue
         lines.append(line)
-        match = URL_PATTERN.search(line)
-        if match and ("trycloudflare.com" in match.group(0) or ".workers.dev" in match.group(0) or ".cloudflare" in match.group(0)):
-            live_url = match.group(0).rstrip(")")
+        for match in URL_PATTERN.finditer(line):
+            candidate = match.group(0).rstrip(")")
+            if any(pattern.match(candidate) for pattern in LIVE_URL_PATTERNS):
+                live_url = candidate
+                break
+        if live_url:
             break
 
     if not live_url:
