@@ -82,14 +82,14 @@
     "cleanup_raw_after_job": true
   },
   "pages_sync": {
-    "enabled": false,
-    "pages_dir": "",
+    "enabled": true,
+    "pages_dir": "C:/Users/Administrator/Documents/GitHub/detectWarning-pages",
     "project_name": "detectWarning",
     "report_title": "행동 학습 결과 리포트",
     "live_url": "",
     "live_url_env": "DETECTWARNING_LIVE_URL",
     "redirect_delay_seconds": 3,
-    "git_auto_push": false,
+    "git_auto_push": true,
     "git_commit_prefix": "Update dashboard"
   }
 }
