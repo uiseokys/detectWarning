@@ -210,6 +210,14 @@ def main() -> None:
 
         stream_process("cloudflared", tunnel_process)
         stream_process("dashboard", dashboard_process)
+        print(f"[launcher] dashboard pid = {dashboard_process.pid}")
+        time.sleep(2.0)
+        if dashboard_process.poll() is not None:
+            cleanup()
+            raise RuntimeError(
+                "training_dashboard가 바로 종료되었습니다. "
+                "위의 [dashboard] 로그를 확인해 주세요."
+            )
 
         def handle_signal(signum, _frame):
             print(f"[launcher] signal {signum} 수신, 종료합니다...")
