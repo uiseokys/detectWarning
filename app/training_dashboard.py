@@ -1077,18 +1077,6 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--muted);
       white-space: pre-line;
     }
-    .readonly-banner {
-      display: none;
-      margin-top: 12px;
-      padding: 10px 12px;
-      border-radius: 14px;
-      background: rgba(37, 99, 235, 0.08);
-      border: 1px solid rgba(37, 99, 235, 0.14);
-      color: #1d4ed8;
-      font-size: 12.5px;
-      font-weight: 700;
-      line-height: 1.55;
-    }
     .grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1582,15 +1570,28 @@ def create_app(config_path: Path) -> FastAPI:
       color: #7c8aa0;
       cursor: not-allowed;
     }
+    .viewer-mode .queue-editor,
+    .viewer-mode .control-actions {
+      display: none !important;
+    }
+    .viewer-mode {
+      padding: 16px;
+    }
+    .viewer-mode .launch-box {
+      padding: 0;
+      background: transparent;
+      border: none;
+      gap: 8px;
+    }
+    .viewer-mode .launch-item {
+      background: rgba(248, 250, 253, 0.98);
+    }
     .viewer-mode .primary-button {
       opacity: 0.55;
       box-shadow: none !important;
       cursor: not-allowed;
       pointer-events: none;
       filter: grayscale(0.08);
-    }
-    .viewer-mode .readonly-banner {
-      display: block;
     }
     .helper {
       font-size: 12.5px;
@@ -1812,18 +1813,20 @@ def create_app(config_path: Path) -> FastAPI:
     <aside class="sidebar-stack">
     <section id="controlPanel" class="card control-panel">
       <div>
-        <h2 class="control-title">학습 큐</h2>
-        <div class="control-copy">datasetkey와 filekey를 넣으면 다운로드, 전처리, 학습이 순차로 이어집니다.</div>
+        <h2 id="controlTitle" class="control-title">학습 큐</h2>
+        <div id="controlCopy" class="control-copy">datasetkey와 filekey를 넣으면 다운로드, 전처리, 학습이 순차로 이어집니다.</div>
         <div class="meta-row">
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
           <div class="meta-chip">workspace <span id="workspaceChip">-</span></div>
         </div>
-        <label class="form-label" for="datasetKeyInput">AIHub datasetkey</label>
-        <input id="datasetKeyInput" class="text-input" type="text" placeholder="예: 12345" />
-        <label class="form-label" for="apiKeyInput">AIHub API 키</label>
-        <input id="apiKeyInput" class="text-input" type="password" placeholder="AIHub API 키를 입력하세요" />
-        <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
-        <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
+        <div class="queue-editor">
+          <label class="form-label" for="datasetKeyInput">AIHub datasetkey</label>
+          <input id="datasetKeyInput" class="text-input" type="text" placeholder="예: 12345" />
+          <label class="form-label" for="apiKeyInput">AIHub API 키</label>
+          <input id="apiKeyInput" class="text-input" type="password" placeholder="AIHub API 키를 입력하세요" />
+          <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
+          <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
+        </div>
         <div class="control-actions">
           <button id="startButton" class="primary-button" type="button">큐 시작 / 추가</button>
           <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">현재 작업 후 중지</button>
@@ -1831,7 +1834,6 @@ def create_app(config_path: Path) -> FastAPI:
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
           <div class="helper">datasetkey는 데이터셋 키, filekey는 분할 ZIP key입니다.</div>
         </div>
-        <div id="readonlyBanner" class="readonly-banner">공유용 읽기 전용 화면입니다. 팀원은 현재 상태와 결과만 확인할 수 있습니다.</div>
       </div>
       <div class="launch-box">
         <div class="launch-item">
@@ -2176,6 +2178,14 @@ def create_app(config_path: Path) -> FastAPI:
       if (panel) {
         panel.classList.add('viewer-mode');
       }
+      const title = document.getElementById('controlTitle');
+      const copy = document.getElementById('controlCopy');
+      if (title) {
+        title.textContent = '실행 상태';
+      }
+      if (copy) {
+        copy.textContent = '현재 작업, 대기열, 최근 완료 상태를 확인합니다.';
+      }
 
       [
         'datasetKeyInput',
@@ -2195,7 +2205,6 @@ def create_app(config_path: Path) -> FastAPI:
         }
       });
 
-      setLaunchMessage('읽기 전용 공유 화면입니다. 조작은 데스크탑 관리자 화면에서만 가능합니다.', false);
     }
 
     function setLaunchMessage(message, isError) {
