@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from action_training_pipeline import load_config, resolve_paths
+from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -189,9 +192,38 @@ def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> 
     return "error", f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
 
 
+def resolve_pages_sync_config(config: dict, base_dir: Path) -> dict:
+    raw = config.get("pages_sync") or {}
+    pages_dir_raw = str(raw.get("pages_dir") or "").strip()
+    live_url = str(raw.get("live_url") or "").strip()
+    live_url_env = str(raw.get("live_url_env") or "").strip()
+    if not live_url and live_url_env:
+        live_url = str(os.getenv(live_url_env, "")).strip()
+
+    pages_dir = None
+    if pages_dir_raw:
+        candidate = Path(pages_dir_raw)
+        if not candidate.is_absolute():
+            candidate = (base_dir / candidate).resolve()
+        pages_dir = candidate
+
+    enabled = bool(raw.get("enabled")) and pages_dir is not None
+    return {
+        "enabled": enabled,
+        "pages_dir": pages_dir,
+        "project_name": str(raw.get("project_name") or "detectWarning"),
+        "report_title": str(raw.get("report_title") or "행동 학습 결과 리포트"),
+        "live_url": live_url,
+        "redirect_delay_seconds": int(raw.get("redirect_delay_seconds") or 3),
+        "git_auto_push": bool(raw.get("git_auto_push", False)),
+        "git_commit_prefix": str(raw.get("git_commit_prefix") or "Update dashboard"),
+    }
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
+    pages_sync = resolve_pages_sync_config(config, config_path.parent)
     project_root = Path(__file__).resolve().parent.parent
     pipeline_script = Path(__file__).resolve().with_name("action_training_pipeline.py")
     job_logs_dir = paths["workspace_dir"] / "job_logs"
@@ -226,6 +258,79 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["completed_jobs"] = completed_jobs
         except (OSError, json.JSONDecodeError):
             launcher_state["completed_jobs"] = []
+
+    def push_pages_repo(*relative_paths: str, reason: str) -> None:
+        if not pages_sync["enabled"] or not pages_sync.get("git_auto_push") or pages_sync["pages_dir"] is None:
+            return
+        pages_dir = Path(pages_sync["pages_dir"])
+        if not (pages_dir / ".git").exists():
+            return
+        existing_targets = [path for path in relative_paths if (pages_dir / path).exists()]
+        if not existing_targets:
+            return
+        try:
+            subprocess.run(
+                ["git", "-C", str(pages_dir), "add", *existing_targets],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            status = subprocess.run(
+                ["git", "-C", str(pages_dir), "status", "--porcelain", "--", *existing_targets],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not status.stdout.strip():
+                return
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            commit_message = f"{pages_sync['git_commit_prefix']} ({reason}) {timestamp}"
+            subprocess.run(
+                ["git", "-C", str(pages_dir), "commit", "-m", commit_message],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(pages_dir), "push"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"[pages-sync] 자동 push 실패: {exc}")
+
+    def sync_pages_report() -> None:
+        if not pages_sync["enabled"] or pages_sync["pages_dir"] is None:
+            return
+        payload = build_latest_result_payload(
+            paths,
+            project_name=str(pages_sync["project_name"]),
+            report_title=str(pages_sync["report_title"]),
+        )
+        write_json(Path(pages_sync["pages_dir"]) / "latest-result.json", payload)
+        push_pages_repo("latest-result.json", reason="report")
+
+    def sync_pages_live(status: str) -> None:
+        if not pages_sync["enabled"] or pages_sync["pages_dir"] is None:
+            return
+        live_url = str(pages_sync.get("live_url") or "")
+        if status == "online" and not live_url:
+            status = "offline"
+        message = (
+            "실시간 대시보드를 사용할 수 있습니다."
+            if status == "online"
+            else "현재 실시간 학습 대시보드가 꺼져 있습니다. 최신 결과 리포트를 표시합니다."
+        )
+        payload = build_live_status_payload(
+            pages_dir=Path(pages_sync["pages_dir"]),
+            status=status,
+            live_url=live_url if status == "online" else "",
+            message=message,
+            redirect_delay_seconds=int(pages_sync.get("redirect_delay_seconds") or 3),
+        )
+        write_json(Path(pages_sync["pages_dir"]) / "live-status.json", payload)
+        push_pages_repo("live-status.json", reason=f"live-{status}")
 
     def current_timestamp() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat()
@@ -333,6 +438,7 @@ def create_app(config_path: Path) -> FastAPI:
             stage_progress=0.0,
         )
         persist_launcher_history()
+        sync_pages_report()
 
     def snapshot_job(job: dict | None) -> dict | None:
         if not job:
@@ -445,6 +551,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_message"] = (
             f"datasetkey {job.get('datasetkey', '-')} | filekey {job['filekey']} 학습을 진행 중입니다."
         )
+        sync_pages_live("online")
 
     def update_process_state() -> None:
         process = launcher_state.get("process")
@@ -480,6 +587,7 @@ def create_app(config_path: Path) -> FastAPI:
                         completed_jobs.insert(0, snapshot_job(current_job))
                         del completed_jobs[30:]
                     persist_launcher_history()
+                    sync_pages_report()
                 launcher_state["process"] = None
                 launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
@@ -532,6 +640,10 @@ def create_app(config_path: Path) -> FastAPI:
             "last_exit_code": launcher_state.get("last_exit_code"),
             "log_path": str(launcher_state["log_path"]) if launcher_state.get("log_path") else None,
         }
+
+    sync_pages_report()
+    sync_pages_live("online")
+    atexit.register(lambda: sync_pages_live("offline"))
 
     worker = threading.Thread(target=queue_worker, daemon=True)
     worker.start()

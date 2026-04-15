@@ -1,0 +1,11 @@
+{
+  "status": "offline",
+  "project_name": "detectWarning Training Dashboard",
+  "live_title": "실시간 학습 대시보드 사용 가능",
+  "offline_title": "결과 리포트 표시 중",
+  "live_url": "",
+  "report_url": "/",
+  "redirect_delay_seconds": 3,
+  "updated_at": "2026-04-15T10:00:00+09:00",
+  "message": "현재 실시간 학습 대시보드가 꺼져 있습니다. 마지막으로 저장된 결과 리포트를 표시합니다."
+}

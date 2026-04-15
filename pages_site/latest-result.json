@@ -1,0 +1,128 @@
+{
+  "project_name": "detectWarning",
+  "report_title": "행동 학습 결과 리포트",
+  "updated_at": "2026-04-15T10:00:00+09:00",
+  "summary": {
+    "current_state": "offline",
+    "latest_datasetkey": "171",
+    "latest_filekey": "49841",
+    "latest_job_state": "completed_warning",
+    "train_samples": 25,
+    "val_samples": 5,
+    "test_samples": 7,
+    "best_epoch": 8,
+    "best_val_macro_f1": 0.8142,
+    "final_accuracy": 0.8571,
+    "final_macro_f1": 0.8021,
+    "resumed_from_checkpoint": true
+  },
+  "latest_job": {
+    "datasetkey": "171",
+    "filekey": "49841",
+    "state": "completed_warning",
+    "started_at": "2026-04-14T21:02:54+09:00",
+    "finished_at": "2026-04-14T22:00:20+09:00",
+    "duration_minutes": 57,
+    "message": "학습 산출물은 정상 저장되었고 종료 단계에서만 경고 종료가 발생했습니다. 현재 결과는 공유 및 후속 누적 학습에 그대로 사용할 수 있습니다."
+  },
+  "artifacts": {
+    "best_model": "artifacts/best_action_model.pt",
+    "metrics": "artifacts/metrics.json",
+    "labels": "artifacts/labels.json"
+  },
+  "labels": [
+    "normal",
+    "violence",
+    "collapse",
+    "abduction"
+  ],
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 1.184,
+      "val_loss": 0.982,
+      "val_accuracy": 0.600,
+      "val_macro_f1": 0.541
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.918,
+      "val_loss": 0.841,
+      "val_accuracy": 0.600,
+      "val_macro_f1": 0.596
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.782,
+      "val_loss": 0.733,
+      "val_accuracy": 0.714,
+      "val_macro_f1": 0.671
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.661,
+      "val_loss": 0.648,
+      "val_accuracy": 0.714,
+      "val_macro_f1": 0.701
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.574,
+      "val_loss": 0.604,
+      "val_accuracy": 0.857,
+      "val_macro_f1": 0.781
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.511,
+      "val_loss": 0.572,
+      "val_accuracy": 0.857,
+      "val_macro_f1": 0.792
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.474,
+      "val_loss": 0.558,
+      "val_accuracy": 0.857,
+      "val_macro_f1": 0.799
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.438,
+      "val_loss": 0.541,
+      "val_accuracy": 0.857,
+      "val_macro_f1": 0.814
+    }
+  ],
+  "per_class": [
+    {
+      "label": "normal",
+      "precision": 0.880,
+      "recall": 0.900,
+      "f1": 0.890
+    },
+    {
+      "label": "violence",
+      "precision": 0.820,
+      "recall": 0.800,
+      "f1": 0.810
+    },
+    {
+      "label": "collapse",
+      "precision": 0.750,
+      "recall": 0.750,
+      "f1": 0.750
+    },
+    {
+      "label": "abduction",
+      "precision": 0.760,
+      "recall": 0.730,
+      "f1": 0.740
+    }
+  ],
+  "notes": [
+    "팀원은 이 Pages 주소만 열면 됩니다. live-status.json이 online으로 바뀌면 자동으로 실시간 대시보드로 이동합니다.",
+    "completed_warning은 학습 산출물 저장까지 완료되었지만 종료 단계에서만 경고 코드가 남은 상태를 뜻합니다.",
+    "이 JSON은 학습 종료 후 detectWarning 쪽 exporter가 자동으로 덮어쓰는 파일로 쓰는 것을 권장합니다."
+  ]
+}

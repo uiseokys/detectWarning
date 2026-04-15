@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>detectWarning Dashboard</title>
+  <style>
+    :root {
+      --bg: #07111d;
+      --bg-deep: #0b1627;
+      --text: #0f172a;
+      --muted: #66758b;
+      --line: rgba(148, 163, 184, 0.18);
+      --card: rgba(255, 255, 255, 0.96);
+      --card-soft: rgba(247, 250, 252, 0.92);
+      --card-dark: rgba(10, 20, 36, 0.64);
+      --accent: #38bdf8;
+      --accent-strong: #2563eb;
+      --good: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --radius-xl: 26px;
+      --radius-lg: 22px;
+      --radius-md: 18px;
+      --radius-sm: 14px;
+      --shadow-shell: 0 28px 72px rgba(2, 8, 23, 0.32);
+      --shadow-card: 0 18px 42px rgba(15, 23, 42, 0.10);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: #e2e8f0;
+      font-family: "SF Pro Display", "Pretendard", "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 24%),
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.14), transparent 28%),
+        linear-gradient(180deg, #06101d 0%, #0a1322 45%, #0d1727 100%);
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .page {
+      max-width: 1540px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .shell {
+      position: relative;
+      overflow: hidden;
+      border-radius: 34px;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      background:
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.10), transparent 32%),
+        linear-gradient(180deg, rgba(8, 16, 29, 0.94), rgba(10, 20, 36, 0.92));
+      box-shadow: var(--shadow-shell);
+      padding: 24px;
+    }
+
+    .shell::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 12% 10%, rgba(255,255,255,0.05), transparent 18%),
+        linear-gradient(135deg, rgba(255,255,255,0.02), transparent 44%);
+      pointer-events: none;
+    }
+
+    .topbar {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: center;
+      margin-bottom: 18px;
+      padding: 20px 22px;
+      border-radius: 28px;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      background: linear-gradient(135deg, rgba(9, 18, 33, 0.88), rgba(15, 23, 42, 0.72));
+      backdrop-filter: blur(12px);
+    }
+
+    .brand-kicker {
+      margin-bottom: 8px;
+      color: #7dd3fc;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 34px;
+      line-height: 1;
+      letter-spacing: -0.05em;
+    }
+
+    .brand-copy {
+      margin-top: 8px;
+      color: rgba(226, 232, 240, 0.70);
+      font-size: 14px;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .live-stack {
+      display: grid;
+      gap: 6px;
+      justify-items: end;
+      min-width: 220px;
+    }
+
+    .live-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #f8fafc;
+    }
+
+    .live-copy {
+      color: rgba(226, 232, 240, 0.68);
+      font-size: 12px;
+      line-height: 1.5;
+      text-align: right;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .status-pill::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .tone-online {
+      color: var(--good);
+      background: rgba(16, 185, 129, 0.12);
+      border-color: rgba(16, 185, 129, 0.22);
+    }
+
+    .tone-offline {
+      color: #cbd5e1;
+      background: rgba(148, 163, 184, 0.12);
+      border-color: rgba(148, 163, 184, 0.20);
+    }
+
+    .tone-warning {
+      color: var(--warn);
+      background: rgba(245, 158, 11, 0.12);
+      border-color: rgba(245, 158, 11, 0.22);
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 14px;
+      border: 1px solid transparent;
+      font-size: 14px;
+      font-weight: 800;
+      transition: transform 0.16s ease, opacity 0.16s ease, background 0.16s ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+    }
+
+    .button-primary {
+      color: #ffffff;
+      background: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%);
+      box-shadow: 0 16px 24px rgba(37, 99, 235, 0.24);
+    }
+
+    .button-secondary {
+      color: #dbeafe;
+      background: rgba(255,255,255,0.06);
+      border-color: rgba(148, 163, 184, 0.16);
+    }
+
+    .metrics {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1.25fr repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .card,
+    .panel {
+      border-radius: var(--radius-lg);
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(245,248,252,0.95));
+      border: 1px solid rgba(203, 213, 225, 0.70);
+      box-shadow: var(--shadow-card);
+      color: var(--text);
+    }
+
+    .card {
+      min-height: 138px;
+      padding: 20px;
+    }
+
+    .card-primary {
+      background:
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 36%),
+        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
+    }
+
+    .label {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .value {
+      margin-bottom: 8px;
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: -0.05em;
+      line-height: 1.04;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .subvalue {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .section {
+      position: relative;
+      z-index: 1;
+      margin-bottom: 18px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .section-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      color: #cbd5e1;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .info-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 22px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(247,250,253,0.86));
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .panel-body {
+      padding: 20px 22px 22px;
+    }
+
+    .chart-wrap {
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      background:
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 36%),
+        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    }
+
+    .chart-wrap.loss {
+      background:
+        radial-gradient(circle at top right, rgba(245, 158, 11, 0.10), transparent 36%),
+        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
+    }
+
+    .chart {
+      width: 100%;
+      height: 250px;
+      display: block;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .legend span::before {
+      content: "";
+      width: 12px;
+      height: 3px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+
+    .legend .blue { color: #2563eb; }
+    .legend .green { color: #10b981; }
+    .legend .orange { color: #f59e0b; }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .mini {
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      background: linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
+    }
+
+    .mini-label {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .mini-value {
+      font-size: 21px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.2;
+      color: var(--text);
+      word-break: break-word;
+    }
+
+    .detail-box,
+    .notes-box {
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      background: linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 13px;
+    }
+
+    .notes-box ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    .table th,
+    .table td {
+      padding: 12px 10px;
+      text-align: left;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+      vertical-align: top;
+    }
+
+    .table th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .table tbody tr:hover {
+      background: rgba(37, 99, 235, 0.04);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .badge::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .badge-completed {
+      color: var(--good);
+      background: rgba(16, 185, 129, 0.12);
+    }
+
+    .badge-warning {
+      color: var(--warn);
+      background: rgba(245, 158, 11, 0.12);
+    }
+
+    .badge-offline {
+      color: var(--muted);
+      background: rgba(148, 163, 184, 0.12);
+    }
+
+    .footer {
+      position: relative;
+      z-index: 1;
+      margin-top: 8px;
+      color: rgba(226, 232, 240, 0.50);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 1320px) {
+      .metrics,
+      .chart-grid,
+      .info-grid,
+      .meta-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .metrics .card:first-child {
+        grid-column: span 2;
+      }
+    }
+
+    @media (max-width: 940px) {
+      .topbar,
+      .metrics,
+      .chart-grid,
+      .info-grid,
+      .meta-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .top-actions {
+        justify-content: flex-start;
+      }
+
+      .live-stack {
+        justify-items: start;
+      }
+
+      .live-copy {
+        text-align: left;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        padding: 16px;
+      }
+
+      .shell {
+        padding: 16px;
+      }
+
+      .topbar,
+      .card,
+      .panel-head,
+      .panel-body {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      h1 {
+        font-size: 28px;
+      }
+
+      .value {
+        font-size: 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <div class="brand-kicker">Team View</div>
+          <h1>detectWarning Dashboard</h1>
+          <div class="brand-copy">최신 결과와 실시간 상태</div>
+        </div>
+        <div class="top-actions">
+          <div class="live-stack">
+            <div class="live-title" id="liveStateTitle">상태 확인 중</div>
+            <div class="status-pill tone-offline" id="liveStatePill">offline</div>
+            <div class="live-copy" id="liveStateMessage">상태를 불러오는 중입니다.</div>
+            <div class="live-copy" id="redirectMessage">실시간 연결 시 자동 이동합니다.</div>
+          </div>
+          <a class="button button-primary" id="liveLink" href="#" target="_blank" rel="noreferrer" style="display:none;">실시간 보기</a>
+          <a class="button button-secondary" href="#report">결과 보기</a>
+        </div>
+      </header>
+
+      <section class="metrics">
+        <article class="card card-primary">
+          <div class="label">현재 상태</div>
+          <div class="value" id="latestJobState">-</div>
+          <div class="subvalue" id="latestJobMessage">최신 작업 상태를 불러오는 중입니다.</div>
+        </article>
+        <article class="card">
+          <div class="label">Best Validation Macro F1</div>
+          <div class="value" id="bestF1">-</div>
+          <div class="subvalue" id="bestEpoch">best epoch -</div>
+        </article>
+        <article class="card">
+          <div class="label">최종 Accuracy / Macro F1</div>
+          <div class="value" id="finalAccuracy">-</div>
+          <div class="subvalue" id="finalMacroF1">macro F1 -</div>
+        </article>
+        <article class="card">
+          <div class="label">최근 업데이트</div>
+          <div class="value" id="updatedAt">-</div>
+          <div class="subvalue" id="projectName">-</div>
+        </article>
+        <article class="card">
+          <div class="label">최근 작업</div>
+          <div class="value" id="jobDuration">-</div>
+          <div class="subvalue" id="jobRange">-</div>
+        </article>
+      </section>
+
+      <section class="section" id="report">
+        <div class="section-head">
+          <h2 class="section-title">성능 추이</h2>
+          <div class="section-tag">Metrics</div>
+        </div>
+        <div class="chart-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h3 class="panel-title">Validation</h3>
+            </div>
+            <div class="panel-body">
+              <div class="chart-wrap">
+                <svg class="chart" id="metricChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+                <div class="legend">
+                  <span class="blue">Accuracy</span>
+                  <span class="green">Macro F1</span>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h3 class="panel-title">Loss</h3>
+            </div>
+            <div class="panel-body">
+              <div class="chart-wrap loss">
+                <svg class="chart" id="lossChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+                <div class="legend">
+                  <span class="blue">Train Loss</span>
+                  <span class="orange">Validation Loss</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">클래스별 성능</h2>
+          <div class="section-tag">Per Class</div>
+        </div>
+        <article class="panel">
+          <div class="panel-body">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>클래스</th>
+                  <th>Precision</th>
+                  <th>Recall</th>
+                  <th>F1</th>
+                </tr>
+              </thead>
+              <tbody id="classTable"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">작업 정보</h2>
+          <div class="section-tag">Summary</div>
+        </div>
+        <div class="info-grid">
+          <article class="panel">
+            <div class="panel-body">
+              <div class="meta-grid">
+                <div class="mini">
+                  <div class="mini-label">Train / Val / Test</div>
+                  <div class="mini-value" id="sampleTotals">-</div>
+                </div>
+                <div class="mini">
+                  <div class="mini-label">학습 방식</div>
+                  <div class="mini-value" id="resumeState">-</div>
+                </div>
+                <div class="mini">
+                  <div class="mini-label">datasetkey</div>
+                  <div class="mini-value" id="latestDatasetkey">-</div>
+                </div>
+                <div class="mini">
+                  <div class="mini-label">filekey</div>
+                  <div class="mini-value" id="latestFilekey">-</div>
+                </div>
+              </div>
+              <div class="detail-box" id="jobDetailBox">최근 작업 정보를 불러오는 중입니다.</div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-body">
+              <div class="notes-box" id="notesBox">메모를 불러오는 중입니다.</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <div class="footer">detectWarning team result dashboard</div>
+    </div>
+  </div>
+
+  <script>
+    const cacheBust = () => `?t=${Date.now()}`;
+
+    async function fetchJson(path) {
+      const response = await fetch(`${path}${cacheBust()}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("데이터를 불러오지 못했습니다.");
+      }
+      return response.json();
+    }
+
+    function formatNumber(value, digits = 4) {
+      if (value === null || value === undefined || value === "") return "-";
+      const num = Number(value);
+      if (Number.isNaN(num)) return String(value);
+      return num.toFixed(digits);
+    }
+
+    function formatDateTime(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString("ko-KR", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+    }
+
+    function formatDuration(minutes) {
+      if (minutes === null || minutes === undefined || minutes === "") return "-";
+      const mins = Number(minutes);
+      if (Number.isNaN(mins)) return String(minutes);
+      if (mins >= 60) {
+        const hours = Math.floor(mins / 60);
+        const remain = mins % 60;
+        return `${hours}시간 ${remain}분`;
+      }
+      return `${mins}분`;
+    }
+
+    function stateLabel(state) {
+      if (state === "completed") return "완료";
+      if (state === "completed_warning") return "경고 종료";
+      if (state === "running") return "실행 중";
+      if (state === "paused") return "일시 정지";
+      if (state === "aborted") return "강제 중단";
+      if (state === "error") return "오류";
+      return state || "-";
+    }
+
+    function stateClass(state) {
+      if (state === "completed") return "badge badge-completed";
+      if (state === "completed_warning") return "badge badge-warning";
+      return "badge badge-offline";
+    }
+
+    function renderPolylineChart(svgId, history, keys, colors, maxValue, emptyText) {
+      const svg = document.getElementById(svgId);
+      if (!history || !history.length) {
+        svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">${emptyText}</text>`;
+        return;
+      }
+
+      const width = 800;
+      const height = 260;
+      const padLeft = 50;
+      const padRight = 20;
+      const padTop = 16;
+      const padBottom = 30;
+      const innerW = width - padLeft - padRight;
+      const innerH = height - padTop - padBottom;
+      const maxX = Math.max(history.length - 1, 1);
+
+      const gridLines = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = padTop + (1 - ratio) * innerH;
+        const label = (maxValue * ratio).toFixed(maxValue <= 1 ? 2 : 3);
+        return `
+          <line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(148,163,184,0.18)" />
+          <text x="8" y="${y + 4}" fill="#94a3b8" font-size="11">${label}</text>
+        `;
+      }).join("");
+
+      const xLabels = history.map((row, index) => {
+        const x = padLeft + (index / maxX) * innerW;
+        return `<text x="${x}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${row.epoch}</text>`;
+      }).join("");
+
+      const lines = keys.map((key, index) => {
+        const points = history.map((row, rowIndex) => {
+          const x = padLeft + (rowIndex / maxX) * innerW;
+          const raw = Number(row[key] || 0);
+          const normalized = Math.max(0, Math.min(1, raw / maxValue));
+          const y = padTop + (1 - normalized) * innerH;
+          return `${x},${y}`;
+        }).join(" ");
+        return `<polyline fill="none" stroke="${colors[index]}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${points}"></polyline>`;
+      }).join("");
+
+      svg.innerHTML = `${gridLines}${lines}${xLabels}`;
+    }
+
+    function renderMetricChart(history) {
+      renderPolylineChart(
+        "metricChart",
+        history,
+        ["val_accuracy", "val_macro_f1"],
+        ["#2563eb", "#10b981"],
+        1,
+        "표시할 성능 기록이 없습니다"
+      );
+    }
+
+    function renderLossChart(history) {
+      const maxLoss = history && history.length
+        ? Math.max(0.001, ...history.flatMap((row) => [Number(row.train_loss || 0), Number(row.val_loss || 0)]))
+        : 1;
+      renderPolylineChart(
+        "lossChart",
+        history,
+        ["train_loss", "val_loss"],
+        ["#2563eb", "#f59e0b"],
+        maxLoss,
+        "표시할 loss 기록이 없습니다"
+      );
+    }
+
+    function renderClassTable(rows) {
+      const tbody = document.getElementById("classTable");
+      if (!rows || !rows.length) {
+        tbody.innerHTML = '<tr><td colspan="4">클래스별 지표가 없습니다.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${row.label || "-"}</td>
+          <td>${formatNumber(row.precision, 3)}</td>
+          <td>${formatNumber(row.recall, 3)}</td>
+          <td>${formatNumber(row.f1, 3)}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderReport(report) {
+      const summary = report.summary || {};
+      const latestJob = report.latest_job || {};
+      const artifacts = report.artifacts || {};
+
+      document.getElementById("latestJobState").innerHTML =
+        `<span class="${stateClass(latestJob.state)}">${stateLabel(latestJob.state)}</span>`;
+      document.getElementById("latestJobMessage").textContent =
+        latestJob.message || "최신 작업 메시지가 없습니다.";
+      document.getElementById("latestFilekey").textContent = latestJob.filekey || "-";
+      document.getElementById("latestDatasetkey").textContent = latestJob.datasetkey || "-";
+      document.getElementById("bestF1").textContent = formatNumber(summary.best_val_macro_f1, 4);
+      document.getElementById("bestEpoch").textContent = `best epoch ${summary.best_epoch ?? "-"}`;
+      document.getElementById("finalAccuracy").textContent = formatNumber(summary.final_accuracy, 4);
+      document.getElementById("finalMacroF1").textContent = `macro F1 ${formatNumber(summary.final_macro_f1, 4)}`;
+      document.getElementById("sampleTotals").textContent =
+        `${summary.train_samples ?? 0} / ${summary.val_samples ?? 0} / ${summary.test_samples ?? 0}`;
+      document.getElementById("resumeState").textContent =
+        summary.resumed_from_checkpoint ? "resume" : "fresh";
+      document.getElementById("updatedAt").textContent = formatDateTime(report.updated_at);
+      document.getElementById("projectName").textContent = report.project_name || "-";
+      document.getElementById("jobDuration").textContent = formatDuration(latestJob.duration_minutes);
+      document.getElementById("jobRange").textContent =
+        `${formatDateTime(latestJob.started_at)} ~ ${formatDateTime(latestJob.finished_at)}`;
+
+      document.getElementById("jobDetailBox").innerHTML = `
+        상태: ${stateLabel(latestJob.state)}<br />
+        시작: ${formatDateTime(latestJob.started_at)}<br />
+        종료: ${formatDateTime(latestJob.finished_at)}<br />
+        모델: ${artifacts.best_model || "-"}<br />
+        메트릭: ${artifacts.metrics || "-"}<br />
+        라벨: ${artifacts.labels || "-"}<br /><br />
+        ${latestJob.message || "상세 메시지가 없습니다."}
+      `;
+
+      const notes = report.notes || [];
+      document.getElementById("notesBox").innerHTML = notes.length
+        ? `<ul>${notes.map((note) => `<li>${note}</li>`).join("")}</ul>`
+        : "메모가 없습니다.";
+
+      renderMetricChart(report.history || []);
+      renderLossChart(report.history || []);
+      renderClassTable(report.per_class || []);
+    }
+
+    function startLiveRedirect(status) {
+      if (status.status !== "online" || !status.live_url) return;
+
+      const delay = Number(status.redirect_delay_seconds || 3);
+      let countdown = Number.isNaN(delay) ? 3 : delay;
+      const message = document.getElementById("redirectMessage");
+
+      message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
+
+      const timer = setInterval(() => {
+        countdown -= 1;
+        if (countdown <= 0) {
+          clearInterval(timer);
+          window.location.href = status.live_url;
+          return;
+        }
+        message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
+      }, 1000);
+    }
+
+    function renderLiveStatus(status) {
+      const pill = document.getElementById("liveStatePill");
+      const title = document.getElementById("liveStateTitle");
+      const message = document.getElementById("liveStateMessage");
+      const detail = document.getElementById("redirectMessage");
+      const liveLink = document.getElementById("liveLink");
+
+      if (status.status === "online" && status.live_url) {
+        pill.className = "status-pill tone-online";
+        pill.textContent = "online";
+        title.textContent = status.live_title || "실시간 연결 가능";
+        message.textContent = status.updated_at
+          ? `최근 갱신 ${formatDateTime(status.updated_at)}`
+          : (status.message || "실시간 대시보드가 연결되어 있습니다.");
+        detail.textContent = "실시간 화면을 사용할 수 있습니다.";
+        liveLink.style.display = "inline-flex";
+        liveLink.href = status.live_url;
+        startLiveRedirect(status);
+        return;
+      }
+
+      pill.className = "status-pill tone-offline";
+      pill.textContent = "offline";
+      title.textContent = status.offline_title || "오프라인 리포트";
+      message.textContent = status.updated_at
+        ? `최근 갱신 ${formatDateTime(status.updated_at)}`
+        : (status.message || "최신 결과를 표시합니다.");
+      detail.textContent = status.message || "실시간 연결이 활성화되면 자동으로 이동합니다.";
+      liveLink.style.display = "none";
+      liveLink.href = "#";
+    }
+
+    async function boot() {
+      try {
+        const [status, report] = await Promise.all([
+          fetchJson("./live-status.json"),
+          fetchJson("./latest-result.json")
+        ]);
+        renderLiveStatus(status);
+        renderReport(report);
+      } catch (error) {
+        document.getElementById("liveStateTitle").textContent = "불러오기 실패";
+        document.getElementById("liveStatePill").className = "status-pill tone-warning";
+        document.getElementById("liveStatePill").textContent = "warning";
+        document.getElementById("liveStateMessage").textContent =
+          error?.message || "데이터를 읽지 못했습니다.";
+        document.getElementById("redirectMessage").textContent =
+          "잠시 후 다시 시도해 주세요.";
+        document.getElementById("latestJobState").textContent = "데이터 없음";
+        document.getElementById("latestJobMessage").textContent =
+          "결과 데이터를 불러오지 못했습니다.";
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
