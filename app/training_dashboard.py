@@ -281,6 +281,22 @@ def create_app(config_path: Path) -> FastAPI:
         if not existing_targets:
             return
         try:
+            branch_result = subprocess.run(
+                ["git", "-C", str(pages_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+            )
+            branch = decode_process_output(branch_result.stdout).strip() or "main"
+
+            pull_result = subprocess.run(
+                ["git", "-C", str(pages_dir), "pull", "--rebase", "--autostash", "origin", branch],
+                capture_output=True,
+            )
+            if pull_result.returncode != 0:
+                raise RuntimeError(
+                    decode_process_output(pull_result.stderr or pull_result.stdout).strip()
+                    or "git pull --rebase 에 실패했습니다."
+                )
+
             add_result = subprocess.run(
                 ["git", "-C", str(pages_dir), "add", *existing_targets],
                 capture_output=True,
@@ -319,11 +335,6 @@ def create_app(config_path: Path) -> FastAPI:
                 capture_output=True,
             )
             if push_result.returncode != 0:
-                branch_result = subprocess.run(
-                    ["git", "-C", str(pages_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-                    capture_output=True,
-                )
-                branch = decode_process_output(branch_result.stdout).strip() or "main"
                 fallback_push = subprocess.run(
                     ["git", "-C", str(pages_dir), "push", "-u", "origin", branch],
                     capture_output=True,
