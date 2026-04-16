@@ -22,6 +22,9 @@ from fastapi.responses import HTMLResponse
 from action_training_pipeline import load_config, resolve_paths
 from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
+FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
+MAX_FILEKEY_RANGE_SIZE = 1000
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="행동 학습 진행 상황 대시보드")
@@ -1521,34 +1524,46 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .wrap {
       max-width: 1660px;
-      padding: 20px 20px 34px;
+      padding: 18px 18px 30px;
     }
     .hero {
-      margin-bottom: 16px;
-      padding: 22px 24px;
+      margin-bottom: 14px;
+      padding: 20px 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
       background:
-        radial-gradient(circle at top right, rgba(37, 99, 235, 0.12), transparent 28%),
-        linear-gradient(135deg, rgba(255,255,255,0.98), rgba(247,250,253,0.95));
+        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 30%),
+        linear-gradient(135deg, rgba(255,255,255,0.985), rgba(247,250,253,0.965));
       border: 1px solid rgba(203, 213, 225, 0.78);
       box-shadow: var(--shadow);
       backdrop-filter: blur(14px);
     }
     .hero::after {
-      right: -30px;
-      top: -30px;
+      right: -34px;
+      top: -36px;
       width: 220px;
       height: 220px;
-      background: radial-gradient(circle, rgba(37,99,235,0.12), transparent 70%);
+      background: radial-gradient(circle, rgba(37,99,235,0.11), transparent 70%);
+    }
+    .hero-copy {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
     }
     .eyebrow {
       background: rgba(37, 99, 235, 0.08);
       color: #1d4ed8;
       border: 1px solid rgba(37, 99, 235, 0.12);
+      width: fit-content;
+      margin-bottom: 0;
     }
     .hero h1 {
       color: var(--ink);
-      font-size: 38px;
+      font-size: 34px;
       line-height: 1;
+      margin: 0;
     }
     .hero p,
     .hero-side-copy,
@@ -1556,36 +1571,53 @@ def create_app(config_path: Path) -> FastAPI:
     .panel-copy,
     .control-copy {
       color: var(--muted);
-      font-size: 13.5px;
-      line-height: 1.6;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 0;
     }
     .hero-chip {
-      background: rgba(255, 255, 255, 0.9);
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.92);
       border-color: rgba(148, 163, 184, 0.16);
       color: var(--muted);
       box-shadow: none;
+      font-size: 12px;
     }
     .hero-chip strong {
       color: var(--ink);
     }
     .hero-side {
+      min-width: 300px;
+      max-width: 350px;
+      padding: 16px 18px;
+      display: grid;
+      gap: 10px;
       background: linear-gradient(180deg, rgba(249,251,255,0.98), rgba(244,248,252,0.94));
       border-color: rgba(203, 213, 225, 0.72);
       box-shadow: none;
-      min-width: 300px;
-      max-width: 340px;
     }
     .hero-side-label {
       color: #2563eb;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
     .hero-side-title {
       color: var(--ink);
-      font-size: 24px;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
     }
     .dashboard-shell {
       display: grid;
-      grid-template-columns: 370px minmax(0, 1fr);
-      gap: 16px;
+      grid-template-columns: 360px minmax(0, 1fr);
+      gap: 14px;
       align-items: start;
     }
     .sidebar-stack {
@@ -1601,11 +1633,15 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .sidebar-stack .control-panel {
       grid-template-columns: 1fr;
-      padding: 18px;
+      padding: 16px;
       margin-bottom: 0;
       background: linear-gradient(180deg, rgba(255,255,255,0.99), rgba(246,249,253,0.96));
       border-color: rgba(203, 213, 225, 0.72);
       box-shadow: var(--shadow);
+    }
+    .control-panel > div:first-child {
+      display: grid;
+      gap: 12px;
     }
     .sidebar-stack .control-title,
     .sidebar-stack .launch-value,
@@ -1645,11 +1681,40 @@ def create_app(config_path: Path) -> FastAPI:
     .sidebar-stack .launch-message {
       background: rgba(255,255,255,0.92);
     }
+    .meta-row {
+      gap: 8px;
+      margin-top: 0;
+    }
+    .meta-chip {
+      padding: 8px 11px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .queue-editor {
+      display: grid;
+      gap: 10px;
+    }
+    .form-label {
+      margin-bottom: 0;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #5b6d82;
+    }
     .viewer-mode .text-input,
     .viewer-mode .input-area {
       background: rgba(241, 245, 249, 0.9);
       color: #7c8aa0;
       cursor: not-allowed;
+    }
+    html.viewer-mode-page #controlPanel .meta-row,
+    .viewer-mode .meta-row {
+      display: none;
+    }
+    html.viewer-mode-page .hero-meta,
+    .viewer-mode-page .hero-meta {
+      display: none;
     }
     html.viewer-mode-page #controlPanel .queue-editor,
     html.viewer-mode-page #controlPanel .control-actions,
@@ -1661,6 +1726,29 @@ def create_app(config_path: Path) -> FastAPI:
     .viewer-mode {
       padding: 16px;
     }
+    html.viewer-mode-page .dashboard-shell {
+      grid-template-columns: 320px minmax(0, 1fr);
+    }
+    html.viewer-mode-page .hero {
+      padding: 18px 20px;
+    }
+    html.viewer-mode-page .hero h1 {
+      font-size: 30px;
+    }
+    html.viewer-mode-page .hero-side {
+      min-width: 260px;
+      max-width: 300px;
+    }
+    html.viewer-mode-page .main-stack {
+      gap: 14px;
+    }
+    html.viewer-mode-page .section-title p {
+      display: none;
+    }
+    html.viewer-mode-page .section-pill {
+      padding: 7px 11px;
+      font-size: 11px;
+    }
     html.viewer-mode-page #controlPanel .launch-box,
     .viewer-mode .launch-box {
       padding: 0;
@@ -1671,6 +1759,9 @@ def create_app(config_path: Path) -> FastAPI:
     html.viewer-mode-page #controlPanel .launch-item,
     .viewer-mode .launch-item {
       background: rgba(248, 250, 253, 0.98);
+    }
+    html.viewer-mode-page #controlPanel .launch-item {
+      min-height: 76px;
     }
     html.viewer-mode-page #controlPanel .primary-button,
     .viewer-mode .primary-button {
@@ -1686,19 +1777,42 @@ def create_app(config_path: Path) -> FastAPI:
       color: var(--muted);
     }
     .launch-box {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }
     .launch-item {
       padding: 11px 13px;
+      min-height: 88px;
+    }
+    .launch-message {
+      grid-column: 1 / -1;
+      margin-top: 2px;
     }
     .launch-value {
       font-size: 14px;
       line-height: 1.45;
     }
+    .control-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      margin-top: 2px;
+    }
+    .control-actions .helper {
+      grid-column: 1 / -1;
+      margin-top: 2px;
+    }
     .primary-button {
       border-radius: 12px;
       padding: 12px 15px;
       box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18);
+      justify-content: center;
+      min-height: 46px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: -0.01em;
     }
     .primary-button:hover:not(:disabled) {
       transform: translateY(-1px);
@@ -1731,7 +1845,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .card {
       padding: 16px;
-      min-height: 124px;
+      min-height: 118px;
     }
     .card-featured {
       grid-column: span 2;
@@ -1757,7 +1871,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .value {
       color: var(--ink);
-      font-size: 28px;
+      font-size: 30px;
       line-height: 1.08;
     }
     .subvalue,
@@ -1826,7 +1940,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     @media (max-width: 1480px) {
       .dashboard-shell {
-        grid-template-columns: 380px minmax(0, 1fr);
+        grid-template-columns: 350px minmax(0, 1fr);
       }
       .grid {
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1846,6 +1960,9 @@ def create_app(config_path: Path) -> FastAPI:
       .sidebar-stack .control-panel {
         grid-template-columns: 1.15fr 0.85fr;
       }
+      .control-actions {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
       .grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -1864,10 +1981,15 @@ def create_app(config_path: Path) -> FastAPI:
       }
       .hero-side {
         max-width: none;
+        width: 100%;
       }
       .card-featured,
       .card-queue {
         grid-column: span 1;
+      }
+      .control-actions,
+      .launch-box {
+        grid-template-columns: 1fr;
       }
       .value {
         font-size: 27px;
@@ -1889,9 +2011,9 @@ def create_app(config_path: Path) -> FastAPI:
         </div>
       </div>
       <aside class="hero-side">
-        <div class="hero-side-label">Live Status</div>
+        <div class="hero-side-label">Pipeline</div>
         <div class="hero-side-title">현재 파이프라인 상태</div>
-        <div class="hero-side-copy">진행률, ETA, 성능, 오류 로그를 바로 확인합니다.</div>
+        <div class="hero-side-copy">현재 실행 상태와 주요 지표를 바로 확인합니다.</div>
         <div id="pipelineState" class="status-pill tone-neutral">상태 확인 중</div>
       </aside>
     </section>
@@ -1900,8 +2022,8 @@ def create_app(config_path: Path) -> FastAPI:
     <aside class="sidebar-stack">
     <section id="controlPanel" class="card control-panel">
       <div>
-        <h2 id="controlTitle" class="control-title">학습 큐</h2>
-        <div id="controlCopy" class="control-copy">datasetkey와 filekey를 넣으면 다운로드, 전처리, 학습이 순차로 이어집니다.</div>
+        <h2 id="controlTitle" class="control-title">작업 제어</h2>
+        <div id="controlCopy" class="control-copy">큐를 구성하고 현재 실행 상태를 확인합니다.</div>
         <div class="meta-row">
           <div class="meta-chip">datasetkey <span id="datasetKeyChip">-</span></div>
           <div class="meta-chip">workspace <span id="workspaceChip">-</span></div>
@@ -1912,14 +2034,14 @@ def create_app(config_path: Path) -> FastAPI:
           <label class="form-label" for="apiKeyInput">AIHub API 키</label>
           <input id="apiKeyInput" class="text-input" type="password" placeholder="AIHub API 키를 입력하세요" />
           <label class="form-label" for="filekeysInput">분할 ZIP filekey 입력</label>
-          <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;123458"></textarea>
+          <textarea id="filekeysInput" class="input-area" placeholder="예:&#10;123456&#10;123457&#10;49841 ~ 49843"></textarea>
         </div>
         <div class="control-actions">
-          <button id="startButton" class="primary-button" type="button">큐 시작 / 추가</button>
+          <button id="startButton" class="primary-button" type="button">시작 / 추가</button>
           <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">현재 작업 후 중지</button>
           <button id="forceStopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 14px 28px rgba(239, 68, 68, 0.22);">지금 중단</button>
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
-          <div class="helper">datasetkey는 데이터셋 키, filekey는 분할 ZIP key입니다.</div>
+          <div class="helper">datasetkey는 데이터셋 키, filekey는 분할 ZIP key입니다. 범위 입력은 `49841 ~ 49843`처럼 쓸 수 있습니다.</div>
         </div>
       </div>
       <div class="launch-box">
@@ -1959,8 +2081,8 @@ def create_app(config_path: Path) -> FastAPI:
 
     <div class="section-title">
       <div>
-        <h2>실행 현황</h2>
-        <p>핵심 상태</p>
+        <h2>핵심 지표</h2>
+        <p>현재 실행 상태</p>
       </div>
       <div class="section-pill">Overview</div>
     </div>
@@ -2006,8 +2128,8 @@ def create_app(config_path: Path) -> FastAPI:
 
     <div class="section-title">
       <div>
-        <h2>학습 분석</h2>
-        <p>성능과 데이터</p>
+        <h2>성능 분석</h2>
+        <p>성능, 데이터, 진행 추이</p>
       </div>
       <div class="section-pill">Analytics</div>
     </div>
@@ -2016,7 +2138,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">학습 성능 그래프</h2>
-            <div class="panel-copy">성능과 loss 추이</div>
+            <div class="panel-copy">Validation Accuracy, Macro F1, Loss</div>
           </div>
         </div>
         <div class="panel-body">
@@ -2085,7 +2207,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">현재 filekey 세부 진행</h2>
-            <div class="panel-copy">현재 작업 진행 상태</div>
+            <div class="panel-copy">현재 작업 상태</div>
           </div>
         </div>
         <div class="panel-body">
@@ -2113,7 +2235,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">클래스별 검증 지표</h2>
-            <div class="panel-copy">precision / recall / F1</div>
+            <div class="panel-copy">Precision / Recall / F1</div>
           </div>
         </div>
         <div class="panel-body">
@@ -2135,8 +2257,8 @@ def create_app(config_path: Path) -> FastAPI:
 
     <div class="section-title">
       <div>
-        <h2>작업 로그</h2>
-        <p>이력과 로그</p>
+        <h2>로그 & 이력</h2>
+        <p>최근 완료 작업과 현재 로그</p>
       </div>
       <div class="section-pill">Logs</div>
     </div>
@@ -2273,13 +2395,25 @@ def create_app(config_path: Path) -> FastAPI:
       if (panel) {
         panel.classList.add('viewer-mode');
       }
+      const queueEditor = panel ? panel.querySelector('.queue-editor') : null;
+      const controlActions = panel ? panel.querySelector('.control-actions') : null;
+      const metaRow = panel ? panel.querySelector('.meta-row') : null;
+      if (queueEditor) {
+        queueEditor.remove();
+      }
+      if (controlActions) {
+        controlActions.remove();
+      }
+      if (metaRow) {
+        metaRow.remove();
+      }
       const title = document.getElementById('controlTitle');
       const copy = document.getElementById('controlCopy');
       if (title) {
-        title.textContent = '실행 상태';
+        title.textContent = '실행 현황';
       }
       if (copy) {
-        copy.textContent = '현재 작업, 대기열, 최근 완료 상태를 확인합니다.';
+        copy.textContent = '현재 작업과 최근 완료 상태를 확인합니다.';
       }
 
       [
@@ -2299,7 +2433,14 @@ def create_app(config_path: Path) -> FastAPI:
           element.setAttribute('tabindex', '-1');
         }
       });
-
+      const eyebrow = document.querySelector('.eyebrow');
+      if (eyebrow) {
+        eyebrow.textContent = 'Viewer';
+      }
+      const heroCopy = document.querySelector('.hero-copy p');
+      if (heroCopy) {
+        heroCopy.textContent = '학습 상태와 최근 결과를 실시간으로 확인합니다.';
+      }
     }
 
     function setLaunchMessage(message, isError) {
@@ -2328,7 +2469,7 @@ def create_app(config_path: Path) -> FastAPI:
       if (!autoStartEnabled && (hasCurrentJob || pendingCount > 0)) {
         startButton.textContent = hasCurrentJob ? '큐 재개' : '대기열 시작';
       } else {
-        startButton.textContent = '큐 시작 / 추가';
+        startButton.textContent = '시작 / 추가';
       }
 
       if (hasCurrentJob || pendingCount > 0) {
@@ -2928,7 +3069,10 @@ def create_app(config_path: Path) -> FastAPI:
             )
 
         payload = await request.json()
-        filekeys = parse_filekeys(payload.get("filekeys", ""))
+        try:
+            filekeys = parse_filekeys(payload.get("filekeys", ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         datasetkey = str(payload.get("datasetkey", "")).strip()
         api_key = str(payload.get("api_key", "")).strip()
         resume_only = bool(payload.get("resume_only", False))
@@ -3274,16 +3418,34 @@ def parse_filekeys(raw_value) -> list[str]:
         tokens = raw_value
     else:
         text = str(raw_value).replace("{", " ").replace("}", " ")
+        text = re.sub(r"(\d)\s*(~|[-–—])\s*(\d)", r"\1\2\3", text)
         tokens = re.split(r"[\s,;]+", text)
 
     cleaned: list[str] = []
     seen = set()
     for token in tokens:
         value = str(token).strip()
-        if not value or value in seen:
+        if not value:
             continue
-        seen.add(value)
-        cleaned.append(value)
+
+        match = FILEKEY_RANGE_PATTERN.fullmatch(value)
+        expanded_values = [value]
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            step = 1 if end >= start else -1
+            count = abs(end - start) + 1
+            if count > MAX_FILEKEY_RANGE_SIZE:
+                raise ValueError(
+                    f"filekey 범위가 너무 큽니다: {value} (최대 {MAX_FILEKEY_RANGE_SIZE}개까지 허용)"
+                )
+            expanded_values = [str(number) for number in range(start, end + step, step)]
+
+        for expanded in expanded_values:
+            if not expanded or expanded in seen:
+                continue
+            seen.add(expanded)
+            cleaned.append(expanded)
     return cleaned
 
 

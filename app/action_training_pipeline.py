@@ -813,6 +813,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         split_total = len(rows)
         with target_manifest_path.open("w", encoding="utf-8") as target_handle:
             kept = 0
+            skipped = 0
             for split_index, sample in enumerate(rows, start=1):
                 video_path = Path(sample["video_path"])
                 target_label = sample["target_label"]
@@ -836,14 +837,20 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         split_total=split_total,
                         current_video=video_path.name,
                         kept_items=kept,
+                        skipped_items=skipped,
                     )
-                sequence = extract_pose_sequence(
-                    video_path=video_path,
-                    person_detector=person_detector,
-                    face_detector=face_detector,
-                    sequence_length=int(preprocess_config.get("sequence_length", 48)),
-                    max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
-                )
+                try:
+                    sequence = extract_pose_sequence(
+                        video_path=video_path,
+                        person_detector=person_detector,
+                        face_detector=face_detector,
+                        sequence_length=int(preprocess_config.get("sequence_length", 48)),
+                        max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                    )
+                except Exception as exc:
+                    skipped += 1
+                    print(f"[prepare] skip unreadable video: {video_path} ({exc})")
+                    continue
                 if sequence["valid_frames"] < min_frames_with_person:
                     continue
 
@@ -884,8 +891,9 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                 split_index=split_total,
                 split_total=split_total,
                 kept_items=kept,
+                skipped_items=skipped,
             )
-        print(f"[prepare] {split_name}: {kept} samples -> {target_manifest_path}")
+        print(f"[prepare] {split_name}: {kept} samples ({skipped} skipped) -> {target_manifest_path}")
 
     return prepared_paths
 
