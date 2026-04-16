@@ -43,6 +43,14 @@ class PersonDetector:
         self.detector_model = YOLO("yolo11n.pt")
         self.pose_model = YOLO("yolo11n-pose.pt")
 
+    @staticmethod
+    def _normalize_imgsz(value: int, *, min_size: int = 32, stride: int = 32) -> int:
+        normalized = max(int(value), int(min_size))
+        remainder = normalized % stride
+        if remainder == 0:
+            return normalized
+        return normalized + (stride - remainder)
+
     def detect(self, frame):
         candidates = self.detect_person_boxes(frame)
         return self.estimate_pose_in_boxes(frame, candidates)
@@ -53,7 +61,7 @@ class PersonDetector:
             classes=[0],
             conf=self.score_threshold,
             iou=self.nms_threshold,
-            imgsz=self.resize_width,
+            imgsz=self._normalize_imgsz(self.resize_width),
             device=self.device,
             verbose=False,
         )
@@ -101,7 +109,9 @@ class PersonDetector:
                 poses.append({**candidate, "keypoints": [], "pose_mean_conf": 0.0})
                 continue
 
-            pose_imgsz = max(256, min(self.resize_width, max(crop.shape[:2])))
+            pose_imgsz = self._normalize_imgsz(
+                max(256, min(self.resize_width, max(crop.shape[:2])))
+            )
             pose_results = self.pose_model.predict(
                 source=crop,
                 classes=[0],

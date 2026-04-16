@@ -144,7 +144,7 @@ def train_action_classifier(
 
     resumed_from_checkpoint = False
     if resume_from is not None and resume_from.exists():
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=True)
         checkpoint_labels = list(checkpoint.get("labels", []))
         if checkpoint_labels == list(labels):
             model.load_state_dict(checkpoint["model_state_dict"], strict=False)
@@ -214,6 +214,16 @@ def train_action_classifier(
             "learning_rate": round(current_lr, 8),
         }
         history.append(epoch_metrics)
+        epoch_progress = epoch / max(epochs, 1)
+        print(
+            "[train] "
+            f"{epoch_progress * 100:.1f}% "
+            f"(epoch {epoch}/{epochs}) "
+            f"train_loss={train_loss:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_acc={val_metrics['accuracy']:.4f} "
+            f"val_f1={val_metrics['macro_f1']:.4f}"
+        )
 
         if val_metrics["macro_f1"] >= best_val_f1:
             best_val_f1 = val_metrics["macro_f1"]

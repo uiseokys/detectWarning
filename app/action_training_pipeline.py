@@ -219,6 +219,43 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
     }
     with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+    print(format_pipeline_status_log(payload))
+
+
+def format_pipeline_status_log(payload: dict) -> str:
+    stage = str(payload.get("stage", "-")).strip() or "-"
+    state = str(payload.get("state", "-")).strip() or "-"
+    message = str(payload.get("message", "")).strip()
+
+    segments: list[str] = [f"[pipeline][{stage}][{state}]"]
+
+    stage_progress = payload.get("stage_progress")
+    if isinstance(stage_progress, (int, float)):
+        segments.append(f"{float(stage_progress) * 100:.1f}%")
+
+    processed_items = payload.get("processed_items")
+    total_items = payload.get("total_items")
+    if isinstance(processed_items, int) and isinstance(total_items, int) and total_items > 0:
+        segments.append(f"{processed_items}/{total_items}")
+
+    current_split = payload.get("current_split")
+    split_index = payload.get("split_index")
+    split_total = payload.get("split_total")
+    if current_split and isinstance(split_index, int) and isinstance(split_total, int) and split_total > 0:
+        segments.append(f"{current_split} {split_index}/{split_total}")
+
+    epochs_completed = payload.get("epochs_completed")
+    epochs_total = payload.get("epochs_total")
+    if isinstance(epochs_completed, int) and isinstance(epochs_total, int) and epochs_total > 0:
+        segments.append(f"epoch {epochs_completed}/{epochs_total}")
+
+    current_video = payload.get("current_video")
+    if current_video:
+        segments.append(str(current_video))
+
+    if message:
+        segments.append(message)
+    return " ".join(segments)
 
 
 def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
