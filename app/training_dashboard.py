@@ -56,6 +56,17 @@ def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_c
     return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
 
 
+def decode_process_output(data: bytes | None) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def derive_stage_ratio(pipeline_status: dict | None, training_progress: dict | None) -> float:
     pipeline_status = pipeline_status or {}
     training_progress = training_progress or {}
@@ -270,34 +281,63 @@ def create_app(config_path: Path) -> FastAPI:
         if not existing_targets:
             return
         try:
-            subprocess.run(
+            add_result = subprocess.run(
                 ["git", "-C", str(pages_dir), "add", *existing_targets],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
             )
+            if add_result.returncode != 0:
+                raise RuntimeError(
+                    decode_process_output(add_result.stderr or add_result.stdout).strip()
+                    or "git add 에 실패했습니다."
+                )
+
             status = subprocess.run(
                 ["git", "-C", str(pages_dir), "status", "--porcelain", "--", *existing_targets],
-                check=True,
                 capture_output=True,
-                text=True,
             )
-            if not status.stdout.strip():
+            if status.returncode != 0:
+                raise RuntimeError(
+                    decode_process_output(status.stderr or status.stdout).strip()
+                    or "git status 확인에 실패했습니다."
+                )
+            if not decode_process_output(status.stdout).strip():
                 return
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             commit_message = f"{pages_sync['git_commit_prefix']} ({reason}) {timestamp}"
-            subprocess.run(
+            commit_result = subprocess.run(
                 ["git", "-C", str(pages_dir), "commit", "-m", commit_message],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
             )
-            subprocess.run(
+            if commit_result.returncode != 0:
+                raise RuntimeError(
+                    decode_process_output(commit_result.stderr or commit_result.stdout).strip()
+                    or "git commit 에 실패했습니다."
+                )
+
+            push_result = subprocess.run(
                 ["git", "-C", str(pages_dir), "push"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
             )
+            if push_result.returncode != 0:
+                branch_result = subprocess.run(
+                    ["git", "-C", str(pages_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True,
+                )
+                branch = decode_process_output(branch_result.stdout).strip() or "main"
+                fallback_push = subprocess.run(
+                    ["git", "-C", str(pages_dir), "push", "-u", "origin", branch],
+                    capture_output=True,
+                )
+                if fallback_push.returncode != 0:
+                    raise RuntimeError(
+                        decode_process_output(
+                            fallback_push.stderr
+                            or fallback_push.stdout
+                            or push_result.stderr
+                            or push_result.stdout
+                        ).strip()
+                        or "git push 에 실패했습니다."
+                    )
         except Exception as exc:
             print(f"[pages-sync] 자동 push 실패: {exc}")
 
