@@ -2016,7 +2016,7 @@ def create_app(config_path: Path) -> FastAPI:
       backdrop-filter: blur(10px);
       pointer-events: none;
       opacity: 0;
-      transform: translate(-50%, -110%);
+      transform: none;
       transition: opacity 0.14s ease;
     }
     .chart-tooltip.visible {
@@ -2931,8 +2931,25 @@ def create_app(config_path: Path) -> FastAPI:
           const shellRect = tooltip.parentElement.getBoundingClientRect();
           const x = event.clientX - shellRect.left;
           const y = event.clientY - shellRect.top;
-          tooltip.style.left = `${x}px`;
-          tooltip.style.top = `${Math.max(18, y - 12)}px`;
+          tooltip.classList.add('visible');
+          const tooltipWidth = tooltip.offsetWidth || 180;
+          const tooltipHeight = tooltip.offsetHeight || 72;
+          const shellWidth = shellRect.width;
+          const shellHeight = shellRect.height;
+          const margin = 10;
+          const verticalGap = 14;
+
+          let left = x - tooltipWidth / 2;
+          left = Math.max(margin, Math.min(left, shellWidth - tooltipWidth - margin));
+
+          let top = y - tooltipHeight - verticalGap;
+          if (top < margin) {
+            top = Math.min(shellHeight - tooltipHeight - margin, y + verticalGap);
+          }
+          top = Math.max(margin, top);
+
+          tooltip.style.left = `${left}px`;
+          tooltip.style.top = `${top}px`;
           tooltip.classList.add('visible');
           if (line) {
             const cx = Number(point.dataset.cx || 0);
