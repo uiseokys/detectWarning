@@ -1718,8 +1718,10 @@ def create_app(config_path: Path) -> FastAPI:
     }
     html.viewer-mode-page #controlPanel .queue-editor,
     html.viewer-mode-page #controlPanel .control-actions,
+    html.viewer-mode-page #controlPanel .queue-manager,
     .viewer-mode .queue-editor,
-    .viewer-mode .control-actions {
+    .viewer-mode .control-actions,
+    .viewer-mode .queue-manager {
       display: none !important;
     }
     html.viewer-mode-page #controlPanel,
@@ -1792,6 +1794,88 @@ def create_app(config_path: Path) -> FastAPI:
     .launch-value {
       font-size: 14px;
       line-height: 1.45;
+    }
+    .queue-manager {
+      display: grid;
+      gap: 10px;
+      margin-top: 4px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(203, 213, 225, 0.72);
+    }
+    .queue-manager-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .queue-manager-title {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--ink);
+    }
+    .queue-manager-copy {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .queued-job-list {
+      display: grid;
+      gap: 8px;
+    }
+    .queued-job-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(248, 250, 253, 0.98);
+      border: 1px solid rgba(203, 213, 225, 0.72);
+    }
+    .queued-job-main {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+    }
+    .queued-job-key {
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      word-break: break-word;
+    }
+    .queued-job-meta {
+      color: var(--muted);
+      font-size: 11.5px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .queued-remove-button {
+      border: 1px solid rgba(220, 38, 38, 0.14);
+      background: rgba(220, 38, 38, 0.06);
+      color: #b91c1c;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: background 0.16s ease, transform 0.16s ease;
+      flex-shrink: 0;
+    }
+    .queued-remove-button:hover {
+      background: rgba(220, 38, 38, 0.1);
+      transform: translateY(-1px);
+    }
+    .queued-job-empty {
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(248, 250, 253, 0.98);
+      border: 1px dashed rgba(203, 213, 225, 0.72);
+      color: var(--muted);
+      font-size: 12.5px;
+      text-align: center;
     }
     .control-actions {
       display: grid;
@@ -1908,6 +1992,75 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .chart-wrap {
       border-color: rgba(148,163,184,0.12);
+      position: relative;
+      overflow: hidden;
+    }
+    .chart-shell {
+      position: relative;
+    }
+    .chart {
+      position: relative;
+      z-index: 1;
+    }
+    .chart-tooltip {
+      position: absolute;
+      z-index: 3;
+      min-width: 150px;
+      max-width: 240px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.94);
+      color: #e2e8f0;
+      box-shadow: 0 14px 28px rgba(15, 23, 42, 0.24);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      backdrop-filter: blur(10px);
+      pointer-events: none;
+      opacity: 0;
+      transform: translate(-50%, -110%);
+      transition: opacity 0.14s ease;
+    }
+    .chart-tooltip.visible {
+      opacity: 1;
+    }
+    .chart-tooltip-title {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #93c5fd;
+      margin-bottom: 6px;
+    }
+    .chart-tooltip-line {
+      font-size: 12px;
+      line-height: 1.55;
+      color: #e2e8f0;
+      white-space: nowrap;
+    }
+    .chart-tooltip-line strong {
+      color: #f8fafc;
+      font-weight: 800;
+      margin-right: 6px;
+    }
+    .chart-point {
+      cursor: pointer;
+      transition: transform 0.12s ease, opacity 0.12s ease;
+    }
+    .chart-point:hover {
+      transform: scale(1.14);
+    }
+    .chart-point-core {
+      pointer-events: none;
+    }
+    .chart-point-hit {
+      fill: transparent;
+      pointer-events: all;
+    }
+    .chart-hover-line {
+      stroke: rgba(148,163,184,0.28);
+      stroke-width: 1;
+      stroke-dasharray: 4 4;
+      opacity: 0;
+      pointer-events: none;
     }
     .mini-card {
       border-radius: 16px;
@@ -1938,6 +2091,91 @@ def create_app(config_path: Path) -> FastAPI:
         radial-gradient(circle at top right, rgba(59,130,246,0.12), transparent 30%),
         linear-gradient(180deg, #0f172a 0%, #111827 100%);
     }
+    .metric-stack {
+      display: grid;
+      gap: 12px;
+    }
+    .diagnostic-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .insight-card {
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(249,251,254,0.98), rgba(244,248,252,0.95));
+      border: 1px solid rgba(148,163,184,0.12);
+    }
+    .insight-label {
+      color: #5b6d82;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .insight-value {
+      color: var(--ink);
+      font-size: 23px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.05;
+      margin-bottom: 5px;
+    }
+    .insight-copy {
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+    .heatmap-wrap {
+      overflow: auto;
+      border-radius: 16px;
+      border: 1px solid rgba(148,163,184,0.12);
+      background: rgba(249,251,254,0.98);
+    }
+    .heatmap-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      min-width: 520px;
+      font-size: 12px;
+    }
+    .heatmap-table th,
+    .heatmap-table td {
+      padding: 10px 8px;
+      border-bottom: 1px solid rgba(148,163,184,0.10);
+      border-right: 1px solid rgba(148,163,184,0.08);
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .heatmap-table th:first-child,
+    .heatmap-table td:first-child {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: rgba(248,250,253,0.98);
+      z-index: 1;
+    }
+    .heatmap-table thead th {
+      position: sticky;
+      top: 0;
+      background: rgba(248,250,253,0.98);
+      z-index: 2;
+      color: #5b6d82;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .heatmap-table thead th:first-child {
+      z-index: 3;
+    }
+    .heat-cell {
+      color: #0f172a;
+      font-weight: 700;
+    }
     @media (max-width: 1480px) {
       .dashboard-shell {
         grid-template-columns: 350px minmax(0, 1fr);
@@ -1966,6 +2204,9 @@ def create_app(config_path: Path) -> FastAPI:
       .grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
+      .diagnostic-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
     }
     @media (max-width: 860px) {
       .hero,
@@ -1989,6 +2230,9 @@ def create_app(config_path: Path) -> FastAPI:
       }
       .control-actions,
       .launch-box {
+        grid-template-columns: 1fr;
+      }
+      .diagnostic-grid {
         grid-template-columns: 1fr;
       }
       .value {
@@ -2075,6 +2319,15 @@ def create_app(config_path: Path) -> FastAPI:
         </div>
         <div id="launchMessage" class="launch-message">최근 실행 메시지가 여기에 표시됩니다.</div>
       </div>
+      <div class="queue-manager">
+        <div class="queue-manager-head">
+          <h3 class="queue-manager-title">대기 중 작업</h3>
+          <div class="queue-manager-copy" id="queuedJobCount">0개</div>
+        </div>
+        <div id="queuedJobList" class="queued-job-list">
+          <div class="queued-job-empty">대기 중인 filekey가 없습니다.</div>
+        </div>
+      </div>
     </section>
     </aside>
     <main class="main-stack">
@@ -2142,15 +2395,55 @@ def create_app(config_path: Path) -> FastAPI:
           </div>
         </div>
         <div class="panel-body">
-          <div class="chart-wrap">
-            <svg id="trainingChart" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
-            <div class="legend">
-              <span class="blue">Validation Accuracy</span>
-              <span class="green">Validation Macro F1</span>
+          <div class="metric-stack">
+            <div class="chart-wrap">
+              <div class="chart-shell">
+                <svg id="trainingChart" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+                <div id="trainingChartTooltip" class="chart-tooltip"></div>
+              </div>
+              <div class="legend">
+                <span class="blue">Validation Accuracy</span>
+                <span class="green">Validation Macro F1</span>
+              </div>
+            </div>
+            <div class="diagnostic-grid">
+              <div class="insight-card">
+                <div class="insight-label">최종 Validation</div>
+                <div class="insight-value" id="finalValMetrics">-</div>
+                <div class="insight-copy" id="finalValMetricsCopy">최종 accuracy / macro F1</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Best Epoch</div>
+                <div class="insight-value" id="bestEpochValue">-</div>
+                <div class="insight-copy" id="bestEpochCopy">가장 높은 macro F1을 기록한 epoch</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Loss Gap</div>
+                <div class="insight-value" id="lossGapValue">-</div>
+                <div class="insight-copy" id="lossGapCopy">최신 val loss - train loss</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Validation Samples</div>
+                <div class="insight-value" id="valSampleTotal">-</div>
+                <div class="insight-copy" id="valSampleCopy">최종 validation 샘플 수</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Class Coverage</div>
+                <div class="insight-value" id="classCoverageValue">-</div>
+                <div class="insight-copy" id="classCoverageCopy">validation에 등장한 클래스 수</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Dominant Class</div>
+                <div class="insight-value" id="dominantClassValue">-</div>
+                <div class="insight-copy" id="dominantClassCopy">validation에서 가장 많은 클래스</div>
+              </div>
             </div>
           </div>
           <div class="chart-wrap" style="margin-top:18px;">
-            <svg id="lossChart" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+            <div class="chart-shell">
+              <svg id="lossChart" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+              <div id="lossChartTooltip" class="chart-tooltip"></div>
+            </div>
             <div class="legend">
               <span class="blue">Train Loss</span>
               <span class="green">Validation Loss</span>
@@ -2235,7 +2528,7 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">클래스별 검증 지표</h2>
-            <div class="panel-copy">Precision / Recall / F1</div>
+            <div class="panel-copy">Precision / Recall / F1 / Support</div>
           </div>
         </div>
         <div class="panel-body">
@@ -2246,11 +2539,25 @@ def create_app(config_path: Path) -> FastAPI:
                 <th>Precision</th>
                 <th>Recall</th>
                 <th>F1</th>
+                <th>Support</th>
               </tr>
             </thead>
             <tbody id="perClassMetricsTable"></tbody>
           </table>
           <div id="perClassMetricsEmpty" class="empty" style="display:none; margin-top:14px;">클래스별 지표가 아직 없습니다.</div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Confusion Matrix</h2>
+            <div class="panel-copy">최종 validation confusion matrix</div>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="confusionMatrixWrap" class="heatmap-wrap"></div>
+          <div id="confusionMatrixEmpty" class="empty" style="display:none; margin-top:14px;">confusion matrix가 아직 없습니다.</div>
         </div>
       </article>
     </section>
@@ -2398,6 +2705,7 @@ def create_app(config_path: Path) -> FastAPI:
       const queueEditor = panel ? panel.querySelector('.queue-editor') : null;
       const controlActions = panel ? panel.querySelector('.control-actions') : null;
       const metaRow = panel ? panel.querySelector('.meta-row') : null;
+      const queueManager = panel ? panel.querySelector('.queue-manager') : null;
       if (queueEditor) {
         queueEditor.remove();
       }
@@ -2406,6 +2714,9 @@ def create_app(config_path: Path) -> FastAPI:
       }
       if (metaRow) {
         metaRow.remove();
+      }
+      if (queueManager) {
+        queueManager.remove();
       }
       const title = document.getElementById('controlTitle');
       const copy = document.getElementById('controlCopy');
@@ -2449,6 +2760,36 @@ def create_app(config_path: Path) -> FastAPI:
       box.style.color = isError ? '#dc2626' : '#64748b';
       box.style.borderColor = isError ? 'rgba(220,38,38,0.18)' : 'rgba(148,163,184,0.18)';
       box.style.background = isError ? 'rgba(220,38,38,0.06)' : 'rgba(255,255,255,0.84)';
+    }
+
+    function renderQueuedJobs(jobs) {
+      const count = document.getElementById('queuedJobCount');
+      const list = document.getElementById('queuedJobList');
+      if (!count || !list) {
+        return;
+      }
+      const items = Array.isArray(jobs) ? jobs : [];
+      count.textContent = `${items.length}개`;
+      if (!items.length) {
+        list.innerHTML = '<div class="queued-job-empty">대기 중인 filekey가 없습니다.</div>';
+        return;
+      }
+      list.innerHTML = items.map((job) => `
+        <div class="queued-job-item">
+          <div class="queued-job-main">
+            <div class="queued-job-key">filekey ${job.filekey || '-'}</div>
+            <div class="queued-job-meta">
+              datasetkey ${job.datasetkey || '-'} · queued ${formatDateTime(job.queued_at)}
+            </div>
+          </div>
+          <button
+            class="queued-remove-button"
+            type="button"
+            data-job-id="${job.job_id || ''}"
+            data-filekey="${job.filekey || ''}"
+          >제거</button>
+        </div>
+      `).join('');
     }
 
     function updateControlButtons(launcher) {
@@ -2530,10 +2871,77 @@ def create_app(config_path: Path) -> FastAPI:
       return value;
     }
 
+    function buildAreaPath(points, height, padBottom) {
+      if (!points.length) {
+        return '';
+      }
+      const [firstX, firstY] = points[0].split(',').map(Number);
+      const [lastX] = points[points.length - 1].split(',').map(Number);
+      return `M ${firstX} ${height - padBottom} L ${firstX} ${firstY} L ${points.join(' L ')} L ${lastX} ${height - padBottom} Z`;
+    }
+
+    function attachChartTooltip({
+      svgId,
+      tooltipId,
+      lineId,
+      bottomY,
+    }) {
+      const svg = document.getElementById(svgId);
+      const tooltip = document.getElementById(tooltipId);
+      if (!svg || !tooltip) {
+        return;
+      }
+      const line = lineId ? svg.querySelector(`#${lineId}`) : null;
+      const points = svg.querySelectorAll('.chart-point-hit');
+      const hideTooltip = () => {
+        tooltip.classList.remove('visible');
+        if (line) {
+          line.style.opacity = '0';
+        }
+      };
+      points.forEach((point) => {
+        const showTooltip = (event) => {
+          const title = point.dataset.title || '';
+          const lines = (point.dataset.lines || '').split('|').filter(Boolean);
+          tooltip.innerHTML = `
+            <div class="chart-tooltip-title">${title}</div>
+            ${lines.map((entry) => {
+              const parts = entry.split(':');
+              const key = parts.shift() || '';
+              const value = parts.join(':');
+              return `<div class="chart-tooltip-line"><strong>${key}</strong>${value}</div>`;
+            }).join('')}
+          `;
+          const shellRect = tooltip.parentElement.getBoundingClientRect();
+          const x = event.clientX - shellRect.left;
+          const y = event.clientY - shellRect.top;
+          tooltip.style.left = `${x}px`;
+          tooltip.style.top = `${Math.max(18, y - 12)}px`;
+          tooltip.classList.add('visible');
+          if (line) {
+            const cx = Number(point.dataset.cx || 0);
+            line.setAttribute('x1', cx);
+            line.setAttribute('x2', cx);
+            line.setAttribute('y1', 16);
+            line.setAttribute('y2', bottomY);
+            line.style.opacity = '1';
+          }
+        };
+        point.addEventListener('mouseenter', showTooltip);
+        point.addEventListener('mousemove', showTooltip);
+        point.addEventListener('mouseleave', hideTooltip);
+      });
+      svg.addEventListener('mouseleave', hideTooltip);
+    }
+
     function renderChart(history) {
       const svg = document.getElementById('trainingChart');
       if (!history || !history.length) {
         svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">아직 학습 기록이 없습니다</text>';
+        const tooltip = document.getElementById('trainingChartTooltip');
+        if (tooltip) {
+          tooltip.classList.remove('visible');
+        }
         return;
       }
 
@@ -2548,6 +2956,8 @@ def create_app(config_path: Path) -> FastAPI:
 
       const accPoints = [];
       const f1Points = [];
+      const accCircles = [];
+      const f1Circles = [];
       const maxX = Math.max(history.length - 1, 1);
 
       history.forEach((row, index) => {
@@ -2556,6 +2966,32 @@ def create_app(config_path: Path) -> FastAPI:
         const f1Y = padTop + (1 - Math.max(0, Math.min(1, row.val_macro_f1 ?? 0))) * innerH;
         accPoints.push(`${x},${accY}`);
         f1Points.push(`${x},${f1Y}`);
+        accCircles.push(`
+          <g class="chart-point" transform="translate(${x}, ${accY})">
+            <circle class="chart-point-core" r="4.5" fill="#ffffff"></circle>
+            <circle class="chart-point-core" r="3" fill="#2563eb"></circle>
+            <circle
+              class="chart-point-hit"
+              r="12"
+              data-cx="${x}"
+              data-title="Epoch ${row.epoch}"
+              data-lines="Val Acc:${Number(row.val_accuracy ?? 0).toFixed(4)}|Val Macro F1:${Number(row.val_macro_f1 ?? 0).toFixed(4)}|Train Loss:${Number(row.train_loss ?? 0).toFixed(4)}|Val Loss:${Number(row.val_loss ?? 0).toFixed(4)}"
+            ></circle>
+          </g>
+        `);
+        f1Circles.push(`
+          <g class="chart-point" transform="translate(${x}, ${f1Y})">
+            <circle class="chart-point-core" r="4.5" fill="#ffffff"></circle>
+            <circle class="chart-point-core" r="3" fill="#059669"></circle>
+            <circle
+              class="chart-point-hit"
+              r="12"
+              data-cx="${x}"
+              data-title="Epoch ${row.epoch}"
+              data-lines="Val Macro F1:${Number(row.val_macro_f1 ?? 0).toFixed(4)}|Val Acc:${Number(row.val_accuracy ?? 0).toFixed(4)}|Train Loss:${Number(row.train_loss ?? 0).toFixed(4)}|Val Loss:${Number(row.val_loss ?? 0).toFixed(4)}"
+            ></circle>
+          </g>
+        `);
       });
 
       const gridLines = [0, 0.25, 0.5, 0.75, 1].map(value => {
@@ -2570,20 +3006,55 @@ def create_app(config_path: Path) -> FastAPI:
         const x = padLeft + (index / maxX) * innerW;
         return `<text x="${x}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${row.epoch}</text>`;
       }).join('');
+      const accArea = buildAreaPath(accPoints, height, padBottom);
+      const f1Area = buildAreaPath(f1Points, height, padBottom);
 
       svg.innerHTML = `
+        <defs>
+          <linearGradient id="trainingAccStroke" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#3b82f6" />
+            <stop offset="100%" stop-color="#2563eb" />
+          </linearGradient>
+          <linearGradient id="trainingF1Stroke" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#34d399" />
+            <stop offset="100%" stop-color="#059669" />
+          </linearGradient>
+          <linearGradient id="trainingAccFill" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.22" />
+            <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.01" />
+          </linearGradient>
+          <linearGradient id="trainingF1Fill" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#059669" stop-opacity="0.20" />
+            <stop offset="100%" stop-color="#059669" stop-opacity="0.01" />
+          </linearGradient>
+        </defs>
         <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"></rect>
         ${gridLines}
-        <polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${accPoints.join(' ')}"></polyline>
-        <polyline fill="none" stroke="#059669" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${f1Points.join(' ')}"></polyline>
+        <path d="${accArea}" fill="url(#trainingAccFill)"></path>
+        <path d="${f1Area}" fill="url(#trainingF1Fill)"></path>
+        <line id="trainingChartHoverLine" class="chart-hover-line" x1="0" y1="0" x2="0" y2="0"></line>
+        <polyline fill="none" stroke="url(#trainingAccStroke)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" points="${accPoints.join(' ')}"></polyline>
+        <polyline fill="none" stroke="url(#trainingF1Stroke)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" points="${f1Points.join(' ')}"></polyline>
+        ${accCircles.join('')}
+        ${f1Circles.join('')}
         ${xLabels}
       `;
+      attachChartTooltip({
+        svgId: 'trainingChart',
+        tooltipId: 'trainingChartTooltip',
+        lineId: 'trainingChartHoverLine',
+        bottomY: height - padBottom,
+      });
     }
 
     function renderLossChart(history) {
       const svg = document.getElementById('lossChart');
       if (!history || !history.length) {
         svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">아직 손실 기록이 없습니다</text>';
+        const tooltip = document.getElementById('lossChartTooltip');
+        if (tooltip) {
+          tooltip.classList.remove('visible');
+        }
         return;
       }
 
@@ -2603,6 +3074,8 @@ def create_app(config_path: Path) -> FastAPI:
       const maxX = Math.max(history.length - 1, 1);
       const trainPoints = [];
       const valPoints = [];
+      const trainCircles = [];
+      const valCircles = [];
 
       history.forEach((row, index) => {
         const x = padLeft + (index / maxX) * innerW;
@@ -2610,6 +3083,32 @@ def create_app(config_path: Path) -> FastAPI:
         const valY = padTop + (1 - Math.min(1, Number(row.val_loss || 0) / maxLoss)) * innerH;
         trainPoints.push(`${x},${trainY}`);
         valPoints.push(`${x},${valY}`);
+        trainCircles.push(`
+          <g class="chart-point" transform="translate(${x}, ${trainY})">
+            <circle class="chart-point-core" r="4.5" fill="#ffffff"></circle>
+            <circle class="chart-point-core" r="3" fill="#2563eb"></circle>
+            <circle
+              class="chart-point-hit"
+              r="12"
+              data-cx="${x}"
+              data-title="Epoch ${row.epoch}"
+              data-lines="Train Loss:${Number(row.train_loss ?? 0).toFixed(4)}|Val Loss:${Number(row.val_loss ?? 0).toFixed(4)}|Val Acc:${Number(row.val_accuracy ?? 0).toFixed(4)}|Val Macro F1:${Number(row.val_macro_f1 ?? 0).toFixed(4)}"
+            ></circle>
+          </g>
+        `);
+        valCircles.push(`
+          <g class="chart-point" transform="translate(${x}, ${valY})">
+            <circle class="chart-point-core" r="4.5" fill="#ffffff"></circle>
+            <circle class="chart-point-core" r="3" fill="#059669"></circle>
+            <circle
+              class="chart-point-hit"
+              r="12"
+              data-cx="${x}"
+              data-title="Epoch ${row.epoch}"
+              data-lines="Val Loss:${Number(row.val_loss ?? 0).toFixed(4)}|Train Loss:${Number(row.train_loss ?? 0).toFixed(4)}|Val Acc:${Number(row.val_accuracy ?? 0).toFixed(4)}|Val Macro F1:${Number(row.val_macro_f1 ?? 0).toFixed(4)}"
+            ></circle>
+          </g>
+        `);
       });
 
       const ticks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
@@ -2625,14 +3124,45 @@ def create_app(config_path: Path) -> FastAPI:
         const x = padLeft + (index / maxX) * innerW;
         return `<text x="${x}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${row.epoch}</text>`;
       }).join('');
+      const trainArea = buildAreaPath(trainPoints, height, padBottom);
+      const valArea = buildAreaPath(valPoints, height, padBottom);
 
       svg.innerHTML = `
+        <defs>
+          <linearGradient id="lossTrainStroke" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#60a5fa" />
+            <stop offset="100%" stop-color="#2563eb" />
+          </linearGradient>
+          <linearGradient id="lossValStroke" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#6ee7b7" />
+            <stop offset="100%" stop-color="#059669" />
+          </linearGradient>
+          <linearGradient id="lossTrainFill" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#2563eb" stop-opacity="0.20" />
+            <stop offset="100%" stop-color="#2563eb" stop-opacity="0.01" />
+          </linearGradient>
+          <linearGradient id="lossValFill" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#059669" stop-opacity="0.18" />
+            <stop offset="100%" stop-color="#059669" stop-opacity="0.01" />
+          </linearGradient>
+        </defs>
         <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"></rect>
         ${ticks}
-        <polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${trainPoints.join(' ')}"></polyline>
-        <polyline fill="none" stroke="#059669" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${valPoints.join(' ')}"></polyline>
+        <path d="${trainArea}" fill="url(#lossTrainFill)"></path>
+        <path d="${valArea}" fill="url(#lossValFill)"></path>
+        <line id="lossChartHoverLine" class="chart-hover-line" x1="0" y1="0" x2="0" y2="0"></line>
+        <polyline fill="none" stroke="url(#lossTrainStroke)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" points="${trainPoints.join(' ')}"></polyline>
+        <polyline fill="none" stroke="url(#lossValStroke)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" points="${valPoints.join(' ')}"></polyline>
+        ${trainCircles.join('')}
+        ${valCircles.join('')}
         ${xLabels}
       `;
+      attachChartTooltip({
+        svgId: 'lossChart',
+        tooltipId: 'lossChartTooltip',
+        lineId: 'lossChartHoverLine',
+        bottomY: height - padBottom,
+      });
     }
 
     function renderDatasetTable(dataset) {
@@ -2693,7 +3223,72 @@ def create_app(config_path: Path) -> FastAPI:
         `누적 prepared train ${continualTrain} / val ${continualVal}`;
     }
 
-    function renderPerClassMetrics(labels, perClass) {
+    function buildPerClassSupport(labels, confusion) {
+      const matrix = Array.isArray(confusion) ? confusion : [];
+      const supports = [];
+      for (let index = 0; index < matrix.length; index += 1) {
+        const row = Array.isArray(matrix[index]) ? matrix[index] : [];
+        const support = row.reduce((sum, value) => sum + Number(value || 0), 0);
+        supports.push({
+          class_index: index,
+          label: labels?.[index] || `class_${index}`,
+          support,
+        });
+      }
+      return supports;
+    }
+
+    function renderMetricInsights(progress, metrics) {
+      const finalValidation = progress?.final_validation || metrics?.final_validation || {};
+      const history = progress?.history || [];
+      const latest = progress?.latest || history[history.length - 1] || null;
+      const labels = progress?.labels || metrics?.labels || [];
+      const supports = buildPerClassSupport(labels, finalValidation?.confusion_matrix || []);
+      const totalSupport = supports.reduce((sum, row) => sum + Number(row.support || 0), 0);
+      const coveredClasses = supports.filter((row) => Number(row.support || 0) > 0);
+      const dominant = supports.slice().sort((a, b) => Number(b.support || 0) - Number(a.support || 0))[0];
+      const lossGap =
+        latest && latest.train_loss !== undefined && latest.val_loss !== undefined
+          ? Number(latest.val_loss) - Number(latest.train_loss)
+          : null;
+
+      document.getElementById('finalValMetrics').textContent =
+        finalValidation?.accuracy !== undefined && finalValidation?.macro_f1 !== undefined
+          ? `${Number(finalValidation.accuracy).toFixed(3)} / ${Number(finalValidation.macro_f1).toFixed(3)}`
+          : '-';
+      document.getElementById('finalValMetricsCopy').textContent = 'accuracy / macro F1';
+
+      document.getElementById('bestEpochValue').textContent =
+        progress?.best_epoch !== undefined && progress?.best_epoch !== null
+          ? `Epoch ${progress.best_epoch}`
+          : '-';
+      document.getElementById('bestEpochCopy').textContent =
+        progress?.best_val_macro_f1 !== undefined && progress?.best_val_macro_f1 !== null
+          ? `best macro F1 ${Number(progress.best_val_macro_f1).toFixed(3)}`
+          : '가장 높은 macro F1을 기록한 epoch';
+
+      document.getElementById('lossGapValue').textContent =
+        lossGap !== null ? `${lossGap >= 0 ? '+' : ''}${lossGap.toFixed(4)}` : '-';
+      document.getElementById('lossGapCopy').textContent =
+        latest ? `latest val ${latest.val_loss} - train ${latest.train_loss}` : '최신 val loss - train loss';
+
+      document.getElementById('valSampleTotal').textContent =
+        totalSupport > 0 ? String(totalSupport) : '-';
+      document.getElementById('valSampleCopy').textContent = '최종 validation 샘플 수';
+
+      document.getElementById('classCoverageValue').textContent =
+        supports.length ? `${coveredClasses.length} / ${supports.length}` : '-';
+      document.getElementById('classCoverageCopy').textContent = 'validation에 등장한 클래스 수';
+
+      document.getElementById('dominantClassValue').textContent =
+        dominant && Number(dominant.support || 0) > 0 ? dominant.label : '-';
+      document.getElementById('dominantClassCopy').textContent =
+        dominant && Number(dominant.support || 0) > 0
+          ? `support ${dominant.support}`
+          : 'validation에서 가장 많은 클래스';
+    }
+
+    function renderPerClassMetrics(labels, perClass, confusion) {
       const tbody = document.getElementById('perClassMetricsTable');
       const empty = document.getElementById('perClassMetricsEmpty');
       if (!perClass || !perClass.length) {
@@ -2702,17 +3297,64 @@ def create_app(config_path: Path) -> FastAPI:
         return;
       }
       empty.style.display = 'none';
+      const supportRows = buildPerClassSupport(labels, confusion);
       tbody.innerHTML = perClass.map((row) => {
         const label = labels?.[row.class_index] || `class_${row.class_index}`;
+        const support = supportRows.find((item) => item.class_index === row.class_index)?.support ?? 0;
         return `
           <tr>
             <td>${label}</td>
             <td>${row.precision ?? '-'}</td>
             <td>${row.recall ?? '-'}</td>
             <td>${row.f1 ?? '-'}</td>
+            <td>${support}</td>
           </tr>
         `;
       }).join('');
+    }
+
+    function renderConfusionMatrix(labels, confusion) {
+      const wrap = document.getElementById('confusionMatrixWrap');
+      const empty = document.getElementById('confusionMatrixEmpty');
+      const matrix = Array.isArray(confusion) ? confusion : [];
+      if (!wrap || !matrix.length) {
+        if (wrap) {
+          wrap.innerHTML = '';
+        }
+        if (empty) {
+          empty.style.display = 'block';
+        }
+        return;
+      }
+      if (empty) {
+        empty.style.display = 'none';
+      }
+      const maxValue = Math.max(1, ...matrix.flatMap((row) => Array.isArray(row) ? row.map((value) => Number(value || 0)) : [0]));
+      const headerCells = labels.map((label) => `<th>${label}</th>`).join('');
+      const bodyRows = matrix.map((row, rowIndex) => {
+        const label = labels?.[rowIndex] || `class_${rowIndex}`;
+        const cells = row.map((value) => {
+          const numeric = Number(value || 0);
+          const intensity = Math.max(0, Math.min(1, numeric / maxValue));
+          const bg = `rgba(37, 99, 235, ${0.06 + intensity * 0.44})`;
+          const color = intensity > 0.55 ? '#eff6ff' : '#0f172a';
+          return `<td class="heat-cell" style="background:${bg};color:${color};">${numeric}</td>`;
+        }).join('');
+        return `<tr><th>${label}</th>${cells}</tr>`;
+      }).join('');
+      wrap.innerHTML = `
+        <table class="heatmap-table">
+          <thead>
+            <tr>
+              <th>True \\ Pred</th>
+              ${headerCells}
+            </tr>
+          </thead>
+          <tbody>
+            ${bodyRows}
+          </tbody>
+        </table>
+      `;
     }
 
     function formatDateTime(value) {
@@ -2930,6 +3572,33 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
+    async function removeQueuedJob(jobId, filekey) {
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 대기열을 수정할 수 없습니다.', true);
+        return;
+      }
+      const confirmed = window.confirm(`대기 중인 filekey ${filekey || ''} 작업을 큐에서 삭제할까요?`);
+      if (!confirmed) {
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/remove-queued-job', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: jobId }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || data.message || '대기열 삭제에 실패했습니다.');
+        }
+        setLaunchMessage(data.message || '선택한 대기열 작업을 삭제했습니다.', false);
+        await refresh();
+      } catch (error) {
+        setLaunchMessage(error.message || String(error), true);
+      }
+    }
+
     async function refresh() {
       const response = await fetch('/api/overview');
       if (!response.ok) {
@@ -2969,6 +3638,7 @@ def create_app(config_path: Path) -> FastAPI:
       document.getElementById('launcherLogPath').textContent = launcher.log_path || '-';
       setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
       updateControlButtons(launcher);
+      renderQueuedJobs(launcher.pending_jobs || []);
 
       document.getElementById('currentStage').textContent = pipeline.stage || '-';
       document.getElementById('currentMessage').textContent = pipeline.message || '-';
@@ -3025,12 +3695,17 @@ def create_app(config_path: Path) -> FastAPI:
 
       renderChart(progress.history || []);
       renderLossChart(progress.history || []);
+      renderMetricInsights(progress, metrics);
       renderDatasetTable(data.dataset || {});
       renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
+      const metricLabels = progress.labels || metrics.labels || [];
+      const finalValidation = progress.final_validation || metrics.final_validation || {};
       renderPerClassMetrics(
-        progress.labels || metrics.labels || [],
-        progress.final_validation?.per_class || metrics.final_validation?.per_class || []
+        metricLabels,
+        finalValidation.per_class || [],
+        finalValidation.confusion_matrix || []
       );
+      renderConfusionMatrix(metricLabels, finalValidation.confusion_matrix || []);
       renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
       renderLogPanels(logs, launcher);
     }
@@ -3045,6 +3720,13 @@ def create_app(config_path: Path) -> FastAPI:
     document.getElementById('stopButton').addEventListener('click', pauseQueue);
     document.getElementById('forceStopButton').addEventListener('click', forceStopCurrentJob);
     document.getElementById('resetButton').addEventListener('click', resetWorkspace);
+    document.getElementById('queuedJobList')?.addEventListener('click', (event) => {
+      const button = event.target.closest('.queued-remove-button');
+      if (!button) {
+        return;
+      }
+      removeQueuedJob(button.dataset.jobId || '', button.dataset.filekey || '');
+    });
     applyViewerMode();
     refresh();
     setInterval(refresh, 2000);
@@ -3173,6 +3855,50 @@ def create_app(config_path: Path) -> FastAPI:
         return {
             "ok": True,
             "message": "현재 작업까지만 진행하고, 다음 큐 자동 시작을 멈춥니다.",
+            "launcher": get_launcher_status(),
+        }
+
+    @app.post("/api/remove-queued-job")
+    async def remove_queued_job(request: Request) -> dict:
+        payload = await request.json()
+        job_id = str(payload.get("job_id", "")).strip()
+        if not job_id:
+            raise HTTPException(status_code=400, detail="삭제할 job_id가 필요합니다.")
+
+        with state_lock:
+            update_process_state()
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            if not isinstance(pending_jobs, list) or not pending_jobs:
+                raise HTTPException(status_code=404, detail="삭제할 대기열 작업이 없습니다.")
+
+            removed_job = None
+            remaining_jobs = []
+            for job in pending_jobs:
+                if (
+                    removed_job is None
+                    and isinstance(job, dict)
+                    and str(job.get("job_id", "")).strip() == job_id
+                ):
+                    removed_job = snapshot_job(job)
+                    continue
+                remaining_jobs.append(job)
+
+            if removed_job is None:
+                raise HTTPException(status_code=404, detail="선택한 대기열 작업을 찾을 수 없습니다.")
+
+            launcher_state["queued_jobs"] = remaining_jobs
+            launcher_state["last_state"] = "queued" if remaining_jobs else (launcher_state.get("last_state") or "idle")
+            launcher_state["last_message"] = (
+                f"datasetkey {removed_job.get('datasetkey', '-')}"
+                f" | filekey {removed_job.get('filekey', '-')} 를 대기열에서 삭제했습니다."
+            )
+
+        return {
+            "ok": True,
+            "message": (
+                f"datasetkey {removed_job.get('datasetkey', '-')}"
+                f" | filekey {removed_job.get('filekey', '-')} 를 대기열에서 삭제했습니다."
+            ),
             "launcher": get_launcher_status(),
         }
 
