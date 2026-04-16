@@ -287,6 +287,22 @@ def create_app(config_path: Path) -> FastAPI:
             )
             branch = decode_process_output(branch_result.stdout).strip() or "main"
 
+            unmerged_result = subprocess.run(
+                ["git", "-C", str(pages_dir), "diff", "--name-only", "--diff-filter=U"],
+                capture_output=True,
+            )
+            if unmerged_result.returncode == 0:
+                unmerged_files = [
+                    line.strip()
+                    for line in decode_process_output(unmerged_result.stdout).splitlines()
+                    if line.strip()
+                ]
+                if unmerged_files:
+                    raise RuntimeError(
+                        "detectWarning-pages 저장소에 미해결 충돌 파일이 남아 있습니다: "
+                        + ", ".join(unmerged_files[:5])
+                    )
+
             pull_result = subprocess.run(
                 ["git", "-C", str(pages_dir), "pull", "--rebase", "--autostash", "origin", branch],
                 capture_output=True,
@@ -3244,8 +3260,11 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
 def read_json(path: Path):
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def parse_filekeys(raw_value) -> list[str]:

@@ -270,8 +270,11 @@ def safe_number(value) -> float | None:
 def read_json(path: Path) -> dict | list | None:
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def write_json(path: Path, payload: dict) -> None:
