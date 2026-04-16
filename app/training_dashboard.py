@@ -2043,10 +2043,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .chart-point {
       cursor: pointer;
-      transition: transform 0.12s ease, opacity 0.12s ease;
-    }
-    .chart-point:hover {
-      transform: scale(1.14);
+      transition: opacity 0.12s ease;
     }
     .chart-point-core {
       pointer-events: none;
@@ -2054,6 +2051,12 @@ def create_app(config_path: Path) -> FastAPI:
     .chart-point-hit {
       fill: transparent;
       pointer-events: all;
+    }
+    .chart-point.is-active .chart-point-core {
+      filter: drop-shadow(0 0 8px rgba(37, 99, 235, 0.22));
+    }
+    .chart-point.is-active .chart-point-core:last-child {
+      opacity: 1;
     }
     .chart-hover-line {
       stroke: rgba(148,163,184,0.28);
@@ -2893,14 +2896,27 @@ def create_app(config_path: Path) -> FastAPI:
       }
       const line = lineId ? svg.querySelector(`#${lineId}`) : null;
       const points = svg.querySelectorAll('.chart-point-hit');
+      let activeGroup = null;
       const hideTooltip = () => {
         tooltip.classList.remove('visible');
         if (line) {
           line.style.opacity = '0';
         }
+        if (activeGroup) {
+          activeGroup.classList.remove('is-active');
+          activeGroup = null;
+        }
       };
       points.forEach((point) => {
         const showTooltip = (event) => {
+          const group = point.closest('.chart-point');
+          if (activeGroup && activeGroup !== group) {
+            activeGroup.classList.remove('is-active');
+          }
+          if (group) {
+            group.classList.add('is-active');
+            activeGroup = group;
+          }
           const title = point.dataset.title || '';
           const lines = (point.dataset.lines || '').split('|').filter(Boolean);
           tooltip.innerHTML = `
