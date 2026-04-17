@@ -193,12 +193,13 @@ def build_live_status_payload(
     redirect_delay_seconds: int = 3,
 ) -> dict:
     current = read_json(pages_dir / "live-status.json") or {}
+    effective_live_url = str(live_url or current.get("live_url") or "").strip()
     payload = {
         "status": status,
         "project_name": current.get("project_name") or "detectWarning Training Dashboard",
         "live_title": current.get("live_title") or "실시간 연결 가능",
         "offline_title": current.get("offline_title") or "오프라인 리포트",
-        "live_url": live_url,
+        "live_url": effective_live_url,
         "report_url": current.get("report_url") or "/",
         "redirect_delay_seconds": redirect_delay_seconds,
         "updated_at": now_iso(),

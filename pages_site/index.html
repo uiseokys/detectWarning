@@ -711,6 +711,11 @@
 
   <script>
     const cacheBust = () => `?t=${Date.now()}`;
+    const LIVE_STATUS_STORAGE_KEY = "detectwarning.live-status.v2";
+    const REPORT_STORAGE_KEY = "detectwarning.latest-report.v1";
+    const STATUS_REFRESH_MS = 8000;
+    let redirectTimer = null;
+    let redirectTarget = "";
 
     async function fetchJson(path) {
       const response = await fetch(`${path}${cacheBust()}`, { cache: "no-store" });
@@ -901,10 +906,39 @@
       renderClassTable(report.per_class || []);
     }
 
+    function readStoredJson(key) {
+      try {
+        const raw = window.localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function writeStoredJson(key, value) {
+      try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+      } catch (_) {}
+    }
+
+    function clearLiveRedirect() {
+      if (redirectTimer) {
+        clearInterval(redirectTimer);
+      }
+      redirectTimer = null;
+      redirectTarget = "";
+    }
+
     function startLiveRedirect(status) {
       if (status.status !== "online" || !status.live_url) return;
 
       const liveUrl = buildViewerLiveUrl(status.live_url);
+      if (redirectTimer && redirectTarget === liveUrl) {
+        return;
+      }
+
+      clearLiveRedirect();
+      redirectTarget = liveUrl;
 
       const delay = Number(status.redirect_delay_seconds || 3);
       let countdown = Number.isNaN(delay) ? 3 : delay;
@@ -915,12 +949,14 @@
       const timer = setInterval(() => {
         countdown -= 1;
         if (countdown <= 0) {
-          clearInterval(timer);
+          clearLiveRedirect();
           window.location.href = liveUrl;
           return;
         }
         message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
       }, 1000);
+
+      redirectTimer = timer;
     }
 
     function buildViewerLiveUrl(url) {
@@ -933,6 +969,71 @@
         const joiner = url.includes("?") ? "&" : "?";
         return `${url}${joiner}viewer=1`;
       }
+    }
+
+    function normalizeLiveStatus(status) {
+      const stored = readStoredJson(LIVE_STATUS_STORAGE_KEY) || {};
+      const merged = {
+        ...stored,
+        ...(status || {})
+      };
+      merged.status = String(merged.status || "offline").toLowerCase();
+      merged.live_url = String(merged.live_url || stored.live_url || "").trim();
+      merged.redirect_delay_seconds = Number(merged.redirect_delay_seconds || 3) || 3;
+      return merged;
+    }
+
+    async function probeLiveUrl(url, timeoutMs = 2200) {
+      if (!url) return false;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const probeUrl = new URL("/api/live-ping", buildViewerLiveUrl(url));
+        probeUrl.searchParams.set("_t", String(Date.now()));
+        await fetch(probeUrl.toString(), {
+          method: "GET",
+          mode: "no-cors",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        return true;
+      } catch (_) {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function resolveLiveStatus(status) {
+      const normalized = normalizeLiveStatus(status);
+      if (!normalized.live_url) {
+        return normalized;
+      }
+
+      const reachable = await probeLiveUrl(normalized.live_url);
+      if (reachable) {
+        const resolved = {
+          ...normalized,
+          status: "online",
+          updated_at: normalized.updated_at || new Date().toISOString(),
+          message: normalized.status === "online"
+            ? (normalized.message || "실시간 대시보드를 사용할 수 있습니다.")
+            : "실시간 연결을 확인했습니다.",
+        };
+        writeStoredJson(LIVE_STATUS_STORAGE_KEY, resolved);
+        return resolved;
+      }
+
+      if (normalized.status === "online") {
+        return {
+          ...normalized,
+          status: "warning",
+          message: "실시간 주소를 확인 중입니다.",
+        };
+      }
+
+      writeStoredJson(LIVE_STATUS_STORAGE_KEY, normalized);
+      return normalized;
     }
 
     function renderLiveStatus(status) {
@@ -957,6 +1058,26 @@
         return;
       }
 
+      clearLiveRedirect();
+
+      if (status.status === "warning") {
+        pill.className = "status-pill tone-warning";
+        pill.textContent = "warning";
+        title.textContent = status.live_title || "실시간 연결 확인 중";
+        message.textContent = status.updated_at
+          ? `최근 갱신 ${formatDateTime(status.updated_at)}`
+          : (status.message || "실시간 대시보드 상태를 확인하는 중입니다.");
+        detail.textContent = status.message || "잠시 후 다시 확인합니다.";
+        if (status.live_url) {
+          liveLink.style.display = "inline-flex";
+          liveLink.href = buildViewerLiveUrl(status.live_url);
+        } else {
+          liveLink.style.display = "none";
+          liveLink.href = "#";
+        }
+        return;
+      }
+
       pill.className = "status-pill tone-offline";
       pill.textContent = "offline";
       title.textContent = status.offline_title || "오프라인 리포트";
@@ -968,29 +1089,55 @@
       liveLink.href = "#";
     }
 
-    async function boot() {
+    function renderCachedState() {
+      const cachedStatus = readStoredJson(LIVE_STATUS_STORAGE_KEY);
+      const cachedReport = readStoredJson(REPORT_STORAGE_KEY);
+      if (cachedStatus) {
+        renderLiveStatus(normalizeLiveStatus(cachedStatus));
+      }
+      if (cachedReport) {
+        renderReport(cachedReport);
+      }
+    }
+
+    async function refreshDashboard() {
       try {
         const [status, report] = await Promise.all([
           fetchJson("./live-status.json"),
           fetchJson("./latest-result.json")
         ]);
-        renderLiveStatus(status);
+        const resolvedStatus = await resolveLiveStatus(status);
+        writeStoredJson(LIVE_STATUS_STORAGE_KEY, resolvedStatus);
+        writeStoredJson(REPORT_STORAGE_KEY, report);
+        renderLiveStatus(resolvedStatus);
         renderReport(report);
       } catch (error) {
-        document.getElementById("liveStateTitle").textContent = "불러오기 실패";
+        const cachedStatus = normalizeLiveStatus(readStoredJson(LIVE_STATUS_STORAGE_KEY) || {});
+        if (cachedStatus.live_url) {
+          const reachable = await probeLiveUrl(cachedStatus.live_url, 1800);
+          if (reachable) {
+            renderLiveStatus({
+              ...cachedStatus,
+              status: "online",
+              message: "저장된 실시간 주소로 연결을 확인했습니다.",
+            });
+            return;
+          }
+        }
+
+        document.getElementById("liveStateTitle").textContent = "상태 확인 지연";
         document.getElementById("liveStatePill").className = "status-pill tone-warning";
         document.getElementById("liveStatePill").textContent = "warning";
         document.getElementById("liveStateMessage").textContent =
-          error?.message || "데이터를 읽지 못했습니다.";
+          error?.message || "상태를 읽지 못했습니다.";
         document.getElementById("redirectMessage").textContent =
-          "잠시 후 다시 시도해 주세요.";
-        document.getElementById("latestJobState").textContent = "데이터 없음";
-        document.getElementById("latestJobMessage").textContent =
-          "결과 데이터를 불러오지 못했습니다.";
+          "잠시 후 자동으로 다시 확인합니다.";
       }
     }
 
-    boot();
+    renderCachedState();
+    refreshDashboard();
+    setInterval(refreshDashboard, STATUS_REFRESH_MS);
   </script>
 </body>
 </html>

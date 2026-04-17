@@ -3883,6 +3883,15 @@ def create_app(config_path: Path) -> FastAPI:
     def overview() -> dict:
         return build_overview(paths, config_path, config=config, launcher_status=get_launcher_status())
 
+    @app.get("/api/live-ping")
+    def live_ping() -> dict:
+        launcher = get_launcher_status()
+        return {
+            "ok": True,
+            "state": launcher.get("state"),
+            "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        }
+
     @app.post("/api/start")
     async def start_training(request: Request) -> dict:
         if str(config.get("dataset_source", "")).strip().lower() != "aihub_shell":
