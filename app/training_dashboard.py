@@ -17,6 +17,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from action_training_pipeline import load_config, resolve_paths
@@ -256,6 +257,13 @@ def create_app(config_path: Path) -> FastAPI:
     launcher_history_path = paths["workspace_dir"] / "launcher_history.json"
 
     app = FastAPI(title="detectWarning Training Dashboard")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
     state_lock = threading.Lock()
 
     launcher_state: dict[str, object] = {

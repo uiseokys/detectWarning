@@ -41,7 +41,9 @@
       "kidnapping": "abduction",
       "abduction": "abduction",
       "배회": "loitering",
+      "배회(wander)": "loitering",
       "loitering": "loitering",
+      "wander": "loitering",
       "wandering": "loitering"
     },
     "video_extensions": [

@@ -1036,6 +1036,83 @@
       return normalized;
     }
 
+    async function fetchLiveOverview(status) {
+      if (!status || !status.live_url) return null;
+      try {
+        const overviewUrl = new URL("/api/overview", buildViewerLiveUrl(status.live_url));
+        overviewUrl.searchParams.set("_t", String(Date.now()));
+        const response = await fetch(overviewUrl.toString(), {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          return null;
+        }
+        return response.json();
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function formatPercent(value) {
+      const num = Number(value || 0);
+      if (Number.isNaN(num)) return "-";
+      return `${(num * 100).toFixed(1)}%`;
+    }
+
+    function renderLiveOverview(overview) {
+      if (!overview || !overview.launcher) return;
+      const launcher = overview.launcher || {};
+      const progress = overview.current_job_progress || {};
+      const currentDataset = overview.current_dataset || {};
+      const pipelineStatus = overview.pipeline_status || {};
+      const queue = overview.queue_progress || {};
+      const currentJob = launcher.current_job || {};
+
+      document.getElementById("latestJobState").innerHTML =
+        `<span class="${stateClass(launcher.state)}">${stateLabel(launcher.state)}</span>`;
+      document.getElementById("latestJobMessage").textContent =
+        launcher.message || progress.detail || "현재 실행 상태를 확인하는 중입니다.";
+
+      if (currentJob.filekey) {
+        document.getElementById("latestFilekey").textContent = currentJob.filekey || "-";
+      }
+      if (currentJob.datasetkey) {
+        document.getElementById("latestDatasetkey").textContent = currentJob.datasetkey || "-";
+      }
+
+      const preparedTrain = currentDataset.prepared_train?.total ?? 0;
+      const preparedVal = currentDataset.prepared_val?.total ?? 0;
+      const preparedTest = currentDataset.prepared_test?.total ?? 0;
+      document.getElementById("sampleTotals").textContent =
+        `${preparedTrain} / ${preparedVal} / ${preparedTest}`;
+      document.getElementById("resumeState").textContent =
+        progress.stage_label || stateLabel(launcher.state);
+
+      const progressText = progress.ratio !== undefined
+        ? `${formatPercent(progress.ratio)} · ${progress.stage_label || "-"}`
+        : (progress.stage_label || "-");
+      document.getElementById("jobDuration").textContent = progressText;
+      document.getElementById("jobRange").textContent =
+        `활성 ${queue.active ?? 0} · 대기 ${queue.pending ?? 0} · 완료 ${queue.completed ?? 0}`;
+
+      document.getElementById("updatedAt").textContent =
+        formatDateTime(pipelineStatus.updated_at || overview.training_progress?.updated_at || new Date().toISOString());
+      document.getElementById("projectName").textContent =
+        overview.workspace_name ? `${overview.workspace_name} · live` : "live";
+
+      document.getElementById("jobDetailBox").innerHTML = `
+        상태: ${stateLabel(launcher.state)}<br />
+        단계: ${progress.stage_label || "-"}<br />
+        진행률: ${formatPercent(progress.ratio || 0)}<br />
+        datasetkey: ${currentJob.datasetkey || overview.aihub?.datasetkey || "-"}<br />
+        filekey: ${currentJob.filekey || "-"}<br />
+        raw / prepared: ${(currentDataset.raw?.total ?? 0)} / ${preparedTrain + preparedVal + preparedTest}<br />
+        큐: 활성 ${queue.active ?? 0}, 대기 ${queue.pending ?? 0}, 완료 ${queue.completed ?? 0}<br /><br />
+        ${launcher.message || progress.detail || "현재 작업 메시지가 없습니다."}
+      `;
+    }
+
     function renderLiveStatus(status) {
       const pill = document.getElementById("liveStatePill");
       const title = document.getElementById("liveStateTitle");
@@ -1111,6 +1188,12 @@
         writeStoredJson(REPORT_STORAGE_KEY, report);
         renderLiveStatus(resolvedStatus);
         renderReport(report);
+        if (resolvedStatus.live_url && (resolvedStatus.status === "online" || resolvedStatus.status === "warning")) {
+          const overview = await fetchLiveOverview(resolvedStatus);
+          if (overview) {
+            renderLiveOverview(overview);
+          }
+        }
       } catch (error) {
         const cachedStatus = normalizeLiveStatus(readStoredJson(LIVE_STATUS_STORAGE_KEY) || {});
         if (cachedStatus.live_url) {
@@ -1121,6 +1204,13 @@
               status: "online",
               message: "저장된 실시간 주소로 연결을 확인했습니다.",
             });
+            const overview = await fetchLiveOverview({
+              ...cachedStatus,
+              status: "online",
+            });
+            if (overview) {
+              renderLiveOverview(overview);
+            }
             return;
           }
         }

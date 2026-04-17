@@ -1584,11 +1584,18 @@ def resolve_aihub_api_key(shell_config: dict) -> str:
 def infer_label_from_path(video_path: Path, label_mapping: dict) -> tuple[str, str | None]:
     relative_text = str(video_path).replace("\\", "/")
     relative_text_lower = relative_text.lower()
+    normalized_path = re.sub(r"[^a-z0-9가-힣]+", "", relative_text_lower)
     for source_label, target_label in label_mapping.items():
         source_text = str(source_label).strip()
         if not source_text:
             continue
-        if source_text in relative_text or source_text.lower() in relative_text_lower:
+        source_text_lower = source_text.lower()
+        normalized_source = re.sub(r"[^a-z0-9가-힣]+", "", source_text_lower)
+        if (
+            source_text in relative_text
+            or source_text_lower in relative_text_lower
+            or (normalized_source and normalized_source in normalized_path)
+        ):
             return str(source_label), str(target_label)
     return "", None
 
