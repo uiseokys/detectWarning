@@ -204,6 +204,8 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "current_prepared_train": manifests_dir / "current_prepared_train.jsonl",
         "current_prepared_val": manifests_dir / "current_prepared_val.jsonl",
         "current_prepared_test": manifests_dir / "current_prepared_test.jsonl",
+        "current_skip_report": manifests_dir / "current_skipped_videos.json",
+        "cumulative_skip_report": manifests_dir / "cumulative_skipped_videos.json",
         "continual_state": manifests_dir / "continual_state.json",
     }
 
@@ -220,6 +222,98 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
     with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     print(format_pipeline_status_log(payload))
+
+
+def create_skip_report() -> dict:
+    return {
+        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "summary": {
+            "total_issues": 0,
+            "broken_count": 0,
+            "skipped_count": 0,
+        },
+        "issues": [],
+    }
+
+
+def append_skip_issue(
+    report: dict,
+    *,
+    category: str,
+    split_name: str,
+    video_path: Path,
+    reason: str,
+    detail: str | None = None,
+    valid_frames: int | None = None,
+    confirmed_frames: int | None = None,
+) -> None:
+    issue = {
+        "category": category,
+        "split": split_name,
+        "video_name": video_path.name,
+        "video_path": str(video_path),
+        "reason": reason,
+        "detail": detail,
+        "valid_frames": valid_frames,
+        "confirmed_frames": confirmed_frames,
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+    }
+    issues = report.setdefault("issues", [])
+    issues.append(issue)
+    summary = report.setdefault("summary", {})
+    summary["total_issues"] = int(summary.get("total_issues", 0) or 0) + 1
+    if category == "broken":
+        summary["broken_count"] = int(summary.get("broken_count", 0) or 0) + 1
+    else:
+        summary["skipped_count"] = int(summary.get("skipped_count", 0) or 0) + 1
+
+
+def build_skip_issue_key(issue: dict) -> str:
+    return "|".join(
+        [
+            str(issue.get("category") or ""),
+            str(issue.get("video_path") or ""),
+            str(issue.get("reason") or ""),
+        ]
+    )
+
+
+def read_json_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_skip_reports(paths: dict, report: dict) -> None:
+    report["updated_at"] = datetime.now(timezone.utc).astimezone().isoformat()
+    with paths["current_skip_report"].open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+
+    cumulative = read_json_file(paths["cumulative_skip_report"]) or create_skip_report()
+    cumulative_issues = cumulative.setdefault("issues", [])
+    seen = {build_skip_issue_key(issue) for issue in cumulative_issues if isinstance(issue, dict)}
+    for issue in report.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        issue_key = build_skip_issue_key(issue)
+        if issue_key in seen:
+            continue
+        cumulative_issues.append(issue)
+        seen.add(issue_key)
+
+    cumulative_issues[:] = cumulative_issues[-1000:]
+    cumulative["updated_at"] = report["updated_at"]
+    cumulative["summary"] = {
+        "total_issues": len(cumulative_issues),
+        "broken_count": sum(1 for issue in cumulative_issues if issue.get("category") == "broken"),
+        "skipped_count": sum(1 for issue in cumulative_issues if issue.get("category") != "broken"),
+    }
+    with paths["cumulative_skip_report"].open("w", encoding="utf-8") as handle:
+        json.dump(cumulative, handle, ensure_ascii=False, indent=2)
 
 
 def format_pipeline_status_log(payload: dict) -> str:
@@ -252,6 +346,15 @@ def format_pipeline_status_log(payload: dict) -> str:
     current_video = payload.get("current_video")
     if current_video:
         segments.append(str(current_video))
+
+    broken_videos = payload.get("broken_videos")
+    skipped_videos = payload.get("skipped_videos")
+    if isinstance(broken_videos, int) or isinstance(skipped_videos, int):
+        segments.append(
+            "issues "
+            f"broken={int(broken_videos or 0)} "
+            f"skipped={int(skipped_videos or 0)}"
+        )
 
     if message:
         segments.append(message)
@@ -831,6 +934,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
 
     manifest_rows: dict[str, list[dict]] = {}
     overall_total = 0
+    skip_report = create_skip_report()
     for split_name, manifest_path in split_manifests.items():
         rows: list[dict] = []
         with manifest_path.open("r", encoding="utf-8") as source_handle:
@@ -886,9 +990,27 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                     )
                 except Exception as exc:
                     skipped += 1
+                    append_skip_issue(
+                        skip_report,
+                        category="broken",
+                        split_name=split_name,
+                        video_path=video_path,
+                        reason="unreadable_video",
+                        detail=str(exc),
+                    )
                     print(f"[prepare] skip unreadable video: {video_path} ({exc})")
                     continue
                 if sequence["valid_frames"] < min_frames_with_person:
+                    skipped += 1
+                    append_skip_issue(
+                        skip_report,
+                        category="skipped",
+                        split_name=split_name,
+                        video_path=video_path,
+                        reason="min_frames_with_person",
+                        valid_frames=int(sequence["valid_frames"]),
+                        confirmed_frames=int(sequence["confirmed_frames"]),
+                    )
                     continue
 
                 pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
@@ -929,8 +1051,18 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                 split_total=split_total,
                 kept_items=kept,
                 skipped_items=skipped,
+                broken_videos=skip_report.get("summary", {}).get("broken_count", 0),
+                skipped_videos=skip_report.get("summary", {}).get("skipped_count", 0),
             )
         print(f"[prepare] {split_name}: {kept} samples ({skipped} skipped) -> {target_manifest_path}")
+
+    write_skip_reports(paths, skip_report)
+    summary = skip_report.get("summary", {})
+    print(
+        "[prepare] issue summary: "
+        f"broken={summary.get('broken_count', 0)}, "
+        f"skipped={summary.get('skipped_count', 0)}"
+    )
 
     return prepared_paths
 

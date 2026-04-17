@@ -573,6 +573,8 @@ def create_app(config_path: Path) -> FastAPI:
         }
 
     def collect_result_summary() -> dict:
+        current_skip_report = read_json(paths["current_skip_report"]) or {}
+        current_skip_summary = current_skip_report.get("summary", {}) if isinstance(current_skip_report, dict) else {}
         return {
             "raw_total": summarize_manifest(paths["raw_manifest"], label_field="target_label").get("total", 0),
             "train_total": summarize_manifest(paths["split_train"], label_field="target_label").get("total", 0),
@@ -581,6 +583,9 @@ def create_app(config_path: Path) -> FastAPI:
             "prepared_train_total": summarize_manifest(paths["prepared_train"], label_field="target_label").get("total", 0),
             "prepared_val_total": summarize_manifest(paths["prepared_val"], label_field="target_label").get("total", 0),
             "prepared_test_total": summarize_manifest(paths["prepared_test"], label_field="target_label").get("total", 0),
+            "broken_count": int(current_skip_summary.get("broken_count", 0) or 0),
+            "skipped_count": int(current_skip_summary.get("skipped_count", 0) or 0),
+            "total_issues": int(current_skip_summary.get("total_issues", 0) or 0),
         }
 
     def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_chars: int = 12000) -> str:
@@ -2524,6 +2529,32 @@ def create_app(config_path: Path) -> FastAPI:
               <div class="mini-copy" id="continualStateMeta">-</div>
             </div>
           </div>
+          <div class="two-col" style="margin-top:12px;">
+            <div class="mini-card">
+              <div class="mini-title">손상 영상</div>
+              <div class="mini-value" id="brokenVideoCount">0</div>
+              <div class="mini-copy" id="brokenVideoSummary">읽기 실패 없음</div>
+            </div>
+            <div class="mini-card">
+              <div class="mini-title">건너뜀</div>
+              <div class="mini-value" id="skippedVideoCount">0</div>
+              <div class="mini-copy" id="skippedVideoSummary">조건 미달 없음</div>
+            </div>
+          </div>
+          <div class="scroll-panel" style="margin-top:16px; max-height: 260px;">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>구분</th>
+                  <th>split</th>
+                  <th>파일</th>
+                  <th>사유</th>
+                </tr>
+              </thead>
+              <tbody id="issueVideoTable"></tbody>
+            </table>
+          </div>
+          <div id="issueVideoEmpty" class="empty" style="display:none; margin-top:14px;">현재 작업에서 기록된 문제 영상이 없습니다.</div>
         </div>
       </article>
 
@@ -3426,6 +3457,7 @@ def create_app(config_path: Path) -> FastAPI:
           (summary.prepared_train_total ?? 0) +
           (summary.prepared_val_total ?? 0) +
           (summary.prepared_test_total ?? 0);
+        const issueTotal = Number(summary.total_issues ?? ((summary.broken_count ?? 0) + (summary.skipped_count ?? 0)));
         const stateLabel =
           job.state === 'completed' ? '완료' :
           job.state === 'completed_warning' ? '경고 종료' :
@@ -3436,12 +3468,63 @@ def create_app(config_path: Path) -> FastAPI:
           <tr>
             <td>${job.filekey || '-'}</td>
             <td>${stateLabel}${job.exit_code !== null && job.exit_code !== undefined ? ` (${job.exit_code})` : ''}</td>
-            <td>${rawTotal} / ${preparedTotal}</td>
+            <td>${rawTotal} / ${preparedTotal}${issueTotal > 0 ? `<br>issue ${issueTotal}` : ''}</td>
             <td>${formatDateTime(job.started_at)}<br>${formatDateTime(job.finished_at)}</td>
             <td class="mono">${logPreview}</td>
           </tr>
         `;
       }).join('');
+    }
+
+    function formatIssueReason(issue) {
+      if (!issue) {
+        return '-';
+      }
+      if (issue.category === 'broken') {
+        return issue.detail || issue.reason || '읽기 실패';
+      }
+      if (issue.reason === 'min_frames_with_person') {
+        const validFrames = Number(issue.valid_frames || 0);
+        const confirmedFrames = Number(issue.confirmed_frames || 0);
+        return `person frame 부족 (${validFrames}, confirmed ${confirmedFrames})`;
+      }
+      return issue.detail || issue.reason || '조건 미달';
+    }
+
+    function renderIssueVideos(skipReport, cumulativeSkipReport) {
+      const summary = skipReport?.summary || {};
+      const cumulativeSummary = cumulativeSkipReport?.summary || {};
+      const issues = Array.isArray(skipReport?.issues) ? skipReport.issues : [];
+      const tbody = document.getElementById('issueVideoTable');
+      const empty = document.getElementById('issueVideoEmpty');
+
+      const brokenCount = Number(summary.broken_count || 0);
+      const skippedCount = Number(summary.skipped_count || 0);
+      const cumulativeBroken = Number(cumulativeSummary.broken_count || 0);
+      const cumulativeSkipped = Number(cumulativeSummary.skipped_count || 0);
+
+      document.getElementById('brokenVideoCount').textContent = String(brokenCount);
+      document.getElementById('skippedVideoCount').textContent = String(skippedCount);
+      document.getElementById('brokenVideoSummary').textContent =
+        brokenCount > 0 ? `누적 ${cumulativeBroken}개` : '읽기 실패 없음';
+      document.getElementById('skippedVideoSummary').textContent =
+        skippedCount > 0 ? `누적 ${cumulativeSkipped}개` : '조건 미달 없음';
+
+      if (!issues.length) {
+        tbody.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+      }
+
+      empty.style.display = 'none';
+      tbody.innerHTML = issues.slice(-20).reverse().map((issue) => `
+        <tr>
+          <td>${issue.category === 'broken' ? '손상' : 'skip'}</td>
+          <td>${issue.split || '-'}</td>
+          <td>${issue.video_name || '-'}</td>
+          <td>${formatIssueReason(issue)}</td>
+        </tr>
+      `).join('');
     }
 
     function renderLogPanels(logs, launcher) {
@@ -3648,6 +3731,8 @@ def create_app(config_path: Path) -> FastAPI:
       const currentJobProgress = data.current_job_progress || {};
       const continualState = data.continual_state || {};
       const eta = data.eta || {};
+      const skipReport = data.skip_report || {};
+      const cumulativeSkipReport = data.cumulative_skip_report || {};
 
       const stateEl = document.getElementById('pipelineState');
       const displayState = launcher.state || pipeline.state || 'unknown';
@@ -3702,6 +3787,7 @@ def create_app(config_path: Path) -> FastAPI:
         `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`;
       document.getElementById('queueProgressFill').style.width =
         `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`;
+      renderIssueVideos(skipReport, cumulativeSkipReport);
 
       if (progress.latest) {
         document.getElementById('latestEpoch').textContent = `Epoch ${progress.latest.epoch}`;
@@ -4025,6 +4111,14 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     launcher_status = launcher_status or {}
     pipeline_status = read_json(paths["pipeline_status"])
     training_progress = read_json(paths["training_progress"])
+    current_skip_report = read_json(paths["current_skip_report"]) or {
+        "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
+        "issues": [],
+    }
+    cumulative_skip_report = read_json(paths["cumulative_skip_report"]) or {
+        "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
+        "issues": [],
+    }
     completed_jobs = launcher_status.get("completed_jobs", []) if isinstance(launcher_status, dict) else []
     pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
     current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
@@ -4139,6 +4233,8 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "has_metrics": (paths["artifacts_dir"] / "metrics.json").exists(),
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
+        "skip_report": current_skip_report,
+        "cumulative_skip_report": cumulative_skip_report,
         "metrics": read_json(paths["artifacts_dir"] / "metrics.json"),
     }
 
@@ -4218,6 +4314,7 @@ def reset_training_workspace(paths: dict) -> None:
         "current_prepared_train",
         "current_prepared_val",
         "current_prepared_test",
+        "current_skip_report",
     )
 
     for key in transient_dirs:
