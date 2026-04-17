@@ -94,6 +94,115 @@ def resolve_cloudflared_path(cloudflared_arg: str, project_root: Path) -> str:
     )
 
 
+def stop_processes_on_port(port: int) -> list[int]:
+    stopped: list[int] = []
+    if os.name != "nt":
+        return stopped
+
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except Exception:
+        return stopped
+
+    seen: set[int] = set()
+    port_suffix = f":{port}"
+    for line in result.stdout.splitlines():
+        if port_suffix not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local_addr = parts[1]
+        pid_text = parts[-1]
+        if not local_addr.endswith(port_suffix):
+            continue
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid <= 0 or pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            stopped.append(pid)
+        except Exception:
+            continue
+    return stopped
+
+
+def stop_stale_detectwarning_python_processes(project_root: Path) -> list[int]:
+    stopped: list[int] = []
+    if os.name != "nt":
+        return stopped
+
+    project_hint = str(project_root).replace("\\", "\\\\").replace("'", "''").lower()
+    current_pid = os.getpid()
+    ps_script = rf"""
+$project = '{project_hint}'
+$selfPid = {current_pid}
+Get-CimInstance Win32_Process |
+  Where-Object {{
+    $_.ProcessId -ne $selfPid -and
+    $_.Name -match '^python(?:\.exe)?$' -and
+    $_.CommandLine -and
+    $_.CommandLine.ToLower().Contains($project) -and
+    (
+      $_.CommandLine -match 'training_dashboard\.py' -or
+      $_.CommandLine -match 'action_training_pipeline\.py' -or
+      $_.CommandLine -match 'run_training_share\.py'
+    )
+  }} |
+  ForEach-Object {{
+    try {{
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      Write-Output $_.ProcessId
+    }} catch {{}}
+  }}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except Exception:
+        return stopped
+
+    for line in result.stdout.splitlines():
+        pid_text = line.strip()
+        if pid_text.isdigit():
+            stopped.append(int(pid_text))
+    return stopped
+
+
+def clear_local_pycache(project_root: Path) -> None:
+    for target in [
+        project_root / "app" / "__pycache__",
+        project_root / "__pycache__",
+    ]:
+        if not target.exists():
+            continue
+        try:
+            shutil.rmtree(target)
+        except Exception:
+            pass
+
+
 def start_tunnel(cloudflared_cmd: str, tunnel_url: str) -> tuple[subprocess.Popen, str]:
     process = subprocess.Popen(
         [cloudflared_cmd, "tunnel", "--url", tunnel_url],
@@ -182,6 +291,21 @@ def main() -> None:
         stop_process(tunnel_process)
 
     try:
+        stale_pids = stop_stale_detectwarning_python_processes(project_root)
+        if stale_pids:
+            print(
+                "[launcher] 이전 detectWarning Python 프로세스를 정리했습니다: "
+                + ", ".join(str(pid) for pid in stale_pids)
+            )
+            time.sleep(1.0)
+        stopped_pids = stop_processes_on_port(args.dashboard_port)
+        if stopped_pids:
+            print(
+                "[launcher] 기존 dashboard 포트 점유 프로세스를 정리했습니다: "
+                + ", ".join(str(pid) for pid in stopped_pids)
+            )
+            time.sleep(1.0)
+        clear_local_pycache(project_root)
         print(f"[launcher] cloudflared = {cloudflared_cmd}")
         print("[launcher] cloudflared tunnel을 시작합니다...")
         tunnel_process, live_url = start_tunnel(cloudflared_cmd, args.tunnel_url)
