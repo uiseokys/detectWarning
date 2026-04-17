@@ -19,6 +19,19 @@ LIVE_URL_PATTERNS = (
 )
 
 
+def configure_stdio_for_utf8() -> None:
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONLEGACYWINDOWSSTDIO", "1")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="training_dashboard와 cloudflared tunnel을 한 번에 실행합니다."
@@ -278,6 +291,7 @@ def stop_process(process: subprocess.Popen | None) -> None:
 
 
 def main() -> None:
+    configure_stdio_for_utf8()
     args = parse_args()
     project_root = Path(__file__).resolve().parent.parent
     dashboard_script = Path(__file__).resolve().with_name("training_dashboard.py")
