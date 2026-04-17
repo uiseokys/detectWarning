@@ -313,9 +313,13 @@ def main() -> None:
 
         env = os.environ.copy()
         env[args.live_url_env] = live_url
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
 
         dashboard_cmd = [
             sys.executable,
+            "-X",
+            "utf8",
             str(dashboard_script),
             "--config",
             args.config,

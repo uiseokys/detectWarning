@@ -45,9 +45,17 @@ def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_cha
     if not path.exists() or not path.is_file():
         return ""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
     except OSError:
         return ""
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines()
     tail = "\n".join(lines[-max_lines:])
     if len(tail) > max_chars:
@@ -595,9 +603,17 @@ def create_app(config_path: Path) -> FastAPI:
         if not path.exists() or not path.is_file():
             return ""
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
         except OSError:
             return ""
+        for encoding in ("utf-8", "cp949", "euc-kr"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="replace")
         lines = text.splitlines()
         tail = "\n".join(lines[-max_lines:])
         if len(tail) > max_chars:
@@ -640,9 +656,14 @@ def create_app(config_path: Path) -> FastAPI:
             current_datasetkey=job.get("datasetkey"),
         )
         with log_path.open("w", encoding="utf-8") as log_handle:
+            child_env = os.environ.copy()
+            child_env["PYTHONUTF8"] = "1"
+            child_env["PYTHONIOENCODING"] = "utf-8"
             process = subprocess.Popen(
                 [
                     sys.executable,
+                    "-X",
+                    "utf8",
                     str(pipeline_script),
                     "--config",
                     str(runtime_config_path),
@@ -653,6 +674,7 @@ def create_app(config_path: Path) -> FastAPI:
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                env=child_env,
                 start_new_session=(os.name != "nt"),
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
             )

@@ -11,7 +11,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo [launcher] detectWarning 공유 런처를 시작합니다...
-".venv\Scripts\python.exe" "app\run_training_share.py" --config "configs\action_training.aihub_shell.example.json"
+".venv\Scripts\python.exe" -X utf8 "app\run_training_share.py" --config "configs\action_training.aihub_shell.example.json"
 set EXIT_CODE=%ERRORLEVEL%
 
 if not "%EXIT_CODE%"=="0" (
