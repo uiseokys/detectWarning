@@ -2771,16 +2771,16 @@ def create_app(config_path: Path) -> FastAPI:
       const metaRow = panel ? panel.querySelector('.meta-row') : null;
       const queueManager = panel ? panel.querySelector('.queue-manager') : null;
       if (queueEditor) {
-        queueEditor.remove();
+        queueEditor.style.display = 'none';
       }
       if (controlActions) {
-        controlActions.remove();
+        controlActions.style.display = 'none';
       }
       if (metaRow) {
-        metaRow.remove();
+        metaRow.style.display = 'none';
       }
       if (queueManager) {
-        queueManager.remove();
+        queueManager.style.display = 'none';
       }
       const title = document.getElementById('controlTitle');
       const copy = document.getElementById('controlCopy');
@@ -2818,8 +2818,31 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
+    function getElement(id) {
+      return document.getElementById(id);
+    }
+
+    function setText(id, value) {
+      const element = getElement(id);
+      if (element) {
+        element.textContent = value;
+      }
+      return element;
+    }
+
+    function setHTML(id, value) {
+      const element = getElement(id);
+      if (element) {
+        element.innerHTML = value;
+      }
+      return element;
+    }
+
     function setLaunchMessage(message, isError) {
       const box = document.getElementById('launchMessage');
+      if (!box) {
+        return;
+      }
       box.textContent = message || '-';
       box.style.color = isError ? '#dc2626' : '#64748b';
       box.style.borderColor = isError ? 'rgba(220,38,38,0.18)' : 'rgba(148,163,184,0.18)';
@@ -2860,11 +2883,15 @@ def create_app(config_path: Path) -> FastAPI:
       const startButton = document.getElementById('startButton');
       const stopButton = document.getElementById('stopButton');
       const forceStopButton = document.getElementById('forceStopButton');
+      const resetButton = document.getElementById('resetButton');
+      if (!startButton || !stopButton || !forceStopButton || !resetButton) {
+        return;
+      }
       if (viewerMode) {
         startButton.disabled = true;
         stopButton.disabled = true;
         forceStopButton.disabled = true;
-        document.getElementById('resetButton').disabled = true;
+        resetButton.disabled = true;
         return;
       }
       const autoStartEnabled = launcher?.auto_start_enabled !== false;
@@ -2893,9 +2920,13 @@ def create_app(config_path: Path) -> FastAPI:
       if (viewerMode) {
         return;
       }
+      const input = document.getElementById('apiKeyInput');
+      if (!input) {
+        return;
+      }
       const saved = window.localStorage.getItem('training_dashboard_aihub_api_key');
       if (saved) {
-        document.getElementById('apiKeyInput').value = saved;
+        input.value = saved;
       }
     }
 
@@ -2903,7 +2934,11 @@ def create_app(config_path: Path) -> FastAPI:
       if (viewerMode) {
         return '';
       }
-      const value = document.getElementById('apiKeyInput').value.trim();
+      const input = document.getElementById('apiKeyInput');
+      if (!input) {
+        return '';
+      }
+      const value = input.value.trim();
       if (value) {
         window.localStorage.setItem('training_dashboard_aihub_api_key', value);
       } else {
@@ -2916,17 +2951,25 @@ def create_app(config_path: Path) -> FastAPI:
       if (viewerMode) {
         return;
       }
+      const input = document.getElementById('datasetKeyInput');
+      if (!input) {
+        return;
+      }
       const saved = window.localStorage.getItem('training_dashboard_aihub_datasetkey');
       if (saved) {
-        document.getElementById('datasetKeyInput').value = saved;
+        input.value = saved;
       }
     }
 
     function saveDatasetKey() {
-      if (viewerMode) {
-        return document.getElementById('datasetKeyInput').value.trim();
+      const input = document.getElementById('datasetKeyInput');
+      if (!input) {
+        return '';
       }
-      const value = document.getElementById('datasetKeyInput').value.trim();
+      if (viewerMode) {
+        return input.value.trim();
+      }
+      const value = input.value.trim();
       if (value) {
         window.localStorage.setItem('training_dashboard_aihub_datasetkey', value);
       } else {
@@ -3770,20 +3813,22 @@ def create_app(config_path: Path) -> FastAPI:
       stateEl.className = `status-pill ${toneClass(displayState)}`;
 
       const datasetKey = data.aihub?.datasetkey ?? '-';
-      document.getElementById('datasetKeyChip').textContent = datasetKey;
-      if (datasetKey !== '-' && !document.getElementById('datasetKeyInput').value.trim()) {
-        document.getElementById('datasetKeyInput').value = datasetKey;
+      setText('datasetKeyChip', datasetKey);
+      const datasetKeyInput = document.getElementById('datasetKeyInput');
+      if (datasetKeyInput && datasetKey !== '-' && !datasetKeyInput.value.trim()) {
+        datasetKeyInput.value = datasetKey;
       }
-      document.getElementById('workspaceChip').textContent = data.workspace_name || '-';
-      document.getElementById('launcherState').textContent = formatLauncherState(launcher.state || 'idle');
-      document.getElementById('currentFilekey').textContent = formatJob(launcher.current_job);
-      document.getElementById('currentDatasetkey').textContent =
-        launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || []);
-      document.getElementById('pendingFilekeys').textContent = formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey));
-      document.getElementById('completedJobs').textContent = formatCompletedJobs(launcher.completed_jobs || []);
-      document.getElementById('autoStartState').textContent =
-        launcher.auto_start_enabled === false ? '꺼짐' : '켜짐';
-      document.getElementById('launcherLogPath').textContent = launcher.log_path || '-';
+      setText('workspaceChip', data.workspace_name || '-');
+      setText('launcherState', formatLauncherState(launcher.state || 'idle'));
+      setText('currentFilekey', formatJob(launcher.current_job));
+      setText(
+        'currentDatasetkey',
+        launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
+      );
+      setText('pendingFilekeys', formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey)));
+      setText('completedJobs', formatCompletedJobs(launcher.completed_jobs || []));
+      setText('autoStartState', launcher.auto_start_enabled === false ? '꺼짐' : '켜짐');
+      setText('launcherLogPath', launcher.log_path || '-');
       setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
       updateControlButtons(launcher);
       renderQueuedJobs(launcher.pending_jobs || []);
