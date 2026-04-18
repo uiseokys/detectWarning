@@ -261,6 +261,31 @@ def get_latest_job(paths: dict) -> dict:
     completed_jobs = launcher_history.get("completed_jobs") or []
     if not isinstance(completed_jobs, list) or not completed_jobs:
         pipeline_status = read_json(paths["pipeline_status"]) or {}
+        metrics_path = paths["artifacts_dir"] / "metrics.json"
+        model_path = paths["artifacts_dir"] / "best_action_model.pt"
+        has_recent_artifacts = metrics_path.exists() or model_path.exists()
+        fallback_finished_at = None
+        if metrics_path.exists():
+            fallback_finished_at = datetime.fromtimestamp(
+                metrics_path.stat().st_mtime,
+                tz=timezone.utc,
+            ).astimezone().isoformat()
+        elif model_path.exists():
+            fallback_finished_at = datetime.fromtimestamp(
+                model_path.stat().st_mtime,
+                tz=timezone.utc,
+            ).astimezone().isoformat()
+
+        if has_recent_artifacts:
+            return {
+                "datasetkey": None,
+                "filekey": None,
+                "state": "completed",
+                "started_at": None,
+                "finished_at": fallback_finished_at or pipeline_status.get("updated_at"),
+                "duration_minutes": None,
+                "message": pipeline_status.get("message") or "최근 학습 결과를 불러왔습니다.",
+            }
         return {
             "datasetkey": None,
             "filekey": None,
@@ -268,7 +293,7 @@ def get_latest_job(paths: dict) -> dict:
             "started_at": None,
             "finished_at": pipeline_status.get("updated_at"),
             "duration_minutes": None,
-            "message": pipeline_status.get("message") or "학습 기록이 없습니다.",
+            "message": pipeline_status.get("message") or "최근 학습 기록이 아직 없습니다.",
         }
 
     def sort_key(job: dict) -> str:

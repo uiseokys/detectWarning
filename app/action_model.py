@@ -109,6 +109,7 @@ def train_action_classifier(
     num_workers: int | str = 0,
     device: str = "cuda",
     amp: bool = True,
+    compile_model: bool = False,
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
     progress_path: Path | None = None,
@@ -150,7 +151,7 @@ def train_action_classifier(
     )
 
     first_pose, _first_mask, _first_label = train_dataset[0]
-    model = TemporalPoseClassifier(
+    base_model = TemporalPoseClassifier(
         num_joints=first_pose.shape[1],
         input_dim=first_pose.shape[2],
         hidden_dim=hidden_dim,
@@ -158,20 +159,45 @@ def train_action_classifier(
         num_classes=len(labels),
         dropout=dropout,
     ).to(device)
+    model = base_model
 
     resumed_from_checkpoint = False
+    resume_mode = "fresh"
     if resume_from is not None and resume_from.exists():
         checkpoint = torch.load(resume_from, map_location=device, weights_only=True)
         checkpoint_labels = list(checkpoint.get("labels", []))
+        checkpoint_state = checkpoint.get("model_state_dict", {}) or {}
         if checkpoint_labels == list(labels):
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            base_model.load_state_dict(checkpoint_state, strict=False)
             resumed_from_checkpoint = True
+            resume_mode = "full"
         else:
-            print(
-                "[train] 기존 체크포인트 라벨 구성이 현재 설정과 달라서 resume을 건너뜁니다.\n"
-                f"- checkpoint labels: {checkpoint_labels}\n"
-                f"- current labels: {labels}"
-            )
+            loaded_count, skipped_keys = _load_compatible_state_dict(base_model, checkpoint_state)
+            if loaded_count > 0:
+                resumed_from_checkpoint = True
+                resume_mode = "partial"
+                print(
+                    "[train] 기존 체크포인트를 부분 warm-start로 이어받습니다.\n"
+                    f"- checkpoint labels: {checkpoint_labels}\n"
+                    f"- current labels: {labels}\n"
+                    f"- loaded tensors: {loaded_count}\n"
+                    f"- skipped tensors: {len(skipped_keys)}"
+                )
+            else:
+                print(
+                    "[train] 기존 체크포인트 라벨 구성이 현재 설정과 달라서 resume을 건너뜁니다.\n"
+                    f"- checkpoint labels: {checkpoint_labels}\n"
+                    f"- current labels: {labels}"
+                )
+
+    compiled_model = False
+    if compile_model and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(base_model)
+            compiled_model = True
+        except Exception as exc:
+            print(f"[train] torch.compile을 건너뜁니다: {exc}")
+            model = base_model
 
     class_weights = _build_class_weights(train_dataset.samples, len(labels)).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -189,6 +215,8 @@ def train_action_classifier(
         "[train] acceleration "
         f"device={device} "
         f"amp={'on' if use_amp else 'off'} "
+        f"compile={'on' if compiled_model else 'off'} "
+        f"resume={resume_mode} "
         f"workers={resolved_num_workers} "
         f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
         f"persistent={'on' if use_persistent_workers else 'off'}"
@@ -208,9 +236,11 @@ def train_action_classifier(
                 "history": history,
                 "labels": labels,
                 "resumed_from_checkpoint": resumed_from_checkpoint,
+                "resume_mode": resume_mode,
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
+                "compile_enabled": compiled_model,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
@@ -264,7 +294,7 @@ def train_action_classifier(
             best_epoch = epoch
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": base_model.state_dict(),
                     "labels": labels,
                     "num_joints": int(first_pose.shape[1]),
                     "input_dim": int(first_pose.shape[2]),
@@ -289,9 +319,11 @@ def train_action_classifier(
                     "history": history,
                     "labels": labels,
                     "resumed_from_checkpoint": resumed_from_checkpoint,
+                    "resume_mode": resume_mode,
                     "train_samples": train_sample_count,
                     "val_samples": val_sample_count,
                     "amp_enabled": use_amp,
+                    "compile_enabled": compiled_model,
                     "num_workers": resolved_num_workers,
                     "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                     "persistent_workers": use_persistent_workers,
@@ -317,7 +349,9 @@ def train_action_classifier(
                 "labels": labels,
                 "best_epoch": best_epoch,
                 "resumed_from_checkpoint": resumed_from_checkpoint,
+                "resume_mode": resume_mode,
                 "amp_enabled": use_amp,
+                "compile_enabled": compiled_model,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
@@ -342,9 +376,11 @@ def train_action_classifier(
                 "labels": labels,
                 "final_validation": final_metrics,
                 "resumed_from_checkpoint": resumed_from_checkpoint,
+                "resume_mode": resume_mode,
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
+                "compile_enabled": compiled_model,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
@@ -480,6 +516,24 @@ def _compute_f1(confusion: np.ndarray) -> tuple[float, list[dict]]:
         f1_scores.append(f1)
     macro_f1 = float(sum(f1_scores) / max(len(f1_scores), 1))
     return macro_f1, metrics
+
+
+def _load_compatible_state_dict(model: nn.Module, checkpoint_state: dict) -> tuple[int, list[str]]:
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_keys: list[str] = []
+    for key, value in checkpoint_state.items():
+        if key not in model_state:
+            skipped_keys.append(key)
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            skipped_keys.append(key)
+            continue
+        compatible_state[key] = value
+
+    if compatible_state:
+        model.load_state_dict(compatible_state, strict=False)
+    return len(compatible_state), skipped_keys
 
 
 def _build_dataloader(

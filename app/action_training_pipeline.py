@@ -9,7 +9,8 @@ import re
 import shutil
 import subprocess
 import zipfile
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,11 +110,19 @@ def main() -> None:
             prepared_manifests = prepare_pose_dataset(config, paths, split_manifests)
             training_manifests = update_cumulative_manifests(config, paths, split_manifests, prepared_manifests)
         elif args.stage == "train":
-            training_manifests = load_training_manifests(paths, continual_enabled=continual_config["enabled"])
+            training_manifests = load_training_manifests(
+                config,
+                paths,
+                continual_enabled=continual_config["enabled"],
+            )
 
         if args.stage in {"all", "train"}:
             if training_manifests is None:
-                training_manifests = load_training_manifests(paths, continual_enabled=continual_config["enabled"])
+                training_manifests = load_training_manifests(
+                    config,
+                    paths,
+                    continual_enabled=continual_config["enabled"],
+                )
             write_pipeline_status(
                 paths,
                 stage="train",
@@ -143,6 +152,7 @@ def main() -> None:
                 num_workers=config.get("training", {}).get("num_workers", "auto"),
                 device=str(config.get("training", {}).get("device", "cuda")),
                 amp=bool(config.get("training", {}).get("amp", True)),
+                compile_model=bool(config.get("training", {}).get("compile_model", True)),
                 prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
                 persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
                 progress_path=paths["training_progress"],
@@ -174,7 +184,16 @@ def main() -> None:
 
 
 def resolve_paths(config: dict, base_dir: Path) -> dict:
-    workspace_dir = (base_dir / config.get("paths", {}).get("workspace_dir", "training_data/action_pipeline")).resolve()
+    paths_config = config.get("paths", {})
+    workspace_dir_setting = paths_config.get("workspace_dir", "training_data/action_pipeline")
+    workspace_dir_env = str(paths_config.get("workspace_dir_env", "DETECTWARNING_WORKSPACE_DIR") or "").strip()
+    workspace_dir_override = os.environ.get(workspace_dir_env, "").strip() if workspace_dir_env else ""
+
+    if workspace_dir_override:
+        workspace_dir = Path(workspace_dir_override).expanduser().resolve()
+    else:
+        workspace_path = Path(workspace_dir_setting).expanduser()
+        workspace_dir = workspace_path.resolve() if workspace_path.is_absolute() else (base_dir / workspace_path).resolve()
     raw_dir = workspace_dir / "raw_videos"
     import_dir = workspace_dir / "imported_dataset"
     extracted_dir = workspace_dir / "extracted_dataset"
@@ -200,6 +219,9 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "prepared_train": manifests_dir / "cumulative_prepared_train.jsonl",
         "prepared_val": manifests_dir / "cumulative_prepared_val.jsonl",
         "prepared_test": manifests_dir / "cumulative_prepared_test.jsonl",
+        "active_prepared_train": manifests_dir / "active_prepared_train.jsonl",
+        "active_prepared_val": manifests_dir / "active_prepared_val.jsonl",
+        "active_prepared_test": manifests_dir / "active_prepared_test.jsonl",
         "current_raw_manifest": manifests_dir / "current_raw_items.jsonl",
         "current_split_train": manifests_dir / "current_split_train.jsonl",
         "current_split_val": manifests_dir / "current_split_val.jsonl",
@@ -919,6 +941,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     preprocess_config = config.get("preprocess", {})
     device = str(preprocess_config.get("device", "cuda:0"))
     compress_prepared_pose = bool(preprocess_config.get("compress_prepared_pose", False))
+    video_prefetch_workers = max(int(preprocess_config.get("video_prefetch_workers", 2)), 0)
     person_detector = PersonDetector(
         score_threshold=float(preprocess_config.get("person_score_threshold", 0.25)),
         resize_width=int(preprocess_config.get("person_imgsz", 640)),
@@ -955,95 +978,145 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     for split_name, manifest_path in split_manifests.items():
         target_manifest_path = prepared_paths[split_name]
         rows = manifest_rows.get(split_name, [])
+        payload_futures: deque[tuple[dict, Future]] = deque()
+        payload_executor = (
+            ThreadPoolExecutor(max_workers=video_prefetch_workers, thread_name_prefix="pose-prefetch")
+            if video_prefetch_workers > 0
+            else None
+        )
+
+        def submit_payload(sample_row: dict) -> Future | None:
+            if payload_executor is None:
+                return None
+            return payload_executor.submit(
+                load_video_sequence_payload,
+                video_path=Path(sample_row["video_path"]),
+                sequence_length=int(preprocess_config.get("sequence_length", 48)),
+                max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+            )
+
+        if payload_executor is not None:
+            prefetch_window = max(video_prefetch_workers * 2, 1)
+            for sample_row in rows[:prefetch_window]:
+                future = submit_payload(sample_row)
+                if future is not None:
+                    payload_futures.append((sample_row, future))
+        else:
+            prefetch_window = 0
+
         split_total = len(rows)
         with target_manifest_path.open("w", encoding="utf-8") as target_handle:
             kept = 0
             skipped = 0
-            for split_index, sample in enumerate(rows, start=1):
-                video_path = Path(sample["video_path"])
-                target_label = sample["target_label"]
-                processed_total += 1
-                if (
-                    processed_total == 1
-                    or processed_total == overall_total
-                    or processed_total % 5 == 0
-                ):
-                    prepare_ratio = processed_total / max(overall_total, 1)
-                    write_pipeline_status(
-                        paths,
-                        stage="prepare",
-                        state="running",
-                        message=f"{split_name} split에서 pose 시퀀스를 추출하는 중입니다.",
-                        stage_progress=round(0.55 + (0.25 * prepare_ratio), 4),
-                        processed_items=processed_total,
-                        total_items=overall_total,
-                        current_split=split_name,
-                        split_index=split_index,
-                        split_total=split_total,
-                        current_video=video_path.name,
-                        kept_items=kept,
-                        skipped_items=skipped,
-                    )
-                try:
-                    sequence = extract_pose_sequence(
-                        video_path=video_path,
-                        person_detector=person_detector,
-                        face_detector=face_detector,
-                        sequence_length=int(preprocess_config.get("sequence_length", 48)),
-                        max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
-                        detector_batch_size=int(preprocess_config.get("detector_batch_size", 8)),
-                    )
-                except Exception as exc:
-                    skipped += 1
-                    append_skip_issue(
-                        skip_report,
-                        category="broken",
-                        split_name=split_name,
-                        video_path=video_path,
-                        reason="unreadable_video",
-                        detail=str(exc),
-                    )
-                    print(f"[prepare] skip unreadable video: {video_path} ({exc})")
-                    continue
-                if sequence["valid_frames"] < min_frames_with_person:
-                    skipped += 1
-                    append_skip_issue(
-                        skip_report,
-                        category="skipped",
-                        split_name=split_name,
-                        video_path=video_path,
-                        reason="min_frames_with_person",
-                        valid_frames=int(sequence["valid_frames"]),
-                        confirmed_frames=int(sequence["confirmed_frames"]),
-                    )
-                    continue
+            try:
+                for split_index in range(1, split_total + 1):
+                    if payload_executor is not None:
+                        sample, payload_future = payload_futures.popleft()
+                        next_prefetch_index = split_index - 1 + prefetch_window
+                        if next_prefetch_index < split_total:
+                            next_sample = rows[next_prefetch_index]
+                            next_future = submit_payload(next_sample)
+                            if next_future is not None:
+                                payload_futures.append((next_sample, next_future))
+                    else:
+                        sample = rows[split_index - 1]
+                        payload_future = None
 
-                pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
-                pose_output_dir.mkdir(parents=True, exist_ok=True)
-                pose_path = pose_output_dir / f"{video_path.stem}_{sample['item_id']}.npz"
-                save_npz = np.savez_compressed if compress_prepared_pose else np.savez
-                save_npz(
-                    pose_path,
-                    pose=sequence["pose"],
-                    mask=sequence["mask"],
-                    label_idx=np.int64(label_to_idx[target_label]),
-                )
+                    video_path = Path(sample["video_path"])
+                    target_label = sample["target_label"]
+                    processed_total += 1
+                    if (
+                        processed_total == 1
+                        or processed_total == overall_total
+                        or processed_total % 5 == 0
+                    ):
+                        prepare_ratio = processed_total / max(overall_total, 1)
+                        write_pipeline_status(
+                            paths,
+                            stage="prepare",
+                            state="running",
+                            message=f"{split_name} split에서 pose 시퀀스를 추출하는 중입니다.",
+                            stage_progress=round(0.55 + (0.25 * prepare_ratio), 4),
+                            processed_items=processed_total,
+                            total_items=overall_total,
+                            current_split=split_name,
+                            split_index=split_index,
+                            split_total=split_total,
+                            current_video=video_path.name,
+                            kept_items=kept,
+                            skipped_items=skipped,
+                            prefetch_workers=video_prefetch_workers,
+                        )
+                    try:
+                        if payload_future is not None:
+                            payload = payload_future.result()
+                        else:
+                            payload = load_video_sequence_payload(
+                                video_path=video_path,
+                                sequence_length=int(preprocess_config.get("sequence_length", 48)),
+                                max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                            )
 
-                target_handle.write(
-                    json.dumps(
-                        {
-                            **sample,
-                            "pose_path": str(pose_path.resolve()),
-                            "label_idx": label_to_idx[target_label],
-                            "valid_frames": sequence["valid_frames"],
-                            "confirmed_frames": sequence["confirmed_frames"],
-                            "chosen_track_id": sequence["chosen_track_id"],
-                        },
-                        ensure_ascii=False,
+                        sequence = extract_pose_sequence_from_payload(
+                            payload=payload,
+                            person_detector=person_detector,
+                            face_detector=face_detector,
+                            detector_batch_size=int(preprocess_config.get("detector_batch_size", 8)),
+                        )
+                    except Exception as exc:
+                        skipped += 1
+                        append_skip_issue(
+                            skip_report,
+                            category="broken",
+                            split_name=split_name,
+                            video_path=video_path,
+                            reason="unreadable_video",
+                            detail=str(exc),
+                        )
+                        print(f"[prepare] skip unreadable video: {video_path} ({exc})")
+                        continue
+                    if sequence["valid_frames"] < min_frames_with_person:
+                        skipped += 1
+                        append_skip_issue(
+                            skip_report,
+                            category="skipped",
+                            split_name=split_name,
+                            video_path=video_path,
+                            reason="min_frames_with_person",
+                            valid_frames=int(sequence["valid_frames"]),
+                            confirmed_frames=int(sequence["confirmed_frames"]),
+                        )
+                        continue
+
+                    pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
+                    pose_output_dir.mkdir(parents=True, exist_ok=True)
+                    pose_path = pose_output_dir / f"{video_path.stem}_{sample['item_id']}.npz"
+                    save_npz = np.savez_compressed if compress_prepared_pose else np.savez
+                    save_npz(
+                        pose_path,
+                        pose=sequence["pose"],
+                        mask=sequence["mask"],
+                        label_idx=np.int64(label_to_idx[target_label]),
                     )
-                    + "\n"
-                )
-                kept += 1
+
+                    target_handle.write(
+                        json.dumps(
+                            {
+                                **sample,
+                                "pose_path": str(pose_path.resolve()),
+                                "label_idx": label_to_idx[target_label],
+                                "valid_frames": sequence["valid_frames"],
+                                "confirmed_frames": sequence["confirmed_frames"],
+                                "chosen_track_id": sequence["chosen_track_id"],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    kept += 1
+            finally:
+                if payload_executor is not None:
+                    payload_executor.shutdown(wait=True, cancel_futures=True)
             write_pipeline_status(
                 paths,
                 stage="prepare",
@@ -1094,18 +1167,20 @@ def get_continual_config(config: dict) -> dict:
     }
 
 
-def load_training_manifests(paths: dict, *, continual_enabled: bool) -> dict[str, Path]:
+def load_training_manifests(config: dict, paths: dict, *, continual_enabled: bool) -> dict[str, Path]:
     if continual_enabled and paths["prepared_train"].exists() and paths["prepared_val"].exists():
-        return {
+        base_manifests = {
             "train": paths["prepared_train"],
             "val": paths["prepared_val"],
             "test": paths["prepared_test"],
         }
-    return {
-        "train": paths["current_prepared_train"],
-        "val": paths["current_prepared_val"],
-        "test": paths["current_prepared_test"],
-    }
+    else:
+        base_manifests = {
+            "train": paths["current_prepared_train"],
+            "val": paths["current_prepared_val"],
+            "test": paths["current_prepared_test"],
+        }
+    return materialize_training_manifests(config, paths, base_manifests)
 
 
 def update_cumulative_manifests(
@@ -1116,7 +1191,7 @@ def update_cumulative_manifests(
 ) -> dict[str, Path]:
     continual_config = get_continual_config(config)
     if not continual_config["enabled"]:
-        return prepared_manifests
+        return materialize_training_manifests(config, paths, prepared_manifests)
 
     shell_config = config.get("aihub_shell", {})
     job_meta = {
@@ -1183,11 +1258,60 @@ def update_cumulative_manifests(
         f"val={count_manifest_lines(paths['prepared_val'])}, "
         f"test={count_manifest_lines(paths['prepared_test'])}"
     )
-    return {
-        "train": paths["prepared_train"],
-        "val": paths["prepared_val"],
-        "test": paths["prepared_test"],
+    return materialize_training_manifests(
+        config,
+        paths,
+        {
+            "train": paths["prepared_train"],
+            "val": paths["prepared_val"],
+            "test": paths["prepared_test"],
+        },
+    )
+
+
+def materialize_training_manifests(config: dict, paths: dict, prepared_manifests: dict[str, Path]) -> dict[str, Path]:
+    target_labels = get_target_labels(config)
+    label_to_idx = {label: index for index, label in enumerate(target_labels)}
+    label_mapping = config.get("dataset", {}).get("label_mapping", {}) or {}
+    active_paths = {
+        "train": paths["active_prepared_train"],
+        "val": paths["active_prepared_val"],
+        "test": paths["active_prepared_test"],
     }
+
+    for split_name, source_path in prepared_manifests.items():
+        target_path = active_paths[split_name]
+        kept = 0
+        skipped = 0
+        with target_path.open("w", encoding="utf-8") as handle:
+            for entry in read_jsonl_entries(source_path):
+                remapped = remap_prepared_entry(entry, label_to_idx=label_to_idx, label_mapping=label_mapping)
+                if remapped is None:
+                    skipped += 1
+                    continue
+                handle.write(json.dumps(remapped, ensure_ascii=False) + "\n")
+                kept += 1
+        print(f"[train-manifest] {split_name}: {kept} kept ({skipped} filtered) -> {target_path}")
+
+    return active_paths
+
+
+def remap_prepared_entry(entry: dict, *, label_to_idx: dict[str, int], label_mapping: dict) -> dict | None:
+    mapped_entry = dict(entry)
+    target_label = str(mapped_entry.get("target_label") or "").strip()
+    source_label = str(mapped_entry.get("source_label") or "").strip()
+
+    if target_label not in label_to_idx and source_label:
+        remapped_target = label_mapping.get(source_label)
+        if remapped_target:
+            target_label = str(remapped_target)
+
+    if target_label not in label_to_idx:
+        return None
+
+    mapped_entry["target_label"] = target_label
+    mapped_entry["label_idx"] = int(label_to_idx[target_label])
+    return mapped_entry
 
 
 def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: dict | None = None) -> int:
@@ -1290,6 +1414,25 @@ def extract_pose_sequence(
     max_frames_to_scan: int,
     detector_batch_size: int,
 ) -> dict:
+    payload = load_video_sequence_payload(
+        video_path=video_path,
+        sequence_length=sequence_length,
+        max_frames_to_scan=max_frames_to_scan,
+    )
+    return extract_pose_sequence_from_payload(
+        payload=payload,
+        person_detector=person_detector,
+        face_detector=face_detector,
+        detector_batch_size=detector_batch_size,
+    )
+
+
+def load_video_sequence_payload(
+    *,
+    video_path: Path,
+    sequence_length: int,
+    max_frames_to_scan: int,
+) -> dict:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"영상 파일을 열지 못했습니다: {video_path}")
@@ -1297,20 +1440,41 @@ def extract_pose_sequence(
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_indices = build_frame_indices(total_frames, sequence_length, max_frames_to_scan)
 
-    tracker = PersonTracker()
-    presence_filter = PersonPresenceFilter(debug=False)
-    track_frames: dict[int, dict[int, dict]] = defaultdict(dict)
-
     sampled_frames = read_sampled_frames(capture, frame_indices)
-    sampled_grays: list[np.ndarray] = []
-    sampled_time_indices: list[int] = []
+    valid_frames: list[np.ndarray] = []
+    valid_grays: list[np.ndarray] = []
+    valid_time_indices: list[int] = []
     for time_index, frame in enumerate(sampled_frames):
         if frame is None:
             continue
-        sampled_grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        sampled_time_indices.append(time_index)
-
+        valid_frames.append(frame)
+        valid_grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        valid_time_indices.append(time_index)
     capture.release()
+
+    return {
+        "video_path": str(video_path),
+        "sequence_length": int(sequence_length),
+        "frames": valid_frames,
+        "grays": valid_grays,
+        "time_indices": valid_time_indices,
+    }
+
+
+def extract_pose_sequence_from_payload(
+    *,
+    payload: dict,
+    person_detector: PersonDetector,
+    face_detector: FaceDetector,
+    detector_batch_size: int,
+) -> dict:
+    sequence_length = int(payload.get("sequence_length", 0) or 0)
+    sampled_frames = list(payload.get("frames") or [])
+    sampled_grays = list(payload.get("grays") or [])
+    sampled_time_indices = list(payload.get("time_indices") or [])
+    tracker = PersonTracker()
+    presence_filter = PersonPresenceFilter(debug=False)
+    track_frames: dict[int, dict[int, dict]] = defaultdict(dict)
 
     if not sampled_frames:
         return {

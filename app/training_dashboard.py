@@ -968,7 +968,18 @@ def create_app(config_path: Path) -> FastAPI:
 
     sync_pages_report()
     sync_pages_live("online")
-    atexit.register(lambda: sync_pages_live("offline"))
+
+    def sync_pages_shutdown() -> None:
+        try:
+            sync_pages_report()
+        except Exception as exc:
+            print(f"[pages-sync] 종료 시 report 동기화 실패: {exc}")
+        try:
+            sync_pages_live("offline")
+        except Exception as exc:
+            print(f"[pages-sync] 종료 시 offline 동기화 실패: {exc}")
+
+    atexit.register(sync_pages_shutdown)
 
     worker = threading.Thread(target=queue_worker, daemon=True)
     worker.start()
@@ -1826,15 +1837,14 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .dashboard-shell {
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
+      grid-template-columns: 1fr;
       gap: 14px;
       align-items: start;
     }
     .sidebar-stack {
       display: grid;
       gap: 14px;
-      position: sticky;
-      top: 22px;
+      position: static;
     }
     .main-stack {
       min-width: 0;
@@ -1939,7 +1949,7 @@ def create_app(config_path: Path) -> FastAPI:
       padding: 16px;
     }
     html.viewer-mode-page .dashboard-shell {
-      grid-template-columns: 320px minmax(0, 1fr);
+      grid-template-columns: 1fr;
     }
     html.viewer-mode-page .hero {
       padding: 18px 20px;
@@ -1990,7 +2000,7 @@ def create_app(config_path: Path) -> FastAPI:
     }
     .launch-box {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
     }
     .launch-item {
@@ -2283,7 +2293,7 @@ def create_app(config_path: Path) -> FastAPI:
       font-weight: 700;
     }
     .log-grid {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr;
       gap: 16px;
     }
     .log-card-head {
@@ -2390,9 +2400,6 @@ def create_app(config_path: Path) -> FastAPI:
       font-weight: 700;
     }
     @media (max-width: 1480px) {
-      .dashboard-shell {
-        grid-template-columns: 350px minmax(0, 1fr);
-      }
       .grid {
         grid-template-columns: repeat(3, minmax(0, 1fr));
       }
@@ -2402,14 +2409,8 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
     @media (max-width: 1260px) {
-      .dashboard-shell {
-        grid-template-columns: 1fr;
-      }
-      .sidebar-stack {
-        position: static;
-      }
       .sidebar-stack .control-panel {
-        grid-template-columns: 1.15fr 0.85fr;
+        grid-template-columns: 1fr;
       }
       .control-actions {
         grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2443,13 +2444,19 @@ def create_app(config_path: Path) -> FastAPI:
       }
       .control-actions,
       .launch-box {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .diagnostic-grid {
         grid-template-columns: 1fr;
       }
       .value {
         font-size: 27px;
+      }
+    }
+    @media (max-width: 640px) {
+      .control-actions,
+      .launch-box {
+        grid-template-columns: 1fr;
       }
     }
   </style>
