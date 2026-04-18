@@ -1095,6 +1095,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
   <script>
     let selectedClientId = null;
 
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
     function speechTone(status) {
       if (status === 'recognized') return 'tone-good';
       if (status === 'processing') return 'tone-warn';
@@ -1113,13 +1122,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       return `
         <div class="screen-empty">
           <div class="screen-empty-icon">AI</div>
-          <div class="screen-empty-title">${title}</div>
-          <div class="screen-empty-copy">${copy}</div>
+          <div class="screen-empty-title">${escapeHtml(title)}</div>
+          <div class="screen-empty-copy">${escapeHtml(copy)}</div>
         </div>
       `;
     }
 
     async function refreshSystem() {
+      if (document.hidden) {
+        return;
+      }
       const response = await fetch('/api/system');
       if (!response.ok) {
         return;
@@ -1139,6 +1151,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
 
     async function refreshClients() {
+      if (document.hidden) {
+        return;
+      }
       const response = await fetch('/api/clients');
       const clients = await response.json();
       const container = document.getElementById('clients');
@@ -1160,10 +1175,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         item.className = 'client-card' + (client.client_id === selectedClientId ? ' active' : '');
         item.innerHTML = `
           <div class="client-top">
-            <div class="client-name">${client.client_id}</div>
+            <div class="client-name">${escapeHtml(client.client_id)}</div>
             <div class="client-badges">
-              <span class="mini-badge ${speechTone(client.speech_status)}">${client.speech_status}</span>
-              <span class="mini-badge ${riskTone(client.risk_level)}">${client.risk_level_label}</span>
+              <span class="mini-badge ${speechTone(client.speech_status)}">${escapeHtml(client.speech_status)}</span>
+              <span class="mini-badge ${riskTone(client.risk_level)}">${escapeHtml(client.risk_level_label)}</span>
             </div>
           </div>
           <div class="client-stats">
@@ -1172,8 +1187,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
             <div class="client-stat">지연<strong>${client.latency_ms.toFixed(1)}ms</strong></div>
           </div>
-          <div class="client-transcript">${client.transcript ? client.transcript : '최근 인식된 음성이 없습니다.'}</div>
-          <div class="client-categories">카테고리 ${client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '없음'}</div>
+          <div class="client-transcript">${escapeHtml(client.transcript ? client.transcript : '최근 인식된 음성이 없습니다.')}</div>
+          <div class="client-categories">카테고리 ${escapeHtml(client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '없음')}</div>
         `;
         item.onclick = () => {
           selectedClientId = client.client_id;
@@ -1187,6 +1202,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
 
     async function refreshSelectedFrame() {
+      if (document.hidden) {
+        return;
+      }
       if (!selectedClientId) {
         return;
       }
@@ -1201,7 +1219,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         screen.innerHTML = screenPlaceholder('프레임을 기다리는 중입니다', '선택한 클라이언트에서 아직 수신된 프레임이 없습니다.');
         return;
       }
-      screen.innerHTML = `<img alt="분석 화면" src="${data.frame_data_url}" />`;
+      screen.innerHTML = '';
+      const image = document.createElement('img');
+      image.alt = '분석 화면';
+      image.src = data.frame_data_url;
+      screen.appendChild(image);
     }
 
     function updateMeta(data) {

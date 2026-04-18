@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "project_name": "detectWarning",
   "report_title": "행동 학습 결과 리포트",
   "updated_at": "2026-04-15T10:00:00+09:00",

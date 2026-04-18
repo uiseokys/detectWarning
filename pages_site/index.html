@@ -853,6 +853,15 @@
       return num.toFixed(digits);
     }
 
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
     function formatDateTime(value) {
       if (!value) return "-";
       const date = new Date(value);
@@ -899,7 +908,7 @@
     function renderPolylineChart(svgId, history, keys, colors, maxValue, emptyText) {
       const svg = document.getElementById(svgId);
       if (!history || !history.length) {
-        svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">${emptyText}</text>`;
+        svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">${escapeHtml(emptyText)}</text>`;
         return;
       }
 
@@ -974,7 +983,7 @@
       }
       tbody.innerHTML = rows.map((row) => `
         <tr>
-          <td>${row.label || "-"}</td>
+          <td>${escapeHtml(row.label || "-")}</td>
           <td class="numeric">${formatNumber(row.precision, 3)}</td>
           <td class="numeric">${formatNumber(row.recall, 3)}</td>
           <td class="numeric">${formatNumber(row.f1, 3)}</td>
@@ -993,7 +1002,7 @@
         return;
       }
       const maxValue = Math.max(1, ...matrix.flatMap((row) => Array.isArray(row) ? row.map((value) => Number(value || 0)) : [0]));
-      const headerCells = labelsList.map((label) => `<th>${label}</th>`).join("");
+      const headerCells = labelsList.map((label) => `<th>${escapeHtml(label)}</th>`).join("");
       const bodyRows = matrix.map((row, rowIndex) => {
         const label = labelsList[rowIndex] || `class_${rowIndex}`;
         const cells = row.map((value) => {
@@ -1003,7 +1012,7 @@
           const color = intensity > 0.55 ? '#eff6ff' : '#0f172a';
           return `<td class="heat-cell" style="background:${bg};color:${color};">${numeric}</td>`;
         }).join("");
-        return `<tr><th>${label}</th>${cells}</tr>`;
+        return `<tr><th>${escapeHtml(label)}</th>${cells}</tr>`;
       }).join("");
       wrap.innerHTML = `
         <table class="heatmap-table">
@@ -1026,11 +1035,11 @@
         const info = dataset?.[key];
         if (!info || !info.total) return "";
         const labels = Object.entries(info.by_label || {})
-          .map(([label, count]) => `${label} ${count}`)
+          .map(([label, count]) => `${escapeHtml(label)} ${count}`)
           .join(" / ");
         return `
           <tr>
-            <td>${key}</td>
+            <td>${escapeHtml(key)}</td>
             <td class="numeric">${info.total}</td>
             <td>${labels || "-"}</td>
           </tr>
@@ -1045,7 +1054,7 @@
       const rows = Array.isArray(jobs) ? jobs : [];
       tbody.innerHTML = rows.length ? rows.map((job) => `
         <tr>
-          <td>${job.filekey || "-"}</td>
+          <td>${escapeHtml(job.filekey || "-")}</td>
           <td>${stateLabel(job.state)}</td>
           <td>${formatDateTime(job.finished_at || job.started_at)}</td>
         </tr>
@@ -1090,19 +1099,19 @@
 
       document.getElementById("jobDetailBox").innerHTML = `
         상태: ${stateLabel(latestJob.state)}<br />
-        datasetkey: ${latestJob.datasetkey || "-"}<br />
-        filekey: ${latestJob.filekey || "-"}<br />
+        datasetkey: ${escapeHtml(latestJob.datasetkey || "-")}<br />
+        filekey: ${escapeHtml(latestJob.filekey || "-")}<br />
         시작: ${formatDateTime(latestJob.started_at)}<br />
         종료: ${formatDateTime(latestJob.finished_at)}<br />
-        모델: ${artifacts.best_model || "-"}<br />
-        메트릭: ${artifacts.metrics || "-"}<br />
-        라벨: ${artifacts.labels || "-"}<br /><br />
-        ${latestJob.message || "상세 메시지가 없습니다."}
+        모델: ${escapeHtml(artifacts.best_model || "-")}<br />
+        메트릭: ${escapeHtml(artifacts.metrics || "-")}<br />
+        라벨: ${escapeHtml(artifacts.labels || "-")}<br /><br />
+        ${escapeHtml(latestJob.message || "상세 메시지가 없습니다.")}
       `;
 
       const notes = report.notes || [];
       document.getElementById("notesBox").innerHTML = notes.length
-        ? `<ul>${notes.map((note) => `<li>${note}</li>`).join("")}</ul>`
+        ? `<ul>${notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>`
         : "메모가 없습니다.";
 
       renderMetricChart(report.history || []);
@@ -1339,11 +1348,11 @@
         상태: ${stateLabel(launcher.state)}<br />
         단계: ${progress.stage_label || "-"}<br />
         진행률: ${formatPercent(progress.ratio || 0)}<br />
-        datasetkey: ${currentJob.datasetkey || overview.aihub?.datasetkey || "-"}<br />
-        filekey: ${currentJob.filekey || "-"}<br />
+        datasetkey: ${escapeHtml(currentJob.datasetkey || overview.aihub?.datasetkey || "-")}<br />
+        filekey: ${escapeHtml(currentJob.filekey || "-")}<br />
         raw / prepared: ${(currentDataset.raw?.total ?? 0)} / ${preparedTrain + preparedVal + preparedTest}<br />
         큐: 활성 ${queue.active ?? 0}, 대기 ${queue.pending ?? 0}, 완료 ${queue.completed ?? 0}<br /><br />
-        ${launcher.message || progress.detail || "현재 작업 메시지가 없습니다."}
+        ${escapeHtml(launcher.message || progress.detail || "현재 작업 메시지가 없습니다.")}
       `;
     }
 
@@ -1412,6 +1421,9 @@
     }
 
     async function refreshDashboard() {
+      if (document.hidden) {
+        return;
+      }
       try {
         const [status, report] = await Promise.all([
           fetchJson("./live-status.json"),

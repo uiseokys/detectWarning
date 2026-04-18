@@ -24,6 +24,7 @@ import requests
 from action_model import train_action_classifier
 from detector import FaceDetector, PersonDetector
 from person_classifier import PersonPresenceFilter
+from training_config import load_action_training_config
 from tracker import PersonTracker
 
 
@@ -59,9 +60,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(config_path: Path) -> dict:
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    return config
+    return load_action_training_config(config_path)
 
 
 def main() -> None:

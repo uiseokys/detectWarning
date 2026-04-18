@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter
-from datetime import datetime, timezone
 from pathlib import Path
 
-from action_training_pipeline import load_config, resolve_paths
+from action_training_pipeline import get_target_labels, load_config, resolve_paths
+from reporting import (
+    STATE_SCHEMA_VERSION,
+    build_per_class_support,
+    build_recent_jobs,
+    get_best_macro_f1,
+    get_latest_job,
+    normalize_label_list,
+    normalize_metric_payload,
+    now_iso,
+    read_json,
+    safe_number,
+    summarize_manifest,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +91,12 @@ def main() -> None:
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     if args.command == "report":
-        payload = build_latest_result_payload(paths, project_name=args.project_name, report_title=args.report_title)
+        payload = build_latest_result_payload(
+            paths,
+            project_name=args.project_name,
+            report_title=args.report_title,
+            target_labels=get_target_labels(config),
+        )
         write_json(pages_dir / "latest-result.json", payload)
         print(f"[pages] updated latest-result.json -> {pages_dir / 'latest-result.json'}")
         return
@@ -111,12 +127,25 @@ def main() -> None:
     raise RuntimeError(f"지원하지 않는 명령입니다: {args.command}")
 
 
-def build_latest_result_payload(paths: dict, *, project_name: str, report_title: str) -> dict:
-    metrics = read_json(paths["artifacts_dir"] / "metrics.json") or {}
+def build_latest_result_payload(
+    paths: dict,
+    *,
+    project_name: str,
+    report_title: str,
+    target_labels: list[str] | None = None,
+) -> dict:
+    metrics = normalize_metric_payload(
+        read_json(paths["artifacts_dir"] / "metrics.json") or {},
+        target_labels=target_labels or [],
+    )
     labels_payload = read_json(paths["artifacts_dir"] / "labels.json") or {}
     history = metrics.get("history") or []
     final_validation = metrics.get("final_validation") or {}
-    labels = metrics.get("labels") or labels_payload.get("labels") or []
+    labels = (
+        metrics.get("labels")
+        or normalize_label_list(target_labels or [])
+        or normalize_label_list(labels_payload.get("labels") or [])
+    )
     best_epoch = metrics.get("best_epoch")
     resumed_from_checkpoint = bool(metrics.get("resumed_from_checkpoint"))
     latest_job = get_latest_job(paths)
@@ -158,9 +187,9 @@ def build_latest_result_payload(paths: dict, *, project_name: str, report_title:
         per_class_rows.append(
             {
                 "label": label,
-                "precision": round(float(row.get("precision", 0.0)), 6),
-                "recall": round(float(row.get("recall", 0.0)), 6),
-                "f1": round(float(row.get("f1", 0.0)), 6),
+                "precision": safe_number(row.get("precision")),
+                "recall": safe_number(row.get("recall")),
+                "f1": safe_number(row.get("f1")),
                 "support": support,
             }
         )
@@ -169,6 +198,7 @@ def build_latest_result_payload(paths: dict, *, project_name: str, report_title:
     latest_job_message = str(latest_job.get("message") or "최근 학습 기록을 불러오지 못했습니다.")
 
     payload = {
+        "schema_version": STATE_SCHEMA_VERSION,
         "project_name": project_name,
         "report_title": report_title,
         "updated_at": now_iso(),
@@ -243,6 +273,7 @@ def build_live_status_payload(
     current = read_json(pages_dir / "live-status.json") or {}
     effective_live_url = str(live_url or current.get("live_url") or "").strip()
     payload = {
+        "schema_version": STATE_SCHEMA_VERSION,
         "status": status,
         "project_name": current.get("project_name") or "detectWarning Training Dashboard",
         "live_title": current.get("live_title") or "실시간 연결 가능",
@@ -256,164 +287,10 @@ def build_live_status_payload(
     return payload
 
 
-def get_latest_job(paths: dict) -> dict:
-    launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
-    completed_jobs = launcher_history.get("completed_jobs") or []
-    if not isinstance(completed_jobs, list) or not completed_jobs:
-        pipeline_status = read_json(paths["pipeline_status"]) or {}
-        metrics_path = paths["artifacts_dir"] / "metrics.json"
-        model_path = paths["artifacts_dir"] / "best_action_model.pt"
-        has_recent_artifacts = metrics_path.exists() or model_path.exists()
-        fallback_finished_at = None
-        if metrics_path.exists():
-            fallback_finished_at = datetime.fromtimestamp(
-                metrics_path.stat().st_mtime,
-                tz=timezone.utc,
-            ).astimezone().isoformat()
-        elif model_path.exists():
-            fallback_finished_at = datetime.fromtimestamp(
-                model_path.stat().st_mtime,
-                tz=timezone.utc,
-            ).astimezone().isoformat()
-
-        if has_recent_artifacts:
-            return {
-                "datasetkey": None,
-                "filekey": None,
-                "state": "completed",
-                "started_at": None,
-                "finished_at": fallback_finished_at or pipeline_status.get("updated_at"),
-                "duration_minutes": None,
-                "message": pipeline_status.get("message") or "최근 학습 결과를 불러왔습니다.",
-            }
-        return {
-            "datasetkey": None,
-            "filekey": None,
-            "state": pipeline_status.get("state") or "offline",
-            "started_at": None,
-            "finished_at": pipeline_status.get("updated_at"),
-            "duration_minutes": None,
-            "message": pipeline_status.get("message") or "최근 학습 기록이 아직 없습니다.",
-        }
-
-    def sort_key(job: dict) -> str:
-        return str(job.get("finished_at") or job.get("started_at") or "")
-
-    latest_job = max(completed_jobs, key=sort_key)
-    return {
-        "datasetkey": latest_job.get("datasetkey"),
-        "filekey": latest_job.get("filekey"),
-        "state": latest_job.get("state"),
-        "started_at": latest_job.get("started_at"),
-        "finished_at": latest_job.get("finished_at"),
-        "duration_minutes": latest_job.get("duration_minutes"),
-        "message": latest_job.get("message"),
-    }
-
-
-def summarize_manifest_total(path: Path) -> int:
-    if not path.exists():
-        return 0
-    total = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                total += 1
-    return total
-
-
-def summarize_manifest(path: Path, label_field: str) -> dict:
-    if not path.exists():
-        return {"total": 0, "by_label": {}}
-    total = 0
-    by_label: Counter[str] = Counter()
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            payload = json.loads(line)
-            label = str(payload.get(label_field, "unknown"))
-            by_label[label] += 1
-    return {"total": total, "by_label": dict(sorted(by_label.items()))}
-
-
-def build_per_class_support(labels: list[str], confusion_matrix: list) -> list[dict]:
-    supports: list[dict] = []
-    matrix = confusion_matrix if isinstance(confusion_matrix, list) else []
-    for index, label in enumerate(labels):
-        row = matrix[index] if index < len(matrix) and isinstance(matrix[index], list) else []
-        support = sum(int(value or 0) for value in row)
-        supports.append(
-            {
-                "class_index": index,
-                "label": label,
-                "support": support,
-            }
-        )
-    return supports
-
-
-def build_recent_jobs(launcher_history: dict, limit: int = 5) -> list[dict]:
-    completed_jobs = launcher_history.get("completed_jobs") or []
-    if not isinstance(completed_jobs, list):
-        return []
-    recent = []
-    for job in completed_jobs[:limit]:
-        if not isinstance(job, dict):
-            continue
-        recent.append(
-            {
-                "datasetkey": job.get("datasetkey"),
-                "filekey": job.get("filekey"),
-                "state": job.get("state"),
-                "started_at": job.get("started_at"),
-                "finished_at": job.get("finished_at"),
-                "duration_minutes": job.get("duration_minutes"),
-                "message": job.get("message"),
-            }
-        )
-    return recent
-
-
-def get_best_macro_f1(history: list[dict]) -> float | None:
-    if not history:
-        return None
-    values = [safe_number(item.get("val_macro_f1")) for item in history]
-    values = [value for value in values if value is not None]
-    if not values:
-        return None
-    return max(values)
-
-
-def safe_number(value) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def read_json(path: Path) -> dict | list | None:
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
 
 
 if __name__ == "__main__":

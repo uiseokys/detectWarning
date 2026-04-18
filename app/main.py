@@ -604,6 +604,8 @@ def main() -> None:
     capture.release()
     if speech_listener is not None:
         speech_listener.stop()
+    if remote_client is not None:
+        remote_client.close()
     cv2.destroyAllWindows()
 
 

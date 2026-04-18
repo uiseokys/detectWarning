@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from math import hypot
+from pathlib import Path
 from time import monotonic
 
 
@@ -23,8 +26,21 @@ class RiskAssessment:
     context_flags: list[str]
 
 
+def _load_rule_bundle(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 class RiskAnalyzer:
-    def __init__(self) -> None:
+    def __init__(self, rules_path: str | Path | None = None) -> None:
         self._last_text_score = 0.0
         self._last_text_categories: list[str] = []
         self._last_text_reasons: list[str] = []
@@ -48,7 +64,35 @@ class RiskAnalyzer:
                 "A8",
                 "특정 비명",
                 42,
-                ("으악", "으아악", "아악", "아아악", "꺄악", "꺄아악", "비명", "악소리""악", "헉", "어어", "으어", "아야", "으윽","깜짝이야", "흐악", "놔", "야", "어", "히익", "으으", "어머", "아이씨", "끄악","허어억","으엑","헉컥","으허억"),
+                (
+                    "으악",
+                    "으아악",
+                    "아악",
+                    "아아악",
+                    "꺄악",
+                    "꺄아악",
+                    "비명",
+                    "악소리악",
+                    "헉",
+                    "어어",
+                    "으어",
+                    "아야",
+                    "으윽",
+                    "깜짝이야",
+                    "흐악",
+                    "놔",
+                    "야",
+                    "어",
+                    "히익",
+                    "으으",
+                    "어머",
+                    "아이씨",
+                    "끄악",
+                    "허어억",
+                    "으엑",
+                    "헉컥",
+                    "으허억",
+                ),
             ),
             CategoryRule(
                 "A7",
@@ -412,6 +456,106 @@ class RiskAnalyzer:
         )
         self._threat_codes = {"A1", "A2", "A3", "A5"}
 
+        configured_rules_path = (
+            Path(rules_path).expanduser()
+            if rules_path
+            else Path(
+                os.environ.get(
+                    "DETECTWARNING_RISK_RULES_PATH",
+                    str(Path(__file__).resolve().parents[1] / "configs" / "risk_rules.json"),
+                )
+            ).expanduser()
+        )
+        loaded_bundle = _load_rule_bundle(configured_rules_path)
+        if loaded_bundle:
+            self._category_rules = [
+                CategoryRule(
+                    str(rule.get("code", "")).strip(),
+                    str(rule.get("label", "")).strip(),
+                    int(rule.get("base_score", 0) or 0),
+                    tuple(str(phrase).strip() for phrase in rule.get("phrases", []) if str(phrase).strip()),
+                )
+                for rule in loaded_bundle.get("category_rules", [])
+                if isinstance(rule, dict)
+            ] or self._category_rules
+            self._low_risk_overstatements = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("low_risk_overstatements", [])
+                if str(token).strip()
+            ) or self._low_risk_overstatements
+            self._target_tokens = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("target_tokens", [])
+                if str(token).strip()
+            ) or self._target_tokens
+            self._immediacy_tokens = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("immediacy_tokens", [])
+                if str(token).strip()
+            ) or self._immediacy_tokens
+            self._means_tokens = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("means_tokens", [])
+                if str(token).strip()
+            ) or self._means_tokens
+            self._conditional_tokens = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("conditional_tokens", [])
+                if str(token).strip()
+            ) or self._conditional_tokens
+            self._plan_specific_tokens = tuple(
+                str(token).strip()
+                for token in loaded_bundle.get("plan_specific_tokens", [])
+                if str(token).strip()
+            ) or self._plan_specific_tokens
+            self._threat_codes = {
+                str(code).strip()
+                for code in loaded_bundle.get("threat_codes", [])
+                if str(code).strip()
+            } or self._threat_codes
+
+        self._normalized_category_rules = [
+            (
+                rule,
+                tuple(
+                    normalized
+                    for normalized in (self._normalize(phrase) for phrase in rule.phrases)
+                    if normalized
+                ),
+            )
+            for rule in self._category_rules
+        ]
+        self._normalized_low_risk_overstatements = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._low_risk_overstatements)
+            if normalized
+        )
+        self._normalized_target_tokens = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._target_tokens)
+            if normalized
+        )
+        self._normalized_immediacy_tokens = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._immediacy_tokens)
+            if normalized
+        )
+        self._normalized_means_tokens = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._means_tokens)
+            if normalized
+        )
+        self._normalized_conditional_tokens = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._conditional_tokens)
+            if normalized
+        )
+        self._normalized_plan_specific_tokens = tuple(
+            normalized
+            for normalized in (self._normalize(token) for token in self._plan_specific_tokens)
+            if normalized
+        )
+
     def update(self, speech_result, tracked_people, face_count: int) -> RiskAssessment:
         now = monotonic()
         transcript = (speech_result.transcript or "").strip()
@@ -516,10 +660,9 @@ class RiskAnalyzer:
 
     def _analyze_transcript(self, normalized_text: str, now: float) -> dict:
         matched_rules: list[tuple[CategoryRule, str]] = []
-        for rule in self._category_rules:
-            for phrase in rule.phrases:
-                normalized_phrase = self._normalize(phrase)
-                if normalized_phrase and normalized_phrase in normalized_text:
+        for rule, normalized_phrases in self._normalized_category_rules:
+            for phrase, normalized_phrase in zip(rule.phrases, normalized_phrases):
+                if normalized_phrase in normalized_text:
                     matched_rules.append((rule, phrase))
                     break
 
@@ -552,11 +695,11 @@ class RiskAnalyzer:
 
         flags: list[str] = []
         threat_like = any(code in self._threat_codes for code in codes)
-        target_detected = self._contains_any(normalized_text, self._target_tokens)
-        immediacy_detected = self._contains_any(normalized_text, self._immediacy_tokens)
-        means_detected = self._contains_any(normalized_text, self._means_tokens)
-        conditional_detected = self._contains_any(normalized_text, self._conditional_tokens)
-        plan_specific = "A4" in codes and self._contains_any(normalized_text, self._plan_specific_tokens)
+        target_detected = self._contains_any(normalized_text, self._normalized_target_tokens)
+        immediacy_detected = self._contains_any(normalized_text, self._normalized_immediacy_tokens)
+        means_detected = self._contains_any(normalized_text, self._normalized_means_tokens)
+        conditional_detected = self._contains_any(normalized_text, self._normalized_conditional_tokens)
+        plan_specific = "A4" in codes and self._contains_any(normalized_text, self._normalized_plan_specific_tokens)
 
         if target_detected and threat_like:
             score += 12
@@ -582,7 +725,7 @@ class RiskAnalyzer:
             score += min(18, 6 + repetition_count * 4)
             flags.append(f"반복 위협:{repetition_count + 1}회")
 
-        if self._contains_any(normalized_text, self._low_risk_overstatements) and not threat_like and "A4" not in codes:
+        if self._contains_any(normalized_text, self._normalized_low_risk_overstatements) and not threat_like and "A4" not in codes:
             score = max(score - 18, 0)
             flags.append("일상 과장 가능성")
 
@@ -753,4 +896,4 @@ class RiskAnalyzer:
         return lowered
 
     def _contains_any(self, normalized_text: str, tokens: tuple[str, ...]) -> bool:
-        return any(self._normalize(token) in normalized_text for token in tokens)
+        return any(token in normalized_text for token in tokens if token)

@@ -34,7 +34,7 @@ def list_input_devices() -> list[tuple[int, str, int, float]]:
                 float(device.get("default_samplerate", 0.0)),
             )
         )
-        return devices
+    return devices
 
 
 @dataclass
@@ -377,80 +377,82 @@ def main() -> None:
         )
         audio_streamer.start()
 
-    while True:
-        if frame is None:
-            ok, frame = capture.read()
-        else:
-            ok = True
-        if not ok:
-            print("\n카메라 프레임을 더 이상 읽지 못했습니다. 업로더를 종료합니다.")
-            break
-
-        if args.show_local_preview:
-            preview = frame.copy()
-            cv2.putText(
-                preview,
-                f"Uploader: {client_id}",
-                (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2,
-            )
-            cv2.imshow("detectWarning uploader", preview)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+    try:
+        while True:
+            if frame is None:
+                ok, frame = capture.read()
+            else:
+                ok = True
+            if not ok:
+                print("\n카메라 프레임을 더 이상 읽지 못했습니다. 업로더를 종료합니다.")
                 break
 
-        now = perf_counter()
-        if now - last_sent_at < interval:
-            sleep(0.005)
+            if args.show_local_preview:
+                preview = frame.copy()
+                cv2.putText(
+                    preview,
+                    f"Uploader: {client_id}",
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.imshow("detectWarning uploader", preview)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+
+            now = perf_counter()
+            if now - last_sent_at < interval:
+                sleep(0.005)
+                frame = None
+                continue
+
+            upload_frame = resize_frame_for_upload(frame, args.frame_width)
+            success, encoded = cv2.imencode(
+                ".jpg",
+                upload_frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(max(min(args.jpeg_quality, 100), 40))],
+            )
+            if not success:
+                frame = None
+                continue
+
+            try:
+                response = session.post(
+                    f"{args.server_url.rstrip('/')}/analyze/frame",
+                    params={"client_id": client_id},
+                    data=encoded.tobytes(),
+                    headers={"Content-Type": "image/jpeg"},
+                    timeout=args.timeout_seconds,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                print(
+                    f"\r전송 성공 | 사람 {len(payload.get('tracked_people', []))} | "
+                    f"얼굴 {len(payload.get('faces', []))} | "
+                    f"지연 {payload.get('latency_ms', 0)}ms",
+                    end="",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    "\r전송 실패: "
+                    f"{exc} | 서버 YOLO/STT 처리 시간이 타임아웃보다 길 수 있습니다.",
+                    end="",
+                    flush=True,
+                )
+
+            last_sent_at = now
             frame = None
-            continue
-
-        upload_frame = resize_frame_for_upload(frame, args.frame_width)
-        success, encoded = cv2.imencode(
-            ".jpg",
-            upload_frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), int(max(min(args.jpeg_quality, 100), 40))],
-        )
-        if not success:
-            frame = None
-            continue
-
-        try:
-            response = session.post(
-                f"{args.server_url.rstrip('/')}/analyze/frame",
-                params={"client_id": client_id},
-                data=encoded.tobytes(),
-                headers={"Content-Type": "image/jpeg"},
-                timeout=args.timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            print(
-                f"\r전송 성공 | 사람 {len(payload.get('tracked_people', []))} | "
-                f"얼굴 {len(payload.get('faces', []))} | "
-                f"지연 {payload.get('latency_ms', 0)}ms",
-                end="",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                "\r전송 실패: "
-                f"{exc} | 서버 YOLO/STT 처리 시간이 타임아웃보다 길 수 있습니다.",
-                end="",
-                flush=True,
-            )
-
-        last_sent_at = now
-        frame = None
-
-    capture.release()
-    if audio_streamer is not None:
-        audio_streamer.stop()
-    cv2.destroyAllWindows()
-    print("\n업로더를 종료했습니다.")
+    finally:
+        capture.release()
+        if audio_streamer is not None:
+            audio_streamer.stop()
+        session.close()
+        cv2.destroyAllWindows()
+        print("\n업로더를 종료했습니다.")
 
 
 if __name__ == "__main__":

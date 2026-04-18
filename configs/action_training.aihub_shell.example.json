@@ -104,11 +104,15 @@
     "resume_from_best": true,
     "cleanup_raw_after_job": true
   },
+  "dashboard": {
+    "allowed_origins": []
+  },
   "pages_sync": {
     "enabled": true,
     "pages_dir": "C:/Users/Administrator/Documents/GitHub/detectWarning-pages",
     "project_name": "detectWarning",
     "report_title": "행동 학습 결과 리포트",
+    "report_url": "",
     "live_url": "",
     "live_url_env": "DETECTWARNING_LIVE_URL",
     "redirect_delay_seconds": 3,

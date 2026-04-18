@@ -1,7 +1,9 @@
 {
   "paths": {
-    "workspace_dir": "../training_data/action_pipeline"
+    "workspace_dir": "../training_data/action_pipeline",
+    "workspace_dir_env": "DETECTWARNING_WORKSPACE_DIR"
   },
+  "dataset_source": "json_api",
   "api": {
     "list_url": "https://your-dataset-api.example.com/videos",
     "items_path": "results",
@@ -30,17 +32,52 @@
       "violence",
       "collapse",
       "abduction",
-      "loitering"
+      "intrusion_crime",
+      "loitering",
+      "vandalism"
     ],
     "label_mapping": {
       "일반행동": "normal",
+      "normal": "normal",
       "폭행": "violence",
+      "assault": "violence",
+      "fight": "violence",
+      "fighting": "violence",
+      "violence": "violence",
       "싸움": "violence",
       "데이트폭력 및 폭행": "violence",
+      "데이트폭력 및 추행": "violence",
+      "datefight": "violence",
+      "datingviolence": "violence",
+      "dating_violence": "violence",
       "실신": "collapse",
+      "fainting": "collapse",
+      "collapse": "collapse",
       "납치": "abduction",
-      "배회": "loitering"
+      "kidnap": "abduction",
+      "kidnapping": "abduction",
+      "abduction": "abduction",
+      "절도": "intrusion_crime",
+      "burglary": "intrusion_crime",
+      "침입": "intrusion_crime",
+      "trespass": "intrusion_crime",
+      "강도": "intrusion_crime",
+      "robbery": "intrusion_crime",
+      "배회": "loitering",
+      "배회(wander)": "loitering",
+      "loitering": "loitering",
+      "wander": "loitering",
+      "wandering": "loitering",
+      "기물파손": "vandalism",
+      "vandalism": "vandalism"
     },
+    "video_extensions": [
+      ".mp4",
+      ".avi",
+      ".mov",
+      ".mkv",
+      ".wmv"
+    ],
     "max_items_per_class": 0
   },
   "split": {
@@ -53,18 +90,46 @@
     "device": "cuda:0",
     "person_score_threshold": 0.25,
     "person_imgsz": 640,
+    "detector_batch_size": 24,
+    "video_prefetch_workers": 2,
+    "compress_prepared_pose": false,
     "sequence_length": 48,
     "max_frames_to_scan": 160,
     "min_frames_with_person": 4
   },
   "training": {
     "device": "cuda",
+    "amp": true,
+    "compile_model": true,
     "epochs": 20,
-    "batch_size": 16,
+    "batch_size": 48,
+    "dataset_cache_size": 2048,
     "learning_rate": 0.001,
     "hidden_dim": 128,
     "num_layers": 2,
     "dropout": 0.2,
-    "num_workers": 0
+    "num_workers": "auto",
+    "prefetch_factor": 4,
+    "persistent_workers": true
+  },
+  "continual_learning": {
+    "enabled": true,
+    "resume_from_best": true,
+    "cleanup_raw_after_job": true
+  },
+  "dashboard": {
+    "allowed_origins": []
+  },
+  "pages_sync": {
+    "enabled": false,
+    "pages_dir": "",
+    "project_name": "detectWarning",
+    "report_title": "행동 학습 결과 리포트",
+    "report_url": "",
+    "live_url": "",
+    "live_url_env": "DETECTWARNING_LIVE_URL",
+    "redirect_delay_seconds": 3,
+    "git_auto_push": false,
+    "git_commit_prefix": "Update dashboard"
   }
 }

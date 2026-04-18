@@ -11,7 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,13 +19,22 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from action_training_pipeline import load_config, resolve_paths
+from action_training_pipeline import get_target_labels, load_config, resolve_paths
+from reporting import (
+    STATE_SCHEMA_VERSION,
+    normalize_metric_payload,
+    read_json,
+    summarize_manifest,
+)
+from training_config import resolve_pages_sync_config
 from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
 GPU_STATUS_CACHE: dict[str, object] = {"timestamp": 0.0, "value": None}
 GPU_STATUS_CACHE_LOCK = threading.Lock()
+OVERVIEW_CACHE: dict[str, object] = {"signature": None, "value": None}
+OVERVIEW_CACHE_LOCK = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,6 +199,89 @@ def query_gpu_status(*, cache_ttl_seconds: float = 1.5) -> dict:
         GPU_STATUS_CACHE["timestamp"] = now
         GPU_STATUS_CACHE["value"] = result
     return result
+
+
+def resolve_allowed_origins(config: dict) -> list[str]:
+    dashboard_config = config.get("dashboard", {})
+    configured = dashboard_config.get("allowed_origins")
+    if isinstance(configured, str):
+        configured = [item.strip() for item in configured.split(",") if item.strip()]
+    elif not isinstance(configured, list):
+        configured = []
+
+    env_value = os.environ.get("DETECTWARNING_ALLOWED_ORIGINS", "").strip()
+    env_origins = [item.strip() for item in env_value.split(",") if item.strip()]
+    allowed = list(dict.fromkeys([*configured, *env_origins]))
+    if allowed:
+        return allowed
+
+    pages_sync = config.get("pages_sync", {})
+    report_url = str(pages_sync.get("report_url") or "").strip()
+    if report_url.startswith("http://") or report_url.startswith("https://"):
+        match = re.match(r"^https?://[^/]+", report_url)
+        if match:
+            return [match.group(0)]
+    if pages_sync.get("enabled"):
+        return ["*"]
+    return ["http://127.0.0.1:8010", "http://localhost:8010"]
+
+
+def compute_overview_signature(paths: dict, launcher_status: dict | None) -> tuple:
+    launcher_status = launcher_status or {}
+    time_bucket = int(time.time() // 2)
+    watched = [
+        paths["pipeline_status"],
+        paths["training_progress"],
+        paths["continual_state"],
+        paths["current_skip_report"],
+        paths["cumulative_skip_report"],
+        paths["artifacts_dir"] / "metrics.json",
+        paths["artifacts_dir"] / "labels.json",
+        paths["raw_manifest"],
+        paths["split_train"],
+        paths["split_val"],
+        paths["split_test"],
+        paths["prepared_train"],
+        paths["prepared_val"],
+        paths["prepared_test"],
+        paths["current_raw_manifest"],
+        paths["current_split_train"],
+        paths["current_split_val"],
+        paths["current_split_test"],
+        paths["current_prepared_train"],
+        paths["current_prepared_val"],
+        paths["current_prepared_test"],
+        paths["workspace_dir"] / "launcher_history.json",
+    ]
+    file_signature = []
+    for path in watched:
+        if not path.exists():
+            file_signature.append((str(path), None, None))
+            continue
+        stat = path.stat()
+        file_signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+
+    current_job = launcher_status.get("current_job") or {}
+    launcher_signature = (
+        launcher_status.get("state"),
+        tuple(
+            (job.get("datasetkey"), job.get("filekey"), job.get("state"))
+            for job in launcher_status.get("pending_jobs", [])
+            if isinstance(job, dict)
+        ),
+        tuple(
+            (job.get("datasetkey"), job.get("filekey"), job.get("state"), job.get("finished_at"))
+            for job in launcher_status.get("completed_jobs", [])[:10]
+            if isinstance(job, dict)
+        ),
+        tuple(
+            (key, current_job.get(key))
+            for key in ("datasetkey", "filekey", "started_at", "state", "message")
+            if key in current_job
+        ),
+        launcher_status.get("auto_start_enabled"),
+    )
+    return (tuple(file_signature), launcher_signature, time_bucket)
 
 
 def _parse_int_or_none(value: str | None) -> int | None:
@@ -391,34 +482,6 @@ def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> 
     return "error", f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
 
 
-def resolve_pages_sync_config(config: dict, base_dir: Path) -> dict:
-    raw = config.get("pages_sync") or {}
-    pages_dir_raw = str(raw.get("pages_dir") or "").strip()
-    live_url = str(raw.get("live_url") or "").strip()
-    live_url_env = str(raw.get("live_url_env") or "").strip()
-    if not live_url and live_url_env:
-        live_url = str(os.getenv(live_url_env, "")).strip()
-
-    pages_dir = None
-    if pages_dir_raw:
-        candidate = Path(pages_dir_raw)
-        if not candidate.is_absolute():
-            candidate = (base_dir / candidate).resolve()
-        pages_dir = candidate
-
-    enabled = bool(raw.get("enabled")) and pages_dir is not None
-    return {
-        "enabled": enabled,
-        "pages_dir": pages_dir,
-        "project_name": str(raw.get("project_name") or "detectWarning"),
-        "report_title": str(raw.get("report_title") or "행동 학습 결과 리포트"),
-        "live_url": live_url,
-        "redirect_delay_seconds": int(raw.get("redirect_delay_seconds") or 3),
-        "git_auto_push": bool(raw.get("git_auto_push", False)),
-        "git_commit_prefix": str(raw.get("git_commit_prefix") or "Update dashboard"),
-    }
-
-
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -434,7 +497,7 @@ def create_app(config_path: Path) -> FastAPI:
     app = FastAPI(title="detectWarning Training Dashboard")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=resolve_allowed_origins(config),
         allow_credentials=False,
         allow_methods=["GET"],
         allow_headers=["*"],
@@ -569,6 +632,7 @@ def create_app(config_path: Path) -> FastAPI:
             paths,
             project_name=str(pages_sync["project_name"]),
             report_title=str(pages_sync["report_title"]),
+            target_labels=get_target_labels(config),
         )
         write_json(Path(pages_sync["pages_dir"]) / "latest-result.json", payload)
         push_pages_repo("latest-result.json", reason="report")
@@ -3112,6 +3176,15 @@ def create_app(config_path: Path) -> FastAPI:
       return document.getElementById(id);
     }
 
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
     function setText(id, value) {
       const element = getElement(id);
       if (element) {
@@ -3154,16 +3227,16 @@ def create_app(config_path: Path) -> FastAPI:
       list.innerHTML = items.map((job) => `
         <div class="queued-job-item">
           <div class="queued-job-main">
-            <div class="queued-job-key">filekey ${job.filekey || '-'}</div>
+            <div class="queued-job-key">filekey ${escapeHtml(job.filekey || '-')}</div>
             <div class="queued-job-meta">
-              datasetkey ${job.datasetkey || '-'} · queued ${formatDateTime(job.queued_at)}
+              datasetkey ${escapeHtml(job.datasetkey || '-')} · queued ${formatDateTime(job.queued_at)}
             </div>
           </div>
           <button
             class="queued-remove-button"
             type="button"
-            data-job-id="${job.job_id || ''}"
-            data-filekey="${job.filekey || ''}"
+            data-job-id="${escapeHtml(job.job_id || '')}"
+            data-filekey="${escapeHtml(job.filekey || '')}"
           >제거</button>
         </div>
       `).join('');
@@ -3314,12 +3387,12 @@ def create_app(config_path: Path) -> FastAPI:
           const title = point.dataset.title || '';
           const lines = (point.dataset.lines || '').split('|').filter(Boolean);
           tooltip.innerHTML = `
-            <div class="chart-tooltip-title">${title}</div>
+            <div class="chart-tooltip-title">${escapeHtml(title)}</div>
             ${lines.map((entry) => {
               const parts = entry.split(':');
               const key = parts.shift() || '';
               const value = parts.join(':');
-              return `<div class="chart-tooltip-line"><strong>${key}</strong>${value}</div>`;
+              return `<div class="chart-tooltip-line"><strong>${escapeHtml(key)}</strong>${escapeHtml(value)}</div>`;
             }).join('')}
           `;
           const shellRect = tooltip.parentElement.getBoundingClientRect();
@@ -3604,11 +3677,11 @@ def create_app(config_path: Path) -> FastAPI:
           return;
         }
         const labels = Object.entries(info.by_label || {})
-          .map(([label, count]) => `${label} ${count}`)
+          .map(([label, count]) => `${escapeHtml(label)} ${count}`)
           .join(' / ');
         rows.push(`
           <tr>
-            <td>${key}</td>
+            <td>${escapeHtml(key)}</td>
             <td>${info.total}</td>
             <td>${labels || '-'}</td>
           </tr>
@@ -3730,7 +3803,7 @@ def create_app(config_path: Path) -> FastAPI:
         const support = supportRows.find((item) => item.class_index === row.class_index)?.support ?? 0;
         return `
           <tr>
-            <td>${label}</td>
+            <td>${escapeHtml(label)}</td>
             <td>${row.precision ?? '-'}</td>
             <td>${row.recall ?? '-'}</td>
             <td>${row.f1 ?? '-'}</td>
@@ -3757,7 +3830,7 @@ def create_app(config_path: Path) -> FastAPI:
         empty.style.display = 'none';
       }
       const maxValue = Math.max(1, ...matrix.flatMap((row) => Array.isArray(row) ? row.map((value) => Number(value || 0)) : [0]));
-      const headerCells = labels.map((label) => `<th>${label}</th>`).join('');
+      const headerCells = labels.map((label) => `<th>${escapeHtml(label)}</th>`).join('');
       const bodyRows = matrix.map((row, rowIndex) => {
         const label = labels?.[rowIndex] || `class_${rowIndex}`;
         const cells = row.map((value) => {
@@ -3767,7 +3840,7 @@ def create_app(config_path: Path) -> FastAPI:
           const color = intensity > 0.55 ? '#eff6ff' : '#0f172a';
           return `<td class="heat-cell" style="background:${bg};color:${color};">${numeric}</td>`;
         }).join('');
-        return `<tr><th>${label}</th>${cells}</tr>`;
+        return `<tr><th>${escapeHtml(label)}</th>${cells}</tr>`;
       }).join('');
       wrap.innerHTML = `
         <table class="heatmap-table">
@@ -3829,11 +3902,11 @@ def create_app(config_path: Path) -> FastAPI:
         const logPreview = job.log_preview || job.log_path || '-';
         return `
           <tr>
-            <td>${job.filekey || '-'}</td>
+            <td>${escapeHtml(job.filekey || '-')}</td>
             <td>${stateLabel}${job.exit_code !== null && job.exit_code !== undefined ? ` (${job.exit_code})` : ''}</td>
             <td>${rawTotal} / ${preparedTotal}${issueTotal > 0 ? `<br>issue ${issueTotal}` : ''}</td>
             <td>${formatDateTime(job.started_at)}<br>${formatDateTime(job.finished_at)}</td>
-            <td class="mono">${logPreview}</td>
+            <td class="mono">${escapeHtml(logPreview)}</td>
           </tr>
         `;
       }).join('');
@@ -3883,9 +3956,9 @@ def create_app(config_path: Path) -> FastAPI:
       tbody.innerHTML = issues.slice(-20).reverse().map((issue) => `
         <tr>
           <td>${issue.category === 'broken' ? '손상' : 'skip'}</td>
-          <td>${issue.split || '-'}</td>
-          <td>${issue.video_name || '-'}</td>
-          <td>${formatIssueReason(issue)}</td>
+          <td>${escapeHtml(issue.split || '-')}</td>
+          <td>${escapeHtml(issue.video_name || '-')}</td>
+          <td>${escapeHtml(formatIssueReason(issue))}</td>
         </tr>
       `).join('');
     }
@@ -4079,6 +4152,9 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     async function refresh() {
+      if (document.hidden) {
+        return;
+      }
       const response = await fetch('/api/overview');
       if (!response.ok) {
         return;
@@ -4492,9 +4568,24 @@ def create_app(config_path: Path) -> FastAPI:
 
 def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_status: dict | None = None) -> dict:
     launcher_status = launcher_status or {}
+    signature = compute_overview_signature(paths, launcher_status)
+    with OVERVIEW_CACHE_LOCK:
+        cached_signature = OVERVIEW_CACHE.get("signature")
+        cached_value = OVERVIEW_CACHE.get("value")
+        if cached_signature == signature and isinstance(cached_value, dict):
+            return cached_value
+
     gpu_status = query_gpu_status()
     pipeline_status = read_json(paths["pipeline_status"])
-    training_progress = read_json(paths["training_progress"])
+    target_labels = get_target_labels(config)
+    training_progress = normalize_metric_payload(
+        read_json(paths["training_progress"]),
+        target_labels=target_labels,
+    )
+    metrics = normalize_metric_payload(
+        read_json(paths["artifacts_dir"] / "metrics.json"),
+        target_labels=target_labels,
+    )
     current_skip_report = read_json(paths["current_skip_report"]) or {
         "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
         "issues": [],
@@ -4546,10 +4637,12 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     current_job_progress = build_current_job_progress(pipeline_status, training_progress, launcher_status)
     eta = estimate_eta(current_job_progress, launcher_status)
 
-    return {
+    overview = {
+        "schema_version": STATE_SCHEMA_VERSION,
         "workspace_dir": str(paths["workspace_dir"]),
         "workspace_name": paths["workspace_dir"].name,
         "config_path": str(config_path),
+        "target_labels": target_labels,
         "pipeline_status": pipeline_status,
         "training_progress": training_progress,
         "launcher": {
@@ -4620,35 +4713,12 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         },
         "skip_report": current_skip_report,
         "cumulative_skip_report": cumulative_skip_report,
-        "metrics": read_json(paths["artifacts_dir"] / "metrics.json"),
+        "metrics": metrics,
     }
-
-
-def summarize_manifest(path: Path, label_field: str) -> dict:
-    if not path.exists():
-        return {"total": 0, "by_label": {}}
-    total = 0
-    by_label: Counter[str] = Counter()
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            payload = json.loads(line)
-            label = str(payload.get(label_field, "unknown"))
-            by_label[label] += 1
-    return {"total": total, "by_label": dict(sorted(by_label.items()))}
-
-
-def read_json(path: Path):
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
+    with OVERVIEW_CACHE_LOCK:
+        OVERVIEW_CACHE["signature"] = signature
+        OVERVIEW_CACHE["value"] = overview
+    return overview
 
 
 def parse_filekeys(raw_value) -> list[str]:

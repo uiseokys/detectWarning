@@ -31,6 +31,9 @@ class RemoteInferenceClient:
         self.jpeg_quality = int(max(min(jpeg_quality, 100), 40))
         self.session = requests.Session()
 
+    def close(self) -> None:
+        self.session.close()
+
     def analyze_frame(self, frame) -> RemoteInferenceResult:
         started_at = perf_counter()
         success, encoded = cv2.imencode(
