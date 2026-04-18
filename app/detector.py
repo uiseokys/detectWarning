@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -55,9 +56,20 @@ class PersonDetector:
         candidates = self.detect_person_boxes(frame)
         return self.estimate_pose_in_boxes(frame, candidates)
 
+    def detect_batch(self, frames):
+        if not frames:
+            return []
+        candidates_per_frame = self.detect_person_boxes_batch(frames)
+        return self.estimate_pose_in_boxes_batch(frames, candidates_per_frame)
+
     def detect_person_boxes(self, frame):
+        return self.detect_person_boxes_batch([frame])[0]
+
+    def detect_person_boxes_batch(self, frames):
+        if not frames:
+            return []
         results = self.detector_model.predict(
-            source=frame,
+            source=frames,
             classes=[0],
             conf=self.score_threshold,
             iou=self.nms_threshold,
@@ -65,10 +77,76 @@ class PersonDetector:
             device=self.device,
             verbose=False,
         )
-        if not results:
+        people_per_frame = []
+        result_count = len(results) if results else 0
+        for frame_index, frame in enumerate(frames):
+            result = results[frame_index] if frame_index < result_count else None
+            people_per_frame.append(self._build_people_from_result(frame, result))
+        return people_per_frame
+
+    def estimate_pose_in_boxes_batch(self, frames, candidates_per_frame):
+        if not frames:
             return []
 
-        boxes = results[0].boxes
+        poses_per_frame = []
+        grouped_crops = defaultdict(list)
+
+        for frame_index, (frame, candidates) in enumerate(zip(frames, candidates_per_frame)):
+            frame_poses = []
+            for candidate_index, candidate in enumerate(candidates):
+                x, y, w, h = candidate["bbox"]
+                crop_box = self._expand_crop_box(frame.shape, x, y, w, h)
+                cx, cy, cw, ch = crop_box
+                base_pose = {**candidate, "keypoints": [], "pose_mean_conf": 0.0}
+                frame_poses.append(base_pose)
+                if cw <= 0 or ch <= 0:
+                    continue
+
+                crop = frame[cy:cy + ch, cx:cx + cw]
+                if crop.size == 0:
+                    continue
+
+                pose_imgsz = self._normalize_imgsz(
+                    max(256, min(self.resize_width, max(crop.shape[:2])))
+                )
+                grouped_crops[pose_imgsz].append(
+                    {
+                        "frame_index": frame_index,
+                        "candidate_index": candidate_index,
+                        "crop_box": crop_box,
+                        "crop": crop,
+                    }
+                )
+            poses_per_frame.append(frame_poses)
+
+        for pose_imgsz, items in grouped_crops.items():
+            crops = [item["crop"] for item in items]
+            pose_results = self.pose_model.predict(
+                source=crops,
+                classes=[0],
+                conf=max(self.score_threshold * 0.5, 0.15),
+                imgsz=pose_imgsz,
+                device=self.device,
+                verbose=False,
+            )
+            result_count = len(pose_results) if pose_results else 0
+            for item_index, item in enumerate(items):
+                result = pose_results[item_index] if item_index < result_count else None
+                keypoints, pose_mean_conf = self._extract_pose_from_result(result, item["crop_box"])
+                target = poses_per_frame[item["frame_index"]][item["candidate_index"]]
+                target["keypoints"] = keypoints
+                target["pose_mean_conf"] = pose_mean_conf
+                if keypoints:
+                    target["crop_bbox"] = item["crop_box"]
+
+        return poses_per_frame
+
+    @staticmethod
+    def _build_people_from_result(frame, result):
+        if result is None:
+            return []
+
+        boxes = result.boxes
         if boxes is None or boxes.xyxy is None:
             return []
 
@@ -94,42 +172,7 @@ class PersonDetector:
     def estimate_pose_in_boxes(self, frame, candidates):
         if not candidates:
             return []
-
-        poses = []
-        for candidate in candidates:
-            x, y, w, h = candidate["bbox"]
-            crop_box = self._expand_crop_box(frame.shape, x, y, w, h)
-            cx, cy, cw, ch = crop_box
-            if cw <= 0 or ch <= 0:
-                poses.append({**candidate, "keypoints": [], "pose_mean_conf": 0.0})
-                continue
-
-            crop = frame[cy:cy + ch, cx:cx + cw]
-            if crop.size == 0:
-                poses.append({**candidate, "keypoints": [], "pose_mean_conf": 0.0})
-                continue
-
-            pose_imgsz = self._normalize_imgsz(
-                max(256, min(self.resize_width, max(crop.shape[:2])))
-            )
-            pose_results = self.pose_model.predict(
-                source=crop,
-                classes=[0],
-                conf=max(self.score_threshold * 0.5, 0.15),
-                imgsz=pose_imgsz,
-                device=self.device,
-                verbose=False,
-            )
-            keypoints, pose_mean_conf = self._extract_pose_from_crop(pose_results, crop_box)
-            poses.append(
-                {
-                    **candidate,
-                    "keypoints": keypoints,
-                    "pose_mean_conf": pose_mean_conf,
-                    "crop_bbox": crop_box,
-                }
-            )
-        return poses
+        return self.estimate_pose_in_boxes_batch([frame], [candidates])[0]
 
     @staticmethod
     def _expand_crop_box(frame_shape, x: int, y: int, w: int, h: int):
@@ -142,11 +185,10 @@ class PersonDetector:
         return (x0, y0, max(x1 - x0, 0), max(y1 - y0, 0))
 
     @staticmethod
-    def _extract_pose_from_crop(results, crop_box):
-        if not results:
+    def _extract_pose_from_result(result, crop_box):
+        if result is None:
             return [], 0.0
 
-        result = results[0]
         boxes = result.boxes
         keypoints = result.keypoints
         if (
@@ -260,6 +302,9 @@ class FaceDetector:
 
     def detect(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return self.detect_gray(gray)
+
+    def detect_gray(self, gray):
         gray = cv2.equalizeHist(gray)
         faces = self.cascade.detectMultiScale(
             gray,

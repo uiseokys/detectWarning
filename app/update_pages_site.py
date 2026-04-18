@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -119,21 +120,48 @@ def build_latest_result_payload(paths: dict, *, project_name: str, report_title:
     best_epoch = metrics.get("best_epoch")
     resumed_from_checkpoint = bool(metrics.get("resumed_from_checkpoint"))
     latest_job = get_latest_job(paths)
+    launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
+    continual_state = read_json(paths["continual_state"]) or {}
+    cumulative_skip_report = read_json(paths["cumulative_skip_report"]) or {
+        "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
+        "issues": [],
+    }
 
-    train_total = summarize_manifest_total(paths["prepared_train"])
-    val_total = summarize_manifest_total(paths["prepared_val"])
-    test_total = summarize_manifest_total(paths["prepared_test"])
+    dataset = {
+        "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
+        "train": summarize_manifest(paths["split_train"], label_field="target_label"),
+        "val": summarize_manifest(paths["split_val"], label_field="target_label"),
+        "test": summarize_manifest(paths["split_test"], label_field="target_label"),
+        "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
+        "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
+        "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
+    }
+    train_total = dataset["prepared_train"]["total"]
+    val_total = dataset["prepared_val"]["total"]
+    test_total = dataset["prepared_test"]["total"]
+    confusion_matrix = final_validation.get("confusion_matrix") or []
+    supports = build_per_class_support(labels, confusion_matrix)
+    covered_classes = [row for row in supports if int(row.get("support", 0)) > 0]
+    dominant_class = max(supports, key=lambda row: int(row.get("support", 0)), default=None)
+    total_val_samples = sum(int(row.get("support", 0)) for row in supports)
+    issue_summary = cumulative_skip_report.get("summary") or {}
+    recent_jobs = build_recent_jobs(launcher_history)
 
     per_class_rows = []
     for row in final_validation.get("per_class", []) or []:
         class_index = int(row.get("class_index", len(per_class_rows)))
         label = labels[class_index] if 0 <= class_index < len(labels) else str(class_index)
+        support = next(
+            (int(item.get("support", 0)) for item in supports if int(item.get("class_index", -1)) == class_index),
+            0,
+        )
         per_class_rows.append(
             {
                 "label": label,
                 "precision": round(float(row.get("precision", 0.0)), 6),
                 "recall": round(float(row.get("recall", 0.0)), 6),
                 "f1": round(float(row.get("f1", 0.0)), 6),
+                "support": support,
             }
         )
 
@@ -157,6 +185,18 @@ def build_latest_result_payload(paths: dict, *, project_name: str, report_title:
             "final_accuracy": safe_number(final_validation.get("accuracy")),
             "final_macro_f1": safe_number(final_validation.get("macro_f1")),
             "resumed_from_checkpoint": resumed_from_checkpoint,
+            "val_sample_total": total_val_samples,
+            "class_coverage": {
+                "covered": len(covered_classes),
+                "total": len(labels),
+            },
+            "dominant_class": dominant_class.get("label") if dominant_class else None,
+            "dominant_class_support": dominant_class.get("support") if dominant_class else 0,
+            "issues": {
+                "total": int(issue_summary.get("total_issues", 0) or 0),
+                "broken": int(issue_summary.get("broken_count", 0) or 0),
+                "skipped": int(issue_summary.get("skipped_count", 0) or 0),
+            },
         },
         "latest_job": {
             "datasetkey": latest_job.get("datasetkey"),
@@ -171,10 +211,18 @@ def build_latest_result_payload(paths: dict, *, project_name: str, report_title:
             "best_model": str(paths["artifacts_dir"] / "best_action_model.pt"),
             "metrics": str(paths["artifacts_dir"] / "metrics.json"),
             "labels": str(paths["artifacts_dir"] / "labels.json"),
+            "has_model": (paths["artifacts_dir"] / "best_action_model.pt").exists(),
+            "has_metrics": (paths["artifacts_dir"] / "metrics.json").exists(),
+            "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
         "labels": labels,
         "history": history,
         "per_class": per_class_rows,
+        "confusion_matrix": confusion_matrix,
+        "dataset": dataset,
+        "continual_state": continual_state,
+        "issues": cumulative_skip_report,
+        "recent_jobs": recent_jobs,
         "notes": [
             "실시간 대시보드가 켜져 있으면 이 페이지는 live 화면으로 자동 전환됩니다.",
             "경고 종료는 산출물 저장까지 완료되었지만 종료 단계에서만 경고 코드가 남은 상태입니다.",
@@ -247,6 +295,61 @@ def summarize_manifest_total(path: Path) -> int:
             if line.strip():
                 total += 1
     return total
+
+
+def summarize_manifest(path: Path, label_field: str) -> dict:
+    if not path.exists():
+        return {"total": 0, "by_label": {}}
+    total = 0
+    by_label: Counter[str] = Counter()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            payload = json.loads(line)
+            label = str(payload.get(label_field, "unknown"))
+            by_label[label] += 1
+    return {"total": total, "by_label": dict(sorted(by_label.items()))}
+
+
+def build_per_class_support(labels: list[str], confusion_matrix: list) -> list[dict]:
+    supports: list[dict] = []
+    matrix = confusion_matrix if isinstance(confusion_matrix, list) else []
+    for index, label in enumerate(labels):
+        row = matrix[index] if index < len(matrix) and isinstance(matrix[index], list) else []
+        support = sum(int(value or 0) for value in row)
+        supports.append(
+            {
+                "class_index": index,
+                "label": label,
+                "support": support,
+            }
+        )
+    return supports
+
+
+def build_recent_jobs(launcher_history: dict, limit: int = 5) -> list[dict]:
+    completed_jobs = launcher_history.get("completed_jobs") or []
+    if not isinstance(completed_jobs, list):
+        return []
+    recent = []
+    for job in completed_jobs[:limit]:
+        if not isinstance(job, dict):
+            continue
+        recent.append(
+            {
+                "datasetkey": job.get("datasetkey"),
+                "filekey": job.get("filekey"),
+                "state": job.get("state"),
+                "started_at": job.get("started_at"),
+                "finished_at": job.get("finished_at"),
+                "duration_minutes": job.get("duration_minutes"),
+                "message": job.get("message"),
+            }
+        )
+    return recent
 
 
 def get_best_macro_f1(history: list[dict]) -> float | None:

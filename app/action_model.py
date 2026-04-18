@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,8 +106,11 @@ def train_action_classifier(
     hidden_dim: int = 128,
     num_layers: int = 2,
     dropout: float = 0.2,
-    num_workers: int = 0,
+    num_workers: int | str = 0,
     device: str = "cuda",
+    amp: bool = True,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
     progress_path: Path | None = None,
     resume_from: Path | None = None,
 ) -> TrainingArtifacts:
@@ -117,19 +122,31 @@ def train_action_classifier(
     train_dataset = PoseSequenceDataset(train_manifest)
     val_dataset = PoseSequenceDataset(val_manifest)
 
-    train_loader = DataLoader(
-        train_dataset,
+    use_cuda = _uses_cuda(device)
+    use_amp = bool(amp and use_cuda and torch.cuda.is_available())
+    resolved_num_workers = _resolve_num_workers(num_workers, batch_size=batch_size)
+    resolved_prefetch_factor = max(int(prefetch_factor), 1)
+    use_persistent_workers = bool(persistent_workers and resolved_num_workers > 0)
+
+    _configure_training_acceleration(device=device, use_cuda=use_cuda)
+
+    train_loader = _build_dataloader(
+        dataset=train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device.startswith("cuda"),
+        num_workers=resolved_num_workers,
+        pin_memory=use_cuda,
+        prefetch_factor=resolved_prefetch_factor,
+        persistent_workers=use_persistent_workers,
     )
-    val_loader = DataLoader(
-        val_dataset,
+    val_loader = _build_dataloader(
+        dataset=val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.startswith("cuda"),
+        num_workers=resolved_num_workers,
+        pin_memory=use_cuda,
+        prefetch_factor=resolved_prefetch_factor,
+        persistent_workers=use_persistent_workers,
     )
 
     first_pose, _first_mask, _first_label = train_dataset[0]
@@ -160,12 +177,22 @@ def train_action_classifier(
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    scaler = _create_grad_scaler(enabled=use_amp)
 
     history: list[dict] = []
     best_val_f1 = -1.0
     best_epoch = 0
     train_sample_count = len(train_dataset)
     val_sample_count = len(val_dataset)
+
+    print(
+        "[train] acceleration "
+        f"device={device} "
+        f"amp={'on' if use_amp else 'off'} "
+        f"workers={resolved_num_workers} "
+        f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
+        f"persistent={'on' if use_persistent_workers else 'off'}"
+    )
 
     if progress_path is not None:
         _write_progress(
@@ -183,6 +210,10 @@ def train_action_classifier(
                 "resumed_from_checkpoint": resumed_from_checkpoint,
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
+                "amp_enabled": use_amp,
+                "num_workers": resolved_num_workers,
+                "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
+                "persistent_workers": use_persistent_workers,
             },
         )
 
@@ -195,6 +226,8 @@ def train_action_classifier(
             optimizer=optimizer,
             device=device,
             train=True,
+            use_amp=use_amp,
+            scaler=scaler,
         )
         val_metrics = _evaluate(
             model=model,
@@ -202,6 +235,7 @@ def train_action_classifier(
             criterion=criterion,
             device=device,
             num_classes=len(labels),
+            use_amp=use_amp,
         )
         scheduler.step()
 
@@ -257,6 +291,10 @@ def train_action_classifier(
                     "resumed_from_checkpoint": resumed_from_checkpoint,
                     "train_samples": train_sample_count,
                     "val_samples": val_sample_count,
+                    "amp_enabled": use_amp,
+                    "num_workers": resolved_num_workers,
+                    "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
+                    "persistent_workers": use_persistent_workers,
                 },
             )
 
@@ -278,6 +316,10 @@ def train_action_classifier(
                 "labels": labels,
                 "best_epoch": best_epoch,
                 "resumed_from_checkpoint": resumed_from_checkpoint,
+                "amp_enabled": use_amp,
+                "num_workers": resolved_num_workers,
+                "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
+                "persistent_workers": use_persistent_workers,
             },
             handle,
             ensure_ascii=False,
@@ -301,6 +343,10 @@ def train_action_classifier(
                 "resumed_from_checkpoint": resumed_from_checkpoint,
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
+                "amp_enabled": use_amp,
+                "num_workers": resolved_num_workers,
+                "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
+                "persistent_workers": use_persistent_workers,
             },
         )
 
@@ -328,6 +374,8 @@ def _run_epoch(
     optimizer,
     device: str,
     train: bool,
+    use_amp: bool,
+    scaler,
 ) -> float:
     if train:
         model.train()
@@ -338,19 +386,25 @@ def _run_epoch(
     total_items = 0
 
     for pose, mask, labels in loader:
-        pose = pose.to(device)
-        mask = mask.to(device)
-        labels = labels.to(device)
+        pose = pose.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        logits = model(pose, mask)
-        loss = criterion(logits, labels)
+        with _autocast_context(device=device, enabled=use_amp):
+            logits = model(pose, mask)
+            loss = criterion(logits, labels)
 
         if train:
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
         batch_size = int(labels.shape[0])
         total_loss += float(loss.item()) * batch_size
@@ -367,6 +421,7 @@ def _evaluate(
     criterion: nn.Module,
     device: str,
     num_classes: int,
+    use_amp: bool,
 ) -> dict:
     model.eval()
     total_loss = 0.0
@@ -374,12 +429,13 @@ def _evaluate(
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
 
     for pose, mask, labels in loader:
-        pose = pose.to(device)
-        mask = mask.to(device)
-        labels = labels.to(device)
+        pose = pose.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        logits = model(pose, mask)
-        loss = criterion(logits, labels)
+        with _autocast_context(device=device, enabled=use_amp):
+            logits = model(pose, mask)
+            loss = criterion(logits, labels)
         preds = logits.argmax(dim=1)
 
         batch_size = int(labels.shape[0])
@@ -423,6 +479,86 @@ def _compute_f1(confusion: np.ndarray) -> tuple[float, list[dict]]:
         f1_scores.append(f1)
     macro_f1 = float(sum(f1_scores) / max(len(f1_scores), 1))
     return macro_f1, metrics
+
+
+def _build_dataloader(
+    *,
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int,
+    persistent_workers: bool,
+) -> DataLoader:
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["persistent_workers"] = persistent_workers
+    return DataLoader(dataset, **kwargs)
+
+
+def _uses_cuda(device: str) -> bool:
+    return str(device).strip().lower().startswith("cuda")
+
+
+def _resolve_num_workers(value: int | str, *, batch_size: int) -> int:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "auto", "default"}:
+            requested = None
+        else:
+            requested = max(int(normalized), 0)
+    else:
+        requested = max(int(value), 0)
+
+    if requested is not None and requested > 0:
+        return requested
+
+    cpu_count = os.cpu_count() or 2
+    auto_workers = min(8, max(2, cpu_count // 2))
+    return min(auto_workers, max(int(batch_size), 1))
+
+
+def _configure_training_acceleration(*, device: str, use_cuda: bool) -> None:
+    if not use_cuda:
+        return
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
+def _create_grad_scaler(*, enabled: bool):
+    if not enabled:
+        return None
+    amp_module = getattr(torch, "amp", None)
+    if amp_module is not None and hasattr(amp_module, "GradScaler"):
+        try:
+            return amp_module.GradScaler("cuda", enabled=True)
+        except TypeError:
+            return amp_module.GradScaler(enabled=True)
+    cuda_amp = getattr(torch.cuda, "amp", None)
+    if cuda_amp is not None and hasattr(cuda_amp, "GradScaler"):
+        return cuda_amp.GradScaler(enabled=True)
+    return None
+
+
+def _autocast_context(*, device: str, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    device_type = "cuda" if _uses_cuda(device) else "cpu"
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device_type, enabled=True)
+    amp_module = getattr(torch.cuda, "amp", None)
+    if amp_module is not None and hasattr(amp_module, "autocast"):
+        return amp_module.autocast(enabled=True)
+    return nullcontext()
 
 
 def _write_progress(progress_path: Path, payload: dict) -> None:

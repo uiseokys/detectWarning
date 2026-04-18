@@ -140,8 +140,11 @@ def main() -> None:
                 hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
                 num_layers=int(config.get("training", {}).get("num_layers", 2)),
                 dropout=float(config.get("training", {}).get("dropout", 0.2)),
-                num_workers=int(config.get("training", {}).get("num_workers", 0)),
+                num_workers=config.get("training", {}).get("num_workers", "auto"),
                 device=str(config.get("training", {}).get("device", "cuda")),
+                amp=bool(config.get("training", {}).get("amp", True)),
+                prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
+                persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
                 progress_path=paths["training_progress"],
                 resume_from=resume_from,
             )
@@ -915,6 +918,7 @@ def _rewrite_split_manifest(path: Path, items: list[DownloadedItem]) -> None:
 def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, Path]) -> dict[str, Path]:
     preprocess_config = config.get("preprocess", {})
     device = str(preprocess_config.get("device", "cuda:0"))
+    compress_prepared_pose = bool(preprocess_config.get("compress_prepared_pose", False))
     person_detector = PersonDetector(
         score_threshold=float(preprocess_config.get("person_score_threshold", 0.25)),
         resize_width=int(preprocess_config.get("person_imgsz", 640)),
@@ -987,6 +991,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         face_detector=face_detector,
                         sequence_length=int(preprocess_config.get("sequence_length", 48)),
                         max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                        detector_batch_size=int(preprocess_config.get("detector_batch_size", 8)),
                     )
                 except Exception as exc:
                     skipped += 1
@@ -1016,7 +1021,8 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                 pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
                 pose_output_dir.mkdir(parents=True, exist_ok=True)
                 pose_path = pose_output_dir / f"{video_path.stem}_{sample['item_id']}.npz"
-                np.savez_compressed(
+                save_npz = np.savez_compressed if compress_prepared_pose else np.savez
+                save_npz(
                     pose_path,
                     pose=sequence["pose"],
                     mask=sequence["mask"],
@@ -1282,6 +1288,7 @@ def extract_pose_sequence(
     face_detector: FaceDetector,
     sequence_length: int,
     max_frames_to_scan: int,
+    detector_batch_size: int,
 ) -> dict:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -1294,24 +1301,44 @@ def extract_pose_sequence(
     presence_filter = PersonPresenceFilter(debug=False)
     track_frames: dict[int, dict[int, dict]] = defaultdict(dict)
 
-    for time_index, frame_index in enumerate(frame_indices):
-        frame = read_frame_at(capture, frame_index)
+    sampled_frames = read_sampled_frames(capture, frame_indices)
+    sampled_grays: list[np.ndarray] = []
+    sampled_time_indices: list[int] = []
+    for time_index, frame in enumerate(sampled_frames):
         if frame is None:
             continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detections = person_detector.detect(frame)
-        tracked = tracker.update(detections)
-        faces = face_detector.detect(frame)
-        evaluated = presence_filter.evaluate(tracked, faces, gray, frame.shape)
-        for candidate in evaluated:
-            if candidate.get("person_state") == "rejected":
-                continue
-            candidate_id = int(candidate["id"])
-            previous = track_frames[candidate_id].get(time_index)
-            if previous is None or candidate.get("person_score", 0) >= previous.get("person_score", 0):
-                track_frames[candidate_id][time_index] = candidate
+        sampled_grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        sampled_time_indices.append(time_index)
 
     capture.release()
+
+    if not sampled_frames:
+        return {
+            "pose": np.zeros((sequence_length, 17, 3), dtype=np.float32),
+            "mask": np.zeros((sequence_length,), dtype=np.float32),
+            "valid_frames": 0,
+            "confirmed_frames": 0,
+            "chosen_track_id": -1,
+        }
+
+    batch_size = max(int(detector_batch_size), 1)
+    for batch_start in range(0, len(sampled_frames), batch_size):
+        frame_batch = sampled_frames[batch_start:batch_start + batch_size]
+        gray_batch = sampled_grays[batch_start:batch_start + batch_size]
+        time_batch = sampled_time_indices[batch_start:batch_start + batch_size]
+        detections_batch = person_detector.detect_batch(frame_batch)
+
+        for time_index, frame, gray, detections in zip(time_batch, frame_batch, gray_batch, detections_batch):
+            tracked = tracker.update(detections)
+            faces = face_detector.detect_gray(gray)
+            evaluated = presence_filter.evaluate(tracked, faces, gray, frame.shape)
+            for candidate in evaluated:
+                if candidate.get("person_state") == "rejected":
+                    continue
+                candidate_id = int(candidate["id"])
+                previous = track_frames[candidate_id].get(time_index)
+                if previous is None or candidate.get("person_score", 0) >= previous.get("person_score", 0):
+                    track_frames[candidate_id][time_index] = candidate
 
     if not track_frames:
         return {
@@ -1363,6 +1390,39 @@ def read_frame_at(capture: cv2.VideoCapture, frame_index: int):
     if not ok:
         return None
     return frame
+
+
+def read_sampled_frames(capture: cv2.VideoCapture, frame_indices: list[int]):
+    if not frame_indices:
+        return []
+
+    sampled = [None] * len(frame_indices)
+    current_frame_index = 0
+    last_frame = None
+
+    for output_index, target_index in enumerate(frame_indices):
+        target_index = max(int(target_index), 0)
+
+        if last_frame is not None and current_frame_index - 1 == target_index:
+            sampled[output_index] = last_frame.copy()
+            continue
+
+        if target_index < current_frame_index:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+            current_frame_index = target_index
+            last_frame = None
+
+        while current_frame_index <= target_index:
+            ok, frame = capture.read()
+            if not ok:
+                last_frame = None
+                break
+            last_frame = frame
+            current_frame_index += 1
+
+        sampled[output_index] = None if last_frame is None else last_frame.copy()
+
+    return sampled
 
 
 def choose_best_track(track_frames: dict[int, dict[int, dict]]) -> int:

@@ -25,6 +25,8 @@ from update_pages_site import build_latest_result_payload, build_live_status_pay
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
+GPU_STATUS_CACHE: dict[str, object] = {"timestamp": 0.0, "value": None}
+GPU_STATUS_CACHE_LOCK = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +79,179 @@ def decode_process_output(data: bytes | None) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def query_gpu_status(*, cache_ttl_seconds: float = 1.5) -> dict:
+    now = time.time()
+    with GPU_STATUS_CACHE_LOCK:
+        cached_timestamp = float(GPU_STATUS_CACHE.get("timestamp") or 0.0)
+        cached_value = GPU_STATUS_CACHE.get("value")
+        if cached_value is not None and (now - cached_timestamp) <= cache_ttl_seconds:
+            return cached_value
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        result = {
+            "available": False,
+            "summary": "-",
+            "detail": "nvidia-smi를 찾지 못했습니다.",
+            "device_name": None,
+            "utilization_gpu": None,
+            "utilization_memory": None,
+            "memory_used_mb": None,
+            "memory_total_mb": None,
+            "memory_percent": None,
+            "temperature_c": None,
+            "devices": [],
+        }
+    else:
+        command = [
+            nvidia_smi,
+            "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=1.5,
+                check=True,
+            )
+            stdout = decode_process_output(completed.stdout)
+            devices = []
+            for raw_line in stdout.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 7:
+                    continue
+                gpu_util = _parse_int_or_none(parts[2])
+                memory_util = _parse_int_or_none(parts[3])
+                memory_used = _parse_float_or_none(parts[4])
+                memory_total = _parse_float_or_none(parts[5])
+                temperature = _parse_int_or_none(parts[6])
+                memory_percent = None
+                if memory_used is not None and memory_total not in (None, 0):
+                    memory_percent = round((memory_used / memory_total) * 100.0, 1)
+                devices.append(
+                    {
+                        "index": _parse_int_or_none(parts[0]),
+                        "name": parts[1],
+                        "utilization_gpu": gpu_util,
+                        "utilization_memory": memory_util,
+                        "memory_used_mb": memory_used,
+                        "memory_total_mb": memory_total,
+                        "memory_percent": memory_percent,
+                        "temperature_c": temperature,
+                    }
+                )
+
+            primary = None
+            if devices:
+                primary = max(
+                    devices,
+                    key=lambda item: (
+                        item.get("utilization_gpu") or 0,
+                        item.get("memory_percent") or 0.0,
+                    ),
+                )
+
+            result = {
+                "available": bool(primary),
+                "summary": _build_gpu_summary(primary),
+                "detail": _build_gpu_detail(primary, device_count=len(devices)),
+                "device_index": primary.get("index") if primary else None,
+                "device_name": primary.get("name") if primary else None,
+                "utilization_gpu": primary.get("utilization_gpu") if primary else None,
+                "utilization_memory": primary.get("utilization_memory") if primary else None,
+                "memory_used_mb": primary.get("memory_used_mb") if primary else None,
+                "memory_total_mb": primary.get("memory_total_mb") if primary else None,
+                "memory_percent": primary.get("memory_percent") if primary else None,
+                "temperature_c": primary.get("temperature_c") if primary else None,
+                "devices": devices,
+            }
+        except (subprocess.SubprocessError, OSError):
+            result = {
+                "available": False,
+                "summary": "-",
+                "detail": "GPU 상태를 읽지 못했습니다.",
+                "device_index": None,
+                "device_name": None,
+                "utilization_gpu": None,
+                "utilization_memory": None,
+                "memory_used_mb": None,
+                "memory_total_mb": None,
+                "memory_percent": None,
+                "temperature_c": None,
+                "devices": [],
+            }
+
+    with GPU_STATUS_CACHE_LOCK:
+        GPU_STATUS_CACHE["timestamp"] = now
+        GPU_STATUS_CACHE["value"] = result
+    return result
+
+
+def _parse_int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() in {"n/a", "[not supported]"}:
+        return None
+    try:
+        return int(float(normalized))
+    except ValueError:
+        return None
+
+
+def _parse_float_or_none(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() in {"n/a", "[not supported]"}:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _format_gib_from_mb(value_mb: float | None) -> str:
+    if value_mb is None:
+        return "-"
+    return f"{value_mb / 1024.0:.1f} GB"
+
+
+def _build_gpu_summary(primary: dict | None) -> str:
+    if not primary:
+        return "-"
+    gpu_util = primary.get("utilization_gpu")
+    if gpu_util is None:
+        return "-"
+    return f"{gpu_util}%"
+
+
+def _build_gpu_detail(primary: dict | None, *, device_count: int) -> str:
+    if not primary:
+        return "GPU 상태를 읽지 못했습니다."
+    memory_used = _format_gib_from_mb(primary.get("memory_used_mb"))
+    memory_total = _format_gib_from_mb(primary.get("memory_total_mb"))
+    memory_percent = primary.get("memory_percent")
+    temp = primary.get("temperature_c")
+    util_mem = primary.get("utilization_memory")
+    index = primary.get("index")
+    prefix = f"GPU {index}" if index is not None else "GPU"
+    suffix_parts = [f"VRAM {memory_used} / {memory_total}"]
+    if memory_percent is not None:
+        suffix_parts.append(f"{memory_percent:.1f}%")
+    if util_mem is not None:
+        suffix_parts.append(f"mem {util_mem}%")
+    if temp is not None:
+        suffix_parts.append(f"{temp}°C")
+    if device_count > 1:
+        suffix_parts.append(f"{device_count} GPUs")
+    return f"{prefix} | " + " | ".join(suffix_parts)
 
 
 def derive_stage_ratio(pipeline_status: dict | None, training_progress: dict | None) -> float:
@@ -2409,6 +2584,16 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="value" id="artifactState">-</div>
         <div class="subvalue" id="workspaceDir">-</div>
       </article>
+      <article class="card">
+        <div class="label">GPU 사용률</div>
+        <div class="value" id="gpuUsageText">-</div>
+        <div class="subvalue" id="gpuUsageMeta">GPU 상태를 불러오는 중입니다.</div>
+      </article>
+      <article class="card">
+        <div class="label">학습 VRAM</div>
+        <div class="value" id="gpuVramText">-</div>
+        <div class="subvalue" id="gpuVramMeta">VRAM 상태를 불러오는 중입니다.</div>
+      </article>
       <article class="card card-queue">
         <div class="label">큐 진행률</div>
         <div class="value" id="queueProgressText">0 / 0</div>
@@ -2570,6 +2755,16 @@ def create_app(config_path: Path) -> FastAPI:
               <div class="mini-value" id="skippedVideoCount">0</div>
               <div class="mini-copy" id="skippedVideoSummary">조건 미달 없음</div>
             </div>
+          </div>
+          <div class="mini-card" style="margin-top:12px;">
+            <div class="mini-title">GPU 상태</div>
+            <div class="mini-value" id="gpuDeviceText">-</div>
+            <div class="mini-copy" id="gpuMemoryText">-</div>
+          </div>
+          <div class="mini-card" style="margin-top:12px;">
+            <div class="mini-title">학습 장치</div>
+            <div class="mini-value" id="trainingDeviceText">-</div>
+            <div class="mini-copy" id="trainingDeviceMeta">학습 프로세스 장치 정보가 없습니다.</div>
           </div>
           <div class="scroll-panel" style="margin-top:16px; max-height: 260px;">
             <table class="table">
@@ -2745,6 +2940,94 @@ def create_app(config_path: Path) -> FastAPI:
       if (state === 'aborted') return '강제 중단';
       if (state === 'error') return '오류';
       return state || '대기 중';
+    }
+
+    function formatGpuUsage(gpu) {
+      if (!gpu || gpu.available === false) {
+        return '-';
+      }
+      if (gpu.utilization_gpu === null || gpu.utilization_gpu === undefined) {
+        return gpu.summary || '-';
+      }
+      return `${gpu.utilization_gpu}%`;
+    }
+
+    function formatGpuMeta(gpu) {
+      if (!gpu) {
+        return 'GPU 상태를 불러오는 중입니다.';
+      }
+      return gpu.detail || 'GPU 상태를 읽지 못했습니다.';
+    }
+
+    function formatGpuDevice(gpu) {
+      if (!gpu || gpu.available === false) {
+        return '-';
+      }
+      const index = gpu.device_index !== null && gpu.device_index !== undefined
+        ? `GPU ${gpu.device_index}`
+        : (gpu.device_name ? 'GPU' : '-');
+      if (gpu.device_name) {
+        return `${index} · ${gpu.device_name}`;
+      }
+      return index;
+    }
+
+    function formatGpuMemory(gpu) {
+      if (!gpu || gpu.available === false) {
+        return 'GPU 상태를 읽지 못했습니다.';
+      }
+      return gpu.detail || '-';
+    }
+
+    function formatGpuVram(gpu) {
+      if (!gpu || gpu.available === false) {
+        return '-';
+      }
+      const used = gpu.memory_used_mb;
+      const total = gpu.memory_total_mb;
+      if (used === null || used === undefined || total === null || total === undefined || total === 0) {
+        return '-';
+      }
+      return `${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GB`;
+    }
+
+    function formatGpuVramMeta(gpu) {
+      if (!gpu || gpu.available === false) {
+        return 'VRAM 상태를 읽지 못했습니다.';
+      }
+      const parts = [];
+      if (gpu.memory_percent !== null && gpu.memory_percent !== undefined) {
+        parts.push(`${gpu.memory_percent.toFixed(1)}% 사용 중`);
+      }
+      if (gpu.utilization_memory !== null && gpu.utilization_memory !== undefined) {
+        parts.push(`mem util ${gpu.utilization_memory}%`);
+      }
+      if (gpu.temperature_c !== null && gpu.temperature_c !== undefined) {
+        parts.push(`${gpu.temperature_c}°C`);
+      }
+      return parts.length ? parts.join(' · ') : (gpu.detail || '-');
+    }
+
+    function formatTrainingDevice(progress, gpu) {
+      const device = progress?.device;
+      if (!device) {
+        return '-';
+      }
+      if (device.startsWith('cuda') && gpu?.device_name) {
+        return `${device} · ${gpu.device_name}`;
+      }
+      return device;
+    }
+
+    function formatTrainingDeviceMeta(progress) {
+      if (!progress || !progress.device) {
+        return '학습 프로세스 장치 정보가 없습니다.';
+      }
+      const ampText = progress.amp_enabled ? 'AMP on' : 'AMP off';
+      const workerText = progress.num_workers !== null && progress.num_workers !== undefined
+        ? `workers ${progress.num_workers}`
+        : 'workers -';
+      return `${ampText} · ${workerText}`;
     }
 
     const viewerMode = (() => {
@@ -3804,6 +4087,7 @@ def create_app(config_path: Path) -> FastAPI:
       const currentJobProgress = data.current_job_progress || {};
       const continualState = data.continual_state || {};
       const eta = data.eta || {};
+      const gpu = data.gpu || {};
       const skipReport = data.skip_report || {};
       const cumulativeSkipReport = data.cumulative_skip_report || {};
 
@@ -3856,6 +4140,10 @@ def create_app(config_path: Path) -> FastAPI:
 
       document.getElementById('artifactState').textContent = data.artifacts?.has_model ? 'ready' : 'pending';
       document.getElementById('workspaceDir').textContent = data.workspace_dir || '-';
+      document.getElementById('gpuUsageText').textContent = formatGpuUsage(gpu);
+      document.getElementById('gpuUsageMeta').textContent = formatGpuMeta(gpu);
+      document.getElementById('gpuVramText').textContent = formatGpuVram(gpu);
+      document.getElementById('gpuVramMeta').textContent = formatGpuVramMeta(gpu);
       document.getElementById('queueProgressText').textContent =
         `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`;
       document.getElementById('queueProgressMeta').textContent =
@@ -3883,6 +4171,10 @@ def create_app(config_path: Path) -> FastAPI:
         progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습';
       document.getElementById('sampleCounts').textContent =
         `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`;
+      document.getElementById('gpuDeviceText').textContent = formatGpuDevice(gpu);
+      document.getElementById('gpuMemoryText').textContent = formatGpuMemory(gpu);
+      document.getElementById('trainingDeviceText').textContent = formatTrainingDevice(progress, gpu);
+      document.getElementById('trainingDeviceMeta').textContent = formatTrainingDeviceMeta(progress);
 
       document.getElementById('updatedAt').textContent = pipeline.updated_at || progress.updated_at || '-';
       document.getElementById('configPath').textContent = launcher.runtime_config_path || data.config_path || '-';
@@ -4193,6 +4485,7 @@ def create_app(config_path: Path) -> FastAPI:
 
 def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_status: dict | None = None) -> dict:
     launcher_status = launcher_status or {}
+    gpu_status = query_gpu_status()
     pipeline_status = read_json(paths["pipeline_status"])
     training_progress = read_json(paths["training_progress"])
     current_skip_report = read_json(paths["current_skip_report"]) or {
@@ -4273,6 +4566,7 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         },
         "current_job_progress": current_job_progress,
         "eta": eta,
+        "gpu": gpu_status,
         "logs": {
             "current": {
                 "filekey": current_log_source.get("filekey") if isinstance(current_log_source, dict) else None,
