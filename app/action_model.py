@@ -307,6 +307,7 @@ def train_action_classifier(
         criterion=criterion,
         device=device,
         num_classes=len(labels),
+        use_amp=use_amp,
     )
     with metrics_path.open("w", encoding="utf-8") as handle:
         json.dump(
