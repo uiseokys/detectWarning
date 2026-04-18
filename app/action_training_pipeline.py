@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -153,6 +154,7 @@ def main() -> None:
                 device=str(config.get("training", {}).get("device", "cuda")),
                 amp=bool(config.get("training", {}).get("amp", True)),
                 compile_model=bool(config.get("training", {}).get("compile_model", True)),
+                dataset_cache_size=int(config.get("training", {}).get("dataset_cache_size", 2048)),
                 prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
                 persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
                 progress_path=paths["training_progress"],
@@ -232,6 +234,7 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "current_skip_report": manifests_dir / "current_skipped_videos.json",
         "cumulative_skip_report": manifests_dir / "cumulative_skipped_videos.json",
         "continual_state": manifests_dir / "continual_state.json",
+        "active_manifest_state": manifests_dir / "active_manifest_state.json",
     }
 
 
@@ -584,7 +587,7 @@ def merge_split_archives(import_dir: Path) -> list[Path]:
             with base_path.open("wb") as merged_handle:
                 for part_path in sorted_parts:
                     with part_path.open("rb") as part_handle:
-                        shutil.copyfileobj(part_handle, merged_handle, length=1024 * 1024)
+                        shutil.copyfileobj(part_handle, merged_handle, length=16 * 1024 * 1024)
             if base_path.stat().st_size == 0:
                 raise RuntimeError(
                     f"분할 압축 병합 결과가 0바이트입니다: {base_path}\n"
@@ -796,8 +799,7 @@ def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None
         destination_dir = raw_dir / slugify(target_label)
         destination_dir.mkdir(parents=True, exist_ok=True)
         destination_path = destination_dir / sanitize_filename(video_path.name)
-        if not destination_path.exists():
-            shutil.copy2(video_path, destination_path)
+        materialize_local_video_asset(video_path, destination_path)
 
         relative_id = str(video_path.relative_to(import_dir)).replace("\\", "/")
         scanned.append(
@@ -823,6 +825,33 @@ def scan_local_video_dataset(config: dict, paths: dict, source_root: Path | None
     elif scanned:
         print(f"[scan] labeled videos: {len(scanned)} / candidates: {candidate_video_count}")
     return scanned
+
+
+def materialize_local_video_asset(source_path: Path, destination_path: Path) -> None:
+    if destination_path.exists():
+        try:
+            source_stat = source_path.stat()
+            destination_stat = destination_path.stat()
+            if (
+                source_stat.st_size == destination_stat.st_size
+                and int(source_stat.st_mtime) == int(destination_stat.st_mtime)
+            ):
+                return
+        except OSError:
+            pass
+        try:
+            destination_path.unlink()
+        except OSError:
+            pass
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source_path, destination_path)
+        return
+    except OSError:
+        pass
+
+    shutil.copy2(source_path, destination_path)
 
 
 def extract_archives(import_dir: Path, extracted_dir: Path) -> Path:
@@ -1278,6 +1307,18 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
         "val": paths["active_prepared_val"],
         "test": paths["active_prepared_test"],
     }
+    desired_state = build_active_manifest_state(
+        target_labels=target_labels,
+        label_mapping=label_mapping,
+        source_manifests=prepared_manifests,
+    )
+    if active_manifests_are_current(
+        state_path=paths["active_manifest_state"],
+        active_paths=active_paths,
+        desired_state=desired_state,
+    ):
+        print("[train-manifest] 기존 active manifest를 재사용합니다.")
+        return active_paths
 
     for split_name, source_path in prepared_manifests.items():
         target_path = active_paths[split_name]
@@ -1293,6 +1334,7 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
                 kept += 1
         print(f"[train-manifest] {split_name}: {kept} kept ({skipped} filtered) -> {target_path}")
 
+    write_active_manifest_state(paths["active_manifest_state"], desired_state)
     return active_paths
 
 
@@ -1319,10 +1361,8 @@ def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: d
     if not source_entries:
         return 0
 
-    existing_entries = read_jsonl_entries(target_path)
-    seen = {build_manifest_unique_key(entry) for entry in existing_entries}
-    merged_entries = list(existing_entries)
-    added = 0
+    seen = {build_manifest_unique_key(entry) for entry in iter_jsonl_entries(target_path)}
+    new_entries: list[dict] = []
 
     for entry in source_entries:
         merged_entry = dict(entry)
@@ -1331,30 +1371,38 @@ def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: d
         unique_key = build_manifest_unique_key(merged_entry)
         if unique_key in seen:
             continue
-        merged_entries.append(merged_entry)
+        new_entries.append(merged_entry)
         seen.add(unique_key)
-        added += 1
+    append_jsonl_entries(target_path, new_entries)
+    return len(new_entries)
 
-    write_jsonl_entries(target_path, merged_entries)
-    return added
-
-
-def read_jsonl_entries(path: Path) -> list[dict]:
+def iter_jsonl_entries(path: Path):
     if not path.exists():
-        return []
-    entries: list[dict] = []
+        return
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
-            entries.append(json.loads(line))
-    return entries
+            yield json.loads(line)
+
+
+def read_jsonl_entries(path: Path) -> list[dict]:
+    return list(iter_jsonl_entries(path) or [])
 
 
 def write_jsonl_entries(path: Path, entries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def append_jsonl_entries(path: Path, entries: list[dict]) -> None:
+    if not entries:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
         for entry in entries:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -1382,6 +1430,74 @@ def count_manifest_lines(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def build_active_manifest_state(
+    *,
+    target_labels: list[str],
+    label_mapping: dict,
+    source_manifests: dict[str, Path],
+) -> dict:
+    schema_payload = {
+        "target_labels": list(target_labels),
+        "label_mapping": label_mapping,
+    }
+    schema_fingerprint = hashlib.sha1(
+        json.dumps(schema_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    source_state = {
+        split_name: build_manifest_signature(source_path)
+        for split_name, source_path in source_manifests.items()
+    }
+    return {
+        "schema_fingerprint": schema_fingerprint,
+        "sources": source_state,
+    }
+
+
+def build_manifest_signature(path: Path) -> dict:
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+        }
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def active_manifests_are_current(*, state_path: Path, active_paths: dict[str, Path], desired_state: dict) -> bool:
+    if not all(path.exists() for path in active_paths.values()):
+        return False
+    if not state_path.exists():
+        return False
+    try:
+        with state_path.open("r", encoding="utf-8") as handle:
+            current_state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        current_state.get("schema_fingerprint") == desired_state.get("schema_fingerprint")
+        and current_state.get("sources") == desired_state.get("sources")
+    )
+
+
+def write_active_manifest_state(state_path: Path, desired_state: dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                **desired_state,
+                "materialized_at": datetime.now(timezone.utc).astimezone().isoformat(),
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def cleanup_transient_job_data(paths: dict) -> None:
@@ -1442,13 +1558,11 @@ def load_video_sequence_payload(
 
     sampled_frames = read_sampled_frames(capture, frame_indices)
     valid_frames: list[np.ndarray] = []
-    valid_grays: list[np.ndarray] = []
     valid_time_indices: list[int] = []
     for time_index, frame in enumerate(sampled_frames):
         if frame is None:
             continue
         valid_frames.append(frame)
-        valid_grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         valid_time_indices.append(time_index)
     capture.release()
 
@@ -1456,7 +1570,6 @@ def load_video_sequence_payload(
         "video_path": str(video_path),
         "sequence_length": int(sequence_length),
         "frames": valid_frames,
-        "grays": valid_grays,
         "time_indices": valid_time_indices,
     }
 
@@ -1469,9 +1582,8 @@ def extract_pose_sequence_from_payload(
     detector_batch_size: int,
 ) -> dict:
     sequence_length = int(payload.get("sequence_length", 0) or 0)
-    sampled_frames = list(payload.get("frames") or [])
-    sampled_grays = list(payload.get("grays") or [])
-    sampled_time_indices = list(payload.get("time_indices") or [])
+    sampled_frames = payload.get("frames") or []
+    sampled_time_indices = payload.get("time_indices") or []
     tracker = PersonTracker()
     presence_filter = PersonPresenceFilter(debug=False)
     track_frames: dict[int, dict[int, dict]] = defaultdict(dict)
@@ -1488,8 +1600,8 @@ def extract_pose_sequence_from_payload(
     batch_size = max(int(detector_batch_size), 1)
     for batch_start in range(0, len(sampled_frames), batch_size):
         frame_batch = sampled_frames[batch_start:batch_start + batch_size]
-        gray_batch = sampled_grays[batch_start:batch_start + batch_size]
         time_batch = sampled_time_indices[batch_start:batch_start + batch_size]
+        gray_batch = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in frame_batch]
         detections_batch = person_detector.detect_batch(frame_batch)
 
         for time_index, frame, gray, detections in zip(time_batch, frame_batch, gray_batch, detections_batch):

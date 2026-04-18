@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -22,8 +23,10 @@ class TrainingArtifacts:
 
 
 class PoseSequenceDataset(Dataset):
-    def __init__(self, manifest_path: Path) -> None:
+    def __init__(self, manifest_path: Path, *, cache_size: int = 0) -> None:
         self.samples = []
+        self.cache_size = max(int(cache_size), 0)
+        self._cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = OrderedDict()
         with manifest_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -38,10 +41,26 @@ class PoseSequenceDataset(Dataset):
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
+        cache_key = str(sample["pose_path"])
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self._cache.move_to_end(cache_key)
+            return cached
+
+        loaded_sample = self._load_sample(sample)
+        if self.cache_size > 0:
+            self._cache[cache_key] = loaded_sample
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        return loaded_sample
+
+    @staticmethod
+    def _load_sample(sample: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pose_path = Path(sample["pose_path"])
-        loaded = np.load(pose_path, allow_pickle=False)
-        pose = loaded["pose"].astype(np.float32)
-        mask = loaded["mask"].astype(np.float32)
+        with np.load(pose_path, allow_pickle=False) as loaded:
+            pose = np.asarray(loaded["pose"], dtype=np.float32)
+            mask = np.asarray(loaded["mask"], dtype=np.float32)
         label_idx = int(sample["label_idx"])
         return (
             torch.from_numpy(pose),
@@ -110,6 +129,7 @@ def train_action_classifier(
     device: str = "cuda",
     amp: bool = True,
     compile_model: bool = False,
+    dataset_cache_size: int = 2048,
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
     progress_path: Path | None = None,
@@ -120,8 +140,8 @@ def train_action_classifier(
     metrics_path = output_dir / "metrics.json"
     best_model_path = output_dir / "best_action_model.pt"
 
-    train_dataset = PoseSequenceDataset(train_manifest)
-    val_dataset = PoseSequenceDataset(val_manifest)
+    train_dataset = PoseSequenceDataset(train_manifest, cache_size=dataset_cache_size)
+    val_dataset = PoseSequenceDataset(val_manifest, cache_size=dataset_cache_size)
 
     use_cuda = _uses_cuda(device)
     use_amp = bool(amp and use_cuda and torch.cuda.is_available())
@@ -217,6 +237,7 @@ def train_action_classifier(
         f"amp={'on' if use_amp else 'off'} "
         f"compile={'on' if compiled_model else 'off'} "
         f"resume={resume_mode} "
+        f"cache={dataset_cache_size} "
         f"workers={resolved_num_workers} "
         f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
         f"persistent={'on' if use_persistent_workers else 'off'}"
@@ -241,6 +262,7 @@ def train_action_classifier(
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
                 "compile_enabled": compiled_model,
+                "dataset_cache_size": dataset_cache_size,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,

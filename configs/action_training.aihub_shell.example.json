@@ -90,6 +90,7 @@
     "compile_model": true,
     "epochs": 20,
     "batch_size": 48,
+    "dataset_cache_size": 2048,
     "learning_rate": 0.001,
     "hidden_dim": 128,
     "num_layers": 2,
