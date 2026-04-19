@@ -42,6 +42,8 @@ DOWNLOAD_PROGRESS_PATTERN = re.compile(
 )
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 SIZE_TOKEN_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMGTP]i?B?|B)$", re.IGNORECASE)
+DOWNLOAD_STATUS_MIN_INTERVAL_SECONDS = 2.0
+DOWNLOAD_STATUS_MIN_BYTES_DELTA = 128 * 1024 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -494,6 +496,7 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
     last_status_at = 0.0
     last_message_at = 0.0
     last_snapshot_signature = ""
+    last_snapshot_bytes = 0.0
     inferred_stage_progress = 0.08
     assert process.stdout is not None
     for raw_line in iter_process_output_lines(process.stdout):
@@ -513,7 +516,16 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
                 now = time.monotonic()
                 if snapshot:
                     snapshot_signature = f"{snapshot['transferred']}|{snapshot['speed']}"
-                    if snapshot_signature != last_snapshot_signature or (now - last_message_at) >= 1.0:
+                    snapshot_bytes = size_token_to_bytes(snapshot["transferred"])
+                    bytes_delta = max(0.0, snapshot_bytes - last_snapshot_bytes)
+                    should_emit_snapshot = (
+                        snapshot_signature != last_snapshot_signature
+                        and (
+                            (now - last_message_at) >= DOWNLOAD_STATUS_MIN_INTERVAL_SECONDS
+                            or bytes_delta >= DOWNLOAD_STATUS_MIN_BYTES_DELTA
+                        )
+                    )
+                    if should_emit_snapshot:
                         inferred_stage_progress = min(0.215, inferred_stage_progress + 0.0025)
                         write_pipeline_status(
                             paths,
@@ -528,8 +540,9 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
                             download_speed=snapshot["speed"],
                         )
                         last_snapshot_signature = snapshot_signature
+                        last_snapshot_bytes = snapshot_bytes
                         last_message_at = now
-                elif line and (now - last_message_at) >= 2.0:
+                elif line and (now - last_message_at) >= DOWNLOAD_STATUS_MIN_INTERVAL_SECONDS:
                     write_pipeline_status(
                         paths,
                         stage="download",
@@ -542,7 +555,7 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
                 continue
 
         now = time.monotonic()
-        if percent == last_reported_percent and (now - last_status_at) < 1.0:
+        if percent == last_reported_percent and (now - last_status_at) < DOWNLOAD_STATUS_MIN_INTERVAL_SECONDS:
             continue
         last_reported_percent = percent
         last_status_at = now
