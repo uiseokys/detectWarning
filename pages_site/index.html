@@ -830,16 +830,26 @@
   </div>
 
   <script>
-    const cacheBust = () => `?t=${Date.now()}`;
     const LIVE_STATUS_STORAGE_KEY = "detectwarning.live-status.v2";
     const REPORT_STORAGE_KEY = "detectwarning.latest-report.v1";
-    const STATUS_REFRESH_MS = 2000;
     const OFFLINE_GRACE_MS = 5000;
+    const STATUS_REFRESH_ONLINE_MS = 3000;
+    const STATUS_REFRESH_WARNING_MS = 5000;
+    const STATUS_REFRESH_OFFLINE_MS = 15000;
+    const REPORT_REFRESH_ONLINE_MS = 60000;
+    const REPORT_REFRESH_WARNING_MS = 10000;
+    const REPORT_REFRESH_OFFLINE_MS = 15000;
     let redirectTimer = null;
     let redirectTarget = "";
+    let refreshTimer = null;
+    let lastStatusRevision = "";
+    let lastReportRevision = "";
+    let lastLiveOverviewRevision = "";
+    let lastReportFetchedAt = 0;
+    let latestResolvedStatus = null;
 
     async function fetchJson(path) {
-      const response = await fetch(`${path}${cacheBust()}`, { cache: "no-store" });
+      const response = await fetch(path, { cache: "no-cache" });
       if (!response.ok) {
         throw new Error("데이터를 불러오지 못했습니다.");
       }
@@ -1206,6 +1216,46 @@
       return merged;
     }
 
+    function getStatusRevision(status) {
+      return [
+        status?.status || "offline",
+        status?.updated_at || "",
+        status?.live_url || "",
+        status?.message || ""
+      ].join("|");
+    }
+
+    function getReportRevision(report) {
+      const latestJob = report?.latest_job || {};
+      return [
+        report?.updated_at || "",
+        latestJob.filekey || "",
+        latestJob.finished_at || latestJob.started_at || "",
+        report?.summary?.best_val_macro_f1 ?? ""
+      ].join("|");
+    }
+
+    function computeStatusRefreshMs(status) {
+      if (!status) return STATUS_REFRESH_WARNING_MS;
+      if (status.status === "online") return STATUS_REFRESH_ONLINE_MS;
+      if (status.status === "warning") return STATUS_REFRESH_WARNING_MS;
+      return STATUS_REFRESH_OFFLINE_MS;
+    }
+
+    function computeReportRefreshMs(status) {
+      if (!status) return REPORT_REFRESH_WARNING_MS;
+      if (status.status === "online") return REPORT_REFRESH_ONLINE_MS;
+      if (status.status === "warning") return REPORT_REFRESH_WARNING_MS;
+      return REPORT_REFRESH_OFFLINE_MS;
+    }
+
+    function scheduleNextRefresh(status) {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+      }
+      refreshTimer = setTimeout(refreshDashboard, computeStatusRefreshMs(status));
+    }
+
     async function probeLiveUrl(url, timeoutMs = 1200) {
       if (!url) return false;
       const controller = new AbortController();
@@ -1278,10 +1328,10 @@
       if (!status || !status.live_url) return null;
       try {
         const overviewUrl = new URL("/api/overview", buildViewerLiveUrl(status.live_url));
-        overviewUrl.searchParams.set("_t", String(Date.now()));
+        overviewUrl.searchParams.set("lite", "1");
         const response = await fetch(overviewUrl.toString(), {
           method: "GET",
-          cache: "no-store",
+          cache: "no-cache",
         });
         if (!response.ok) {
           return null;
@@ -1413,35 +1463,64 @@
       const cachedStatus = readStoredJson(LIVE_STATUS_STORAGE_KEY);
       const cachedReport = readStoredJson(REPORT_STORAGE_KEY);
       if (cachedStatus) {
-        renderLiveStatus(normalizeLiveStatus(cachedStatus));
+        const normalizedStatus = normalizeLiveStatus(cachedStatus);
+        latestResolvedStatus = normalizedStatus;
+        lastStatusRevision = getStatusRevision(normalizedStatus);
+        renderLiveStatus(normalizedStatus);
       }
       if (cachedReport) {
+        lastReportRevision = getReportRevision(cachedReport);
         renderReport(cachedReport);
       }
     }
 
     async function refreshDashboard() {
       if (document.hidden) {
+        scheduleNextRefresh(latestResolvedStatus);
         return;
       }
       try {
-        const [status, report] = await Promise.all([
-          fetchJson("./live-status.json"),
-          fetchJson("./latest-result.json")
-        ]);
+        const status = await fetchJson("./live-status.json");
         const resolvedStatus = await resolveLiveStatus(status);
-        writeStoredJson(LIVE_STATUS_STORAGE_KEY, resolvedStatus);
-        writeStoredJson(REPORT_STORAGE_KEY, report);
-        renderLiveStatus(resolvedStatus);
-        renderReport(report);
+        latestResolvedStatus = resolvedStatus;
+        const statusRevision = getStatusRevision(resolvedStatus);
+        if (statusRevision !== lastStatusRevision) {
+          writeStoredJson(LIVE_STATUS_STORAGE_KEY, resolvedStatus);
+          renderLiveStatus(resolvedStatus);
+          lastStatusRevision = statusRevision;
+        }
+
+        const now = Date.now();
+        let report = readStoredJson(REPORT_STORAGE_KEY);
+        const shouldFetchReport =
+          !report || (now - lastReportFetchedAt) >= computeReportRefreshMs(resolvedStatus);
+        if (shouldFetchReport) {
+          report = await fetchJson("./latest-result.json");
+          lastReportFetchedAt = now;
+        }
+        if (report) {
+          const reportRevision = getReportRevision(report);
+          if (reportRevision !== lastReportRevision) {
+            writeStoredJson(REPORT_STORAGE_KEY, report);
+            renderReport(report);
+            lastReportRevision = reportRevision;
+          }
+        }
+
         if (resolvedStatus.live_url && (resolvedStatus.status === "online" || resolvedStatus.status === "warning")) {
           const overview = await fetchLiveOverview(resolvedStatus);
-          if (overview) {
+          if (
+            overview &&
+            overview.overview_revision &&
+            overview.overview_revision !== lastLiveOverviewRevision
+          ) {
             renderLiveOverview(overview);
+            lastLiveOverviewRevision = overview.overview_revision;
           }
         }
       } catch (error) {
         const cachedStatus = normalizeLiveStatus(readStoredJson(LIVE_STATUS_STORAGE_KEY) || {});
+        latestResolvedStatus = cachedStatus;
         if (cachedStatus.live_url) {
           const reachable = await probeLiveUrl(cachedStatus.live_url, 1800);
           if (reachable) {
@@ -1468,12 +1547,18 @@
           error?.message || "상태를 읽지 못했습니다.";
         document.getElementById("redirectMessage").textContent =
           "잠시 후 자동으로 다시 확인합니다.";
+      } finally {
+        scheduleNextRefresh(latestResolvedStatus);
       }
     }
 
     renderCachedState();
     refreshDashboard();
-    setInterval(refreshDashboard, STATUS_REFRESH_MS);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        refreshDashboard();
+      }
+    });
   </script>
 </body>
 </html>

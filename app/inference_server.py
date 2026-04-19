@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import io
 import platform
 import queue
@@ -17,7 +16,7 @@ import cv2
 import numpy as np
 import uvicorn
 from fastapi import Body
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
@@ -1128,6 +1127,24 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       `;
     }
 
+    let selectedClientHasFrame = false;
+
+    function ensureScreenImage() {
+      const screen = document.getElementById('screen');
+      let image = screen.querySelector('img');
+      if (!image) {
+        screen.innerHTML = '';
+        image = document.createElement('img');
+        image.alt = '분석 화면';
+        screen.appendChild(image);
+      }
+      return image;
+    }
+
+    function setScreenPlaceholder(title, copy) {
+      document.getElementById('screen').innerHTML = screenPlaceholder(title, copy);
+    }
+
     async function refreshSystem() {
       if (document.hidden) {
         return;
@@ -1157,11 +1174,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       const response = await fetch('/api/clients');
       const clients = await response.json();
       const container = document.getElementById('clients');
+      const previousSelectedClientId = selectedClientId;
       container.innerHTML = '';
 
       if (!clients.length) {
         container.innerHTML = '<div class="client-empty">아직 연결된 클라이언트가 없습니다.</div>';
-        document.getElementById('screen').innerHTML = screenPlaceholder('클라이언트를 기다리는 중입니다', '맥북 업로더를 실행하면 이곳에 실시간 분석 화면이 표시됩니다.');
+        selectedClientHasFrame = false;
+        setScreenPlaceholder('클라이언트를 기다리는 중입니다', '맥북 업로더를 실행하면 이곳에 실시간 분석 화면이 표시됩니다.');
         updateMeta(null);
         return;
       }
@@ -1192,16 +1211,21 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         `;
         item.onclick = () => {
           selectedClientId = client.client_id;
+          selectedClientHasFrame = Boolean(client.has_frame);
           refreshClients();
-          refreshSelectedFrame();
+          refreshSelectedClient();
         };
         container.appendChild(item);
       }
 
-      refreshSelectedFrame();
+      const selectedSummary = clients.find((client) => client.client_id === selectedClientId);
+      selectedClientHasFrame = Boolean(selectedSummary && selectedSummary.has_frame);
+      if (previousSelectedClientId !== selectedClientId) {
+        refreshSelectedClient();
+      }
     }
 
-    async function refreshSelectedFrame() {
+    async function refreshSelectedClient() {
       if (document.hidden) {
         return;
       }
@@ -1213,17 +1237,27 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         return;
       }
       const data = await response.json();
+      selectedClientHasFrame = Boolean(data.has_frame);
       updateMeta(data);
-      const screen = document.getElementById('screen');
-      if (!data.frame_data_url) {
-        screen.innerHTML = screenPlaceholder('프레임을 기다리는 중입니다', '선택한 클라이언트에서 아직 수신된 프레임이 없습니다.');
+      if (!selectedClientHasFrame) {
+        setScreenPlaceholder('프레임을 기다리는 중입니다', '선택한 클라이언트에서 아직 수신된 프레임이 없습니다.');
         return;
       }
-      screen.innerHTML = '';
-      const image = document.createElement('img');
-      image.alt = '분석 화면';
-      image.src = data.frame_data_url;
-      screen.appendChild(image);
+      refreshSelectedFrame();
+    }
+
+    function refreshSelectedFrame() {
+      if (document.hidden) {
+        return;
+      }
+      if (!selectedClientId) {
+        return;
+      }
+      if (!selectedClientHasFrame) {
+        return;
+      }
+      const image = ensureScreenImage();
+      image.src = `/api/client/${encodeURIComponent(selectedClientId)}/frame.jpg?ts=${Date.now()}`;
     }
 
     function updateMeta(data) {
@@ -1256,9 +1290,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     refreshSystem();
     refreshClients();
-    setInterval(refreshSystem, 1000);
+    setInterval(refreshSystem, 2000);
     setInterval(refreshClients, 1000);
-    setInterval(refreshSelectedFrame, 350);
+    setInterval(refreshSelectedClient, 1000);
+    setInterval(refreshSelectedFrame, 500);
   </script>
 </body>
 </html>"""
@@ -1289,10 +1324,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             session = sessions.get(client_id)
             if session is None:
                 raise HTTPException(status_code=404, detail="클라이언트를 찾을 수 없습니다.")
-            frame_data_url = None
-            if session.latest_frame_jpeg:
-                encoded = base64.b64encode(session.latest_frame_jpeg).decode("ascii")
-                frame_data_url = f"data:image/jpeg;base64,{encoded}"
             meta = session.latest_meta or {}
             return {
                 "client_id": client_id,
@@ -1309,8 +1340,23 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "risk_categories": list(meta.get("risk_categories", [])),
                 "risk_reasons": list(meta.get("risk_reasons", [])),
                 "last_seen_seconds": monotonic() - session.last_seen,
-                "frame_data_url": frame_data_url,
+                "has_frame": session.latest_frame_jpeg is not None,
             }
+
+    @app.get("/api/client/{client_id}/frame.jpg")
+    def api_client_frame(client_id: str) -> Response:
+        with session_lock:
+            session = sessions.get(client_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="클라이언트를 찾을 수 없습니다.")
+            frame_bytes = session.latest_frame_jpeg
+        if not frame_bytes:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        return Response(
+            content=frame_bytes,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/analyze/audio")
     def analyze_audio(

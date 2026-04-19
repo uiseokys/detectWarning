@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 STATE_SCHEMA_VERSION = 1
+MANIFEST_SUMMARY_CACHE: dict[tuple[str, str], dict] = {}
+MANIFEST_SUMMARY_CACHE_LOCK = threading.Lock()
 
 
 def now_iso() -> str:
@@ -38,6 +41,19 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
     if not path.exists():
         return {"total": 0, "by_label": {}}
 
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        signature = None
+
+    cache_key = (str(path), label_field)
+    if signature is not None:
+        with MANIFEST_SUMMARY_CACHE_LOCK:
+            cached = MANIFEST_SUMMARY_CACHE.get(cache_key)
+            if cached and cached.get("signature") == signature:
+                return dict(cached["value"])
+
     total = 0
     by_label: Counter[str] = Counter()
     with path.open("r", encoding="utf-8") as handle:
@@ -49,7 +65,14 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
             payload = json.loads(line)
             label = str(payload.get(label_field, "unknown"))
             by_label[label] += 1
-    return {"total": total, "by_label": dict(sorted(by_label.items()))}
+    summary = {"total": total, "by_label": dict(sorted(by_label.items()))}
+    if signature is not None:
+        with MANIFEST_SUMMARY_CACHE_LOCK:
+            MANIFEST_SUMMARY_CACHE[cache_key] = {
+                "signature": signature,
+                "value": summary,
+            }
+    return dict(summary)
 
 
 def normalize_label_list(labels) -> list[str]:

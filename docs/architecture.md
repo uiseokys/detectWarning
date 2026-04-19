@@ -21,6 +21,10 @@
   metrics/manifest/job 기록을 공통 형태로 정규화하는 모듈
 - `app/training_config.py`
   학습 config 기본값 주입, 공통 설정 정규화, Pages sync 해석
+- `app/dashboard_runtime.py`
+  학습 대시보드의 job lifecycle, 로그 읽기, Pages sync helper
+- `app/pipeline_prepare.py`
+  pose prepare 단계의 비디오 샘플링/추적/정규화 로직
 - `app/risk_analyzer.py`
   STT 및 비디오 맥락을 점수화하는 규칙 기반 분석기
 - `app/detector.py`

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from action_training_pipeline import get_target_labels, load_config, resolve_paths
+from dashboard_runtime import (
+    build_job,
+    build_retry_job_from,
+    classify_job_exit,
+    collect_result_summary,
+    current_timestamp,
+    decode_process_output,
+    flush_pages_pushes,
+    persist_launcher_history,
+    read_log_preview,
+    read_log_tail,
+    snapshot_job,
+    sync_pages_live,
+    sync_pages_report,
+    write_dashboard_status,
+)
 from reporting import (
     STATE_SCHEMA_VERSION,
     normalize_metric_payload,
@@ -27,13 +44,12 @@ from reporting import (
     summarize_manifest,
 )
 from training_config import resolve_pages_sync_config
-from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
 GPU_STATUS_CACHE: dict[str, object] = {"timestamp": 0.0, "value": None}
 GPU_STATUS_CACHE_LOCK = threading.Lock()
-OVERVIEW_CACHE: dict[str, object] = {"signature": None, "value": None}
+OVERVIEW_CACHE: dict[tuple, dict] = {}
 OVERVIEW_CACHE_LOCK = threading.Lock()
 
 
@@ -49,47 +65,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_chars: int = 12000) -> str:
-    if not path_value:
-        return ""
-    path = Path(path_value)
-    if not path.exists() or not path.is_file():
-        return ""
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return ""
-    for encoding in ("utf-8", "cp949", "euc-kr"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    tail = "\n".join(lines[-max_lines:])
-    if len(tail) > max_chars:
-        tail = tail[-max_chars:]
-    return tail
-
-
-def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_chars: int = 900) -> str:
-    return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
-
-
-def decode_process_output(data: bytes | None) -> str:
-    if not data:
-        return ""
-    for encoding in ("utf-8", "cp949", "euc-kr"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def query_gpu_status(*, cache_ttl_seconds: float = 1.5) -> dict:
+def query_gpu_status(*, cache_ttl_seconds: float = 5.0) -> dict:
     now = time.time()
     with GPU_STATUS_CACHE_LOCK:
         cached_timestamp = float(GPU_STATUS_CACHE.get("timestamp") or 0.0)
@@ -226,9 +202,8 @@ def resolve_allowed_origins(config: dict) -> list[str]:
     return ["http://127.0.0.1:8010", "http://localhost:8010"]
 
 
-def compute_overview_signature(paths: dict, launcher_status: dict | None) -> tuple:
+def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lite: bool = False) -> tuple:
     launcher_status = launcher_status or {}
-    time_bucket = int(time.time() // 2)
     watched = [
         paths["pipeline_status"],
         paths["training_progress"],
@@ -281,7 +256,7 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None) -> tup
         ),
         launcher_status.get("auto_start_enabled"),
     )
-    return (tuple(file_signature), launcher_signature, time_bucket)
+    return (tuple(file_signature), launcher_signature, lite)
 
 
 def _parse_int_or_none(value: str | None) -> int | None:
@@ -458,30 +433,6 @@ def format_duration(seconds: int | float | None) -> str:
     return f"{secs}초"
 
 
-def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> tuple[str, str]:
-    if exit_code == 0:
-        return "completed", "현재 작업이 정상 완료되었습니다."
-
-    pipeline_status = read_json(paths["pipeline_status"]) or {}
-    pipeline_state = str(pipeline_status.get("state", "")).strip().lower()
-    pipeline_stage = str(pipeline_status.get("stage", "")).strip().lower()
-    log_tail = read_log_tail(current_job.get("log_path") if isinstance(current_job, dict) else None, max_lines=60, max_chars=6000)
-    success_markers = (
-        "[train] best model:",
-        "[train] metrics:",
-        "[train] labels:",
-    )
-    has_success_markers = any(marker in log_tail for marker in success_markers)
-
-    if pipeline_state == "completed" or pipeline_stage == "completed" or has_success_markers:
-        return (
-            "completed_warning",
-            f"현재 작업은 산출물 저장까지 완료됐지만 종료 코드 {exit_code}로 경고 종료되었습니다.",
-        )
-
-    return "error", f"현재 작업이 종료 코드 {exit_code}로 중단되었습니다."
-
-
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -527,187 +478,6 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["completed_jobs"] = completed_jobs
         except (OSError, json.JSONDecodeError):
             launcher_state["completed_jobs"] = []
-
-    def push_pages_repo(*relative_paths: str, reason: str) -> None:
-        if not pages_sync["enabled"] or not pages_sync.get("git_auto_push") or pages_sync["pages_dir"] is None:
-            return
-        pages_dir = Path(pages_sync["pages_dir"])
-        if not (pages_dir / ".git").exists():
-            return
-        existing_targets = [path for path in relative_paths if (pages_dir / path).exists()]
-        if not existing_targets:
-            return
-        try:
-            branch_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True,
-            )
-            branch = decode_process_output(branch_result.stdout).strip() or "main"
-
-            unmerged_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "diff", "--name-only", "--diff-filter=U"],
-                capture_output=True,
-            )
-            if unmerged_result.returncode == 0:
-                unmerged_files = [
-                    line.strip()
-                    for line in decode_process_output(unmerged_result.stdout).splitlines()
-                    if line.strip()
-                ]
-                if unmerged_files:
-                    raise RuntimeError(
-                        "detectWarning-pages 저장소에 미해결 충돌 파일이 남아 있습니다: "
-                        + ", ".join(unmerged_files[:5])
-                    )
-
-            pull_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "pull", "--rebase", "--autostash", "origin", branch],
-                capture_output=True,
-            )
-            if pull_result.returncode != 0:
-                raise RuntimeError(
-                    decode_process_output(pull_result.stderr or pull_result.stdout).strip()
-                    or "git pull --rebase 에 실패했습니다."
-                )
-
-            add_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "add", *existing_targets],
-                capture_output=True,
-            )
-            if add_result.returncode != 0:
-                raise RuntimeError(
-                    decode_process_output(add_result.stderr or add_result.stdout).strip()
-                    or "git add 에 실패했습니다."
-                )
-
-            status = subprocess.run(
-                ["git", "-C", str(pages_dir), "status", "--porcelain", "--", *existing_targets],
-                capture_output=True,
-            )
-            if status.returncode != 0:
-                raise RuntimeError(
-                    decode_process_output(status.stderr or status.stdout).strip()
-                    or "git status 확인에 실패했습니다."
-                )
-            if not decode_process_output(status.stdout).strip():
-                return
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            commit_message = f"{pages_sync['git_commit_prefix']} ({reason}) {timestamp}"
-            commit_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "commit", "-m", commit_message],
-                capture_output=True,
-            )
-            if commit_result.returncode != 0:
-                raise RuntimeError(
-                    decode_process_output(commit_result.stderr or commit_result.stdout).strip()
-                    or "git commit 에 실패했습니다."
-                )
-
-            push_result = subprocess.run(
-                ["git", "-C", str(pages_dir), "push"],
-                capture_output=True,
-            )
-            if push_result.returncode != 0:
-                fallback_push = subprocess.run(
-                    ["git", "-C", str(pages_dir), "push", "-u", "origin", branch],
-                    capture_output=True,
-                )
-                if fallback_push.returncode != 0:
-                    raise RuntimeError(
-                        decode_process_output(
-                            fallback_push.stderr
-                            or fallback_push.stdout
-                            or push_result.stderr
-                            or push_result.stdout
-                        ).strip()
-                        or "git push 에 실패했습니다."
-                    )
-        except Exception as exc:
-            print(f"[pages-sync] 자동 push 실패: {exc}")
-
-    def sync_pages_report() -> None:
-        if not pages_sync["enabled"] or pages_sync["pages_dir"] is None:
-            return
-        payload = build_latest_result_payload(
-            paths,
-            project_name=str(pages_sync["project_name"]),
-            report_title=str(pages_sync["report_title"]),
-            target_labels=get_target_labels(config),
-        )
-        write_json(Path(pages_sync["pages_dir"]) / "latest-result.json", payload)
-        push_pages_repo("latest-result.json", reason="report")
-
-    def sync_pages_live(status: str) -> None:
-        if not pages_sync["enabled"] or pages_sync["pages_dir"] is None:
-            return
-        live_url = str(pages_sync.get("live_url") or "")
-        if status == "online" and not live_url:
-            status = "offline"
-        message = (
-            "실시간 대시보드를 사용할 수 있습니다."
-            if status == "online"
-            else "현재 실시간 학습 대시보드가 꺼져 있습니다. 최신 결과 리포트를 표시합니다."
-        )
-        payload = build_live_status_payload(
-            pages_dir=Path(pages_sync["pages_dir"]),
-            status=status,
-            live_url=live_url if status == "online" else "",
-            message=message,
-            redirect_delay_seconds=int(pages_sync.get("redirect_delay_seconds") or 3),
-        )
-        write_json(Path(pages_sync["pages_dir"]) / "live-status.json", payload)
-        push_pages_repo("live-status.json", reason=f"live-{status}")
-
-    def current_timestamp() -> str:
-        return datetime.now(timezone.utc).astimezone().isoformat()
-
-    def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = "") -> dict:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", filekey).strip("_") or "filekey"
-        return {
-            "job_id": f"job_{stamp}_{safe_key}",
-            "filekey": filekey,
-            "datasetkey": str(datasetkey).strip() if datasetkey not in (None, "") else None,
-            "api_key": api_key,
-            "queued_at": current_timestamp(),
-            "started_at": None,
-            "finished_at": None,
-            "state": "queued",
-            "exit_code": None,
-            "runtime_config_path": None,
-            "log_path": None,
-        }
-
-    def build_retry_job_from(job: dict) -> dict:
-        retry_job = build_job(
-            str(job.get("filekey", "")),
-            datasetkey=job.get("datasetkey"),
-            api_key=str(job.get("api_key", "") or ""),
-        )
-        retry_job["retry_of"] = job.get("job_id")
-        retry_job["retry_count"] = int(job.get("retry_count", 0) or 0) + 1
-        return retry_job
-
-    def write_dashboard_status(stage: str, state: str, message: str, **extra) -> None:
-        payload = {
-            "stage": stage,
-            "state": state,
-            "message": message,
-            "workspace_dir": str(paths["workspace_dir"]),
-            "updated_at": current_timestamp(),
-            **extra,
-        }
-        with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-
-    def persist_launcher_history() -> None:
-        completed_jobs = launcher_state.get("completed_jobs", [])
-        payload = {
-            "updated_at": current_timestamp(),
-            "completed_jobs": [snapshot_job(job) for job in completed_jobs] if isinstance(completed_jobs, list) else [],
-        }
-        with launcher_history_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     def hard_reset_workspace() -> None:
         for key in (
@@ -758,13 +528,20 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["log_path"] = None
 
         write_dashboard_status(
+            paths,
             stage="idle",
             state="idle",
             message="학습 워크스페이스를 초기화했습니다.",
             stage_progress=0.0,
         )
-        persist_launcher_history()
-        sync_pages_report()
+        persist_launcher_history(launcher_history_path, launcher_state)
+        sync_pages_report(
+            paths,
+            pages_sync,
+            project_name=str(pages_sync["project_name"]),
+            report_title=str(pages_sync["report_title"]),
+            target_labels=get_target_labels(config),
+        )
 
     def stop_process_tree(process: subprocess.Popen | None) -> int | None:
         if not isinstance(process, subprocess.Popen):
@@ -808,68 +585,6 @@ def create_app(config_path: Path) -> FastAPI:
                 pass
         return process.returncode
 
-    def snapshot_job(job: dict | None) -> dict | None:
-        if not job:
-            return None
-        return {
-            "job_id": job.get("job_id"),
-            "filekey": job.get("filekey"),
-            "datasetkey": job.get("datasetkey"),
-            "retry_of": job.get("retry_of"),
-            "retry_count": job.get("retry_count"),
-            "queued_at": job.get("queued_at"),
-            "started_at": job.get("started_at"),
-            "finished_at": job.get("finished_at"),
-            "state": job.get("state"),
-            "exit_code": job.get("exit_code"),
-            "runtime_config_path": str(job["runtime_config_path"]) if job.get("runtime_config_path") else None,
-            "log_path": str(job["log_path"]) if job.get("log_path") else None,
-            "result_summary": job.get("result_summary"),
-        }
-
-    def collect_result_summary() -> dict:
-        current_skip_report = read_json(paths["current_skip_report"]) or {}
-        current_skip_summary = current_skip_report.get("summary", {}) if isinstance(current_skip_report, dict) else {}
-        return {
-            "raw_total": summarize_manifest(paths["raw_manifest"], label_field="target_label").get("total", 0),
-            "train_total": summarize_manifest(paths["split_train"], label_field="target_label").get("total", 0),
-            "val_total": summarize_manifest(paths["split_val"], label_field="target_label").get("total", 0),
-            "test_total": summarize_manifest(paths["split_test"], label_field="target_label").get("total", 0),
-            "prepared_train_total": summarize_manifest(paths["prepared_train"], label_field="target_label").get("total", 0),
-            "prepared_val_total": summarize_manifest(paths["prepared_val"], label_field="target_label").get("total", 0),
-            "prepared_test_total": summarize_manifest(paths["prepared_test"], label_field="target_label").get("total", 0),
-            "broken_count": int(current_skip_summary.get("broken_count", 0) or 0),
-            "skipped_count": int(current_skip_summary.get("skipped_count", 0) or 0),
-            "total_issues": int(current_skip_summary.get("total_issues", 0) or 0),
-        }
-
-    def read_log_tail(path_value: str | Path | None, *, max_lines: int = 80, max_chars: int = 12000) -> str:
-        if not path_value:
-            return ""
-        path = Path(path_value)
-        if not path.exists() or not path.is_file():
-            return ""
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            return ""
-        for encoding in ("utf-8", "cp949", "euc-kr"):
-            try:
-                text = raw.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        tail = "\n".join(lines[-max_lines:])
-        if len(tail) > max_chars:
-            tail = tail[-max_chars:]
-        return tail
-
-    def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_chars: int = 900) -> str:
-        return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
-
     def start_pipeline_for_job(job: dict) -> None:
         reset_training_workspace(paths)
         runtime_config_dir.mkdir(parents=True, exist_ok=True)
@@ -893,6 +608,7 @@ def create_app(config_path: Path) -> FastAPI:
 
         log_path = job_logs_dir / f"{job['job_id']}.log"
         write_dashboard_status(
+            paths,
             stage="queued",
             state="running",
             message=(
@@ -940,7 +656,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_message"] = (
             f"datasetkey {job.get('datasetkey', '-')} | filekey {job['filekey']} 학습을 진행 중입니다."
         )
-        sync_pages_live("online")
+        sync_pages_live(pages_sync, "online")
 
     def update_process_state() -> None:
         process = launcher_state.get("process")
@@ -970,13 +686,19 @@ def create_app(config_path: Path) -> FastAPI:
                     current_job["exit_code"] = exit_code
                     final_state, final_message = classify_job_exit(paths, current_job, exit_code)
                     current_job["state"] = final_state
-                    current_job["result_summary"] = collect_result_summary()
+                    current_job["result_summary"] = collect_result_summary(paths)
                     completed_jobs = launcher_state.setdefault("completed_jobs", [])
                     if isinstance(completed_jobs, list):
                         completed_jobs.insert(0, snapshot_job(current_job))
                         del completed_jobs[30:]
-                    persist_launcher_history()
-                    sync_pages_report()
+                    persist_launcher_history(launcher_history_path, launcher_state)
+                    sync_pages_report(
+                        paths,
+                        pages_sync,
+                        project_name=str(pages_sync["project_name"]),
+                        report_title=str(pages_sync["report_title"]),
+                        target_labels=get_target_labels(config),
+                    )
                 launcher_state["process"] = None
                 launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
@@ -1030,18 +752,34 @@ def create_app(config_path: Path) -> FastAPI:
             "log_path": str(launcher_state["log_path"]) if launcher_state.get("log_path") else None,
         }
 
-    sync_pages_report()
-    sync_pages_live("online")
+    sync_pages_report(
+        paths,
+        pages_sync,
+        project_name=str(pages_sync["project_name"]),
+        report_title=str(pages_sync["report_title"]),
+        target_labels=get_target_labels(config),
+    )
+    sync_pages_live(pages_sync, "online")
 
     def sync_pages_shutdown() -> None:
         try:
-            sync_pages_report()
+            sync_pages_report(
+                paths,
+                pages_sync,
+                project_name=str(pages_sync["project_name"]),
+                report_title=str(pages_sync["report_title"]),
+                target_labels=get_target_labels(config),
+            )
         except Exception as exc:
             print(f"[pages-sync] 종료 시 report 동기화 실패: {exc}")
         try:
-            sync_pages_live("offline")
+            sync_pages_live(pages_sync, "offline")
         except Exception as exc:
             print(f"[pages-sync] 종료 시 offline 동기화 실패: {exc}")
+        try:
+            flush_pages_pushes()
+        except Exception as exc:
+            print(f"[pages-sync] 종료 시 push flush 실패: {exc}")
 
     atexit.register(sync_pages_shutdown)
 
@@ -4160,6 +3898,14 @@ def create_app(config_path: Path) -> FastAPI:
         return;
       }
       const data = await response.json();
+      if (
+        latestOverview &&
+        latestOverview.overview_revision &&
+        data.overview_revision &&
+        latestOverview.overview_revision === data.overview_revision
+      ) {
+        return;
+      }
       latestOverview = data;
       const pipeline = data.pipeline_status || {};
       const progress = data.training_progress || {};
@@ -4308,8 +4054,14 @@ def create_app(config_path: Path) -> FastAPI:
         return render_dashboard()
 
     @app.get("/api/overview")
-    def overview() -> dict:
-        return build_overview(paths, config_path, config=config, launcher_status=get_launcher_status())
+    def overview(lite: bool = False) -> dict:
+        return build_overview(
+            paths,
+            config_path,
+            config=config,
+            launcher_status=get_launcher_status(),
+            lite=lite,
+        )
 
     @app.get("/api/live-ping")
     def live_ping() -> dict:
@@ -4496,13 +4248,13 @@ def create_app(config_path: Path) -> FastAPI:
             current_job["finished_at"] = current_timestamp()
             current_job["exit_code"] = active_process.returncode if active_process.returncode is not None else -1
             current_job["state"] = "aborted"
-            current_job["result_summary"] = collect_result_summary()
+            current_job["result_summary"] = collect_result_summary(paths)
 
             completed_jobs = launcher_state.setdefault("completed_jobs", [])
             if isinstance(completed_jobs, list):
                 completed_jobs.insert(0, snapshot_job(current_job))
                 del completed_jobs[30:]
-            persist_launcher_history()
+            persist_launcher_history(launcher_history_path, launcher_state)
 
             retry_job = build_retry_job_from(current_job)
             pending_jobs = launcher_state.setdefault("queued_jobs", [])
@@ -4523,6 +4275,7 @@ def create_app(config_path: Path) -> FastAPI:
 
             reset_training_workspace(paths)
             write_dashboard_status(
+                paths,
                 stage="paused",
                 state="paused",
                 message=(
@@ -4566,13 +4319,20 @@ def create_app(config_path: Path) -> FastAPI:
     return app
 
 
-def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_status: dict | None = None) -> dict:
+def build_overview(
+    paths: dict,
+    config_path: Path,
+    *,
+    config: dict,
+    launcher_status: dict | None = None,
+    lite: bool = False,
+) -> dict:
     launcher_status = launcher_status or {}
-    signature = compute_overview_signature(paths, launcher_status)
+    signature = compute_overview_signature(paths, launcher_status, lite=lite)
+    overview_revision = hashlib.sha1(repr(signature).encode("utf-8")).hexdigest()[:16]
     with OVERVIEW_CACHE_LOCK:
-        cached_signature = OVERVIEW_CACHE.get("signature")
-        cached_value = OVERVIEW_CACHE.get("value")
-        if cached_signature == signature and isinstance(cached_value, dict):
+        cached_value = OVERVIEW_CACHE.get(signature)
+        if isinstance(cached_value, dict):
             return cached_value
 
     gpu_status = query_gpu_status()
@@ -4606,7 +4366,7 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     )
     current_log_source = current_job if isinstance(current_job, dict) else latest_completed_job
     current_log_path = current_log_source.get("log_path") if isinstance(current_log_source, dict) else None
-    current_log_tail = read_log_tail(current_log_path)
+    current_log_tail = read_log_tail(current_log_path) if not lite else ""
 
     latest_error_job = next(
         (
@@ -4616,13 +4376,14 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         None,
     )
     latest_error_log_path = latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None
-    latest_error_log_tail = read_log_tail(latest_error_log_path)
+    latest_error_log_tail = read_log_tail(latest_error_log_path) if not lite else ""
     enriched_completed_jobs = []
     for job in completed_jobs:
         if not isinstance(job, dict):
             continue
         enriched_job = dict(job)
-        enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
+        if not lite:
+            enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
         enriched_completed_jobs.append(enriched_job)
 
     completed_count = len([
@@ -4638,6 +4399,7 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
     eta = estimate_eta(current_job_progress, launcher_status)
 
     overview = {
+        "overview_revision": overview_revision,
         "schema_version": STATE_SCHEMA_VERSION,
         "workspace_dir": str(paths["workspace_dir"]),
         "workspace_name": paths["workspace_dir"].name,
@@ -4647,7 +4409,7 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
         "training_progress": training_progress,
         "launcher": {
             **launcher_status,
-            "completed_jobs": enriched_completed_jobs,
+            "completed_jobs": enriched_completed_jobs[: (8 if lite else 30)],
         },
         "aihub": {
             "datasetkey": (
@@ -4678,7 +4440,11 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
                 "filekey": latest_completed_job.get("filekey") if isinstance(latest_completed_job, dict) else None,
                 "datasetkey": latest_completed_job.get("datasetkey") if isinstance(latest_completed_job, dict) else None,
                 "path": latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
-                "tail": read_log_tail(latest_completed_job.get("log_path")) if isinstance(latest_completed_job, dict) else "",
+                "tail": (
+                    read_log_tail(latest_completed_job.get("log_path"))
+                    if (not lite and isinstance(latest_completed_job, dict))
+                    else ""
+                ),
             },
             "latest_error": {
                 "filekey": latest_error_job.get("filekey") if isinstance(latest_error_job, dict) else None,
@@ -4686,16 +4452,20 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
                 "path": latest_error_log_path,
                 "tail": latest_error_log_tail,
             },
-        },
-        "dataset": {
-            "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
-            "train": summarize_manifest(paths["split_train"], label_field="target_label"),
-            "val": summarize_manifest(paths["split_val"], label_field="target_label"),
-            "test": summarize_manifest(paths["split_test"], label_field="target_label"),
-            "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
-            "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
-            "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
-        },
+        } if not lite else {},
+        "dataset": (
+            {
+                "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
+                "train": summarize_manifest(paths["split_train"], label_field="target_label"),
+                "val": summarize_manifest(paths["split_val"], label_field="target_label"),
+                "test": summarize_manifest(paths["split_test"], label_field="target_label"),
+                "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
+                "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
+                "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
+            }
+            if not lite
+            else {}
+        ),
         "current_dataset": {
             "raw": summarize_manifest(paths["current_raw_manifest"], label_field="target_label"),
             "train": summarize_manifest(paths["current_split_train"], label_field="target_label"),
@@ -4712,12 +4482,16 @@ def build_overview(paths: dict, config_path: Path, *, config: dict, launcher_sta
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
         "skip_report": current_skip_report,
-        "cumulative_skip_report": cumulative_skip_report,
-        "metrics": metrics,
+        "cumulative_skip_report": cumulative_skip_report if not lite else {},
+        "metrics": metrics if not lite else {},
     }
     with OVERVIEW_CACHE_LOCK:
-        OVERVIEW_CACHE["signature"] = signature
-        OVERVIEW_CACHE["value"] = overview
+        OVERVIEW_CACHE[signature] = overview
+        while len(OVERVIEW_CACHE) > 4:
+            oldest_key = next(iter(OVERVIEW_CACHE))
+            if oldest_key == signature and len(OVERVIEW_CACHE) == 1:
+                break
+            OVERVIEW_CACHE.pop(oldest_key, None)
     return overview
 
 
