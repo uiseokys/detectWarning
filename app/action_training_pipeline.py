@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -34,6 +35,9 @@ class DownloadedItem:
     video_path: Path
     download_url: str
     metadata: dict
+
+
+DOWNLOAD_PROGRESS_PATTERN = re.compile(r"^\s*(\d{1,3})\s+\S+\s+\d+\s+\S+")
 
 
 def parse_args() -> argparse.Namespace:
@@ -383,6 +387,93 @@ def format_pipeline_status_log(payload: dict) -> str:
     return " ".join(segments)
 
 
+def decode_stream_text(data: bytes) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def iter_process_output_lines(stream):
+    buffer = b""
+    while True:
+        chunk = stream.read(4096)
+        if not chunk:
+            break
+        buffer += chunk
+        while True:
+            newline_positions = [pos for pos in (buffer.find(b"\n"), buffer.find(b"\r")) if pos >= 0]
+            if not newline_positions:
+                break
+            split_at = min(newline_positions)
+            raw_line = buffer[:split_at]
+            buffer = buffer[split_at + 1 :]
+            if buffer.startswith(b"\n"):
+                buffer = buffer[1:]
+            yield decode_stream_text(raw_line)
+    if buffer:
+        yield decode_stream_text(buffer)
+
+
+def extract_download_percent(line: str) -> int | None:
+    match = DOWNLOAD_PROGRESS_PATTERN.match(line)
+    if not match:
+        return None
+    try:
+        percent = int(match.group(1))
+    except ValueError:
+        return None
+    return max(0, min(100, percent))
+
+
+def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: dict) -> None:
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+    )
+
+    last_reported_percent = -1
+    last_status_at = 0.0
+    assert process.stdout is not None
+    for raw_line in iter_process_output_lines(process.stdout):
+        line = raw_line.rstrip()
+        if line:
+            print(line, flush=True)
+
+        percent = extract_download_percent(line)
+        if percent is None:
+            if "Download successful" in line or "Request successful with HTTP status 200" in line:
+                percent = 100
+            else:
+                continue
+
+        now = time.monotonic()
+        if percent == last_reported_percent and (now - last_status_at) < 1.0:
+            continue
+        last_reported_percent = percent
+        last_status_at = now
+        stage_progress = 0.08 + ((percent / 100.0) * 0.14)
+        write_pipeline_status(
+            paths,
+            stage="download",
+            state="running",
+            message=f"AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다. ({percent}%)",
+            stage_progress=stage_progress,
+            download_percent=percent,
+        )
+
+    return_code = process.wait()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
 def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
     source_mode = str(config.get("dataset_source", "json_api")).strip().lower()
     if source_mode == "aihub_shell":
@@ -487,7 +578,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         message="AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다.",
         stage_progress=0.08,
     )
-    subprocess.run(command, cwd=str(import_dir), check=True)
+    run_download_command_with_progress(command, cwd=import_dir, paths=paths)
     import_files = list_indexed_files(import_dir)
     write_pipeline_status(
         paths,
