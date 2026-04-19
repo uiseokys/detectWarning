@@ -4686,7 +4686,16 @@ def build_overview(
         "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
         "issues": [],
     }
+    launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
+    history_completed_jobs = launcher_history.get("completed_jobs", []) if isinstance(launcher_history, dict) else []
     completed_jobs = launcher_status.get("completed_jobs", []) if isinstance(launcher_status, dict) else []
+    if not isinstance(completed_jobs, list) or not completed_jobs:
+        completed_jobs = history_completed_jobs if isinstance(history_completed_jobs, list) else []
+    if (not isinstance(completed_jobs, list) or not completed_jobs) and not lite:
+        completed_jobs = restore_completed_jobs_from_logs(
+            paths["workspace_dir"] / "job_logs",
+            paths["workspace_dir"] / "runtime_configs",
+        )
     pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
     current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
     latest_completed_job = next(
