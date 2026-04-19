@@ -486,6 +486,23 @@ def workspace_has_saved_state(workspace_dir: Path | None) -> bool:
     return False
 
 
+def find_workspace_state_candidates(project_root: Path, active_workspace_dir: Path) -> list[Path]:
+    candidates = [
+        project_root / "training_data" / "action_pipeline_aihub",
+        project_root / "training_data" / "action_pipeline",
+    ]
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen or resolved == active_workspace_dir:
+            continue
+        seen.add(key)
+        unique_candidates.append(resolved)
+    return unique_candidates
+
+
 def _job_timestamp_from_id(job_id: str | None) -> str | None:
     if not job_id:
         return None
@@ -630,6 +647,18 @@ def create_app(config_path: Path) -> FastAPI:
                 f"현재는 환경변수 {workspace_override_env or 'DETECTWARNING_WORKSPACE_DIR'} 때문에 "
                 f"{active_workspace_dir} 작업공간을 보고 있습니다. "
                 f"기본 작업공간 {workspace_default_dir} 에 기존 학습 기록이 남아 있습니다."
+            )
+    elif not workspace_has_saved_state(active_workspace_dir):
+        alternative_workspaces = [
+            candidate
+            for candidate in find_workspace_state_candidates(project_root, active_workspace_dir)
+            if workspace_has_saved_state(candidate)
+        ]
+        if alternative_workspaces:
+            alternative_text = ", ".join(str(path) for path in alternative_workspaces[:2])
+            launcher_state["last_message"] = (
+                f"현재 작업공간 {active_workspace_dir} 에는 저장된 학습 기록이 거의 없습니다. "
+                f"다른 작업공간 {alternative_text} 에 기존 학습 기록이 남아 있을 가능성이 큽니다."
             )
 
     def hard_reset_workspace() -> None:
