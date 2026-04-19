@@ -101,6 +101,7 @@
     "device": "cuda",
     "amp": true,
     "compile_model": true,
+    "compile_backend": "auto",
     "epochs": 20,
     "batch_size": 48,
     "dataset_cache_size": 2048,

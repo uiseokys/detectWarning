@@ -158,6 +158,7 @@ def main() -> None:
                 device=str(config.get("training", {}).get("device", "cuda")),
                 amp=bool(config.get("training", {}).get("amp", True)),
                 compile_model=bool(config.get("training", {}).get("compile_model", True)),
+                compile_backend=str(config.get("training", {}).get("compile_backend", "auto")),
                 dataset_cache_size=int(config.get("training", {}).get("dataset_cache_size", 2048)),
                 prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
                 persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),

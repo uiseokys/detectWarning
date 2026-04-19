@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -113,6 +114,92 @@ class TemporalPoseClassifier(nn.Module):
         return self.classifier(pooled)
 
 
+def _has_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _can_enable_compile() -> tuple[bool, str]:
+    if not hasattr(torch, "compile"):
+        return False, "torch.compile 미지원 환경입니다."
+    return True, ""
+
+
+def _resolve_compile_backend(
+    *,
+    requested_backend: str | None,
+    device: str,
+) -> list[tuple[str | None, str]]:
+    normalized = str(requested_backend or "auto").strip().lower()
+    is_windows = platform.system().lower() == "windows"
+    use_cuda = _uses_cuda(device)
+    has_triton = _has_triton()
+
+    if normalized and normalized not in {"", "auto"}:
+        return [(normalized, normalized)]
+
+    if is_windows:
+        return [
+            ("aot_eager", "aot_eager"),
+            ("eager", "eager"),
+        ]
+
+    if use_cuda and has_triton:
+        return [
+            (None, "inductor"),
+            ("aot_eager", "aot_eager"),
+            ("eager", "eager"),
+        ]
+
+    return [
+        ("aot_eager", "aot_eager"),
+        ("eager", "eager"),
+    ]
+
+
+def _compile_model_safely(
+    base_model: nn.Module,
+    *,
+    compile_model: bool,
+    compile_backend: str | None,
+    device: str,
+) -> tuple[nn.Module, bool, str]:
+    if not compile_model:
+        return base_model, False, "disabled"
+
+    can_compile, compile_reason = _can_enable_compile()
+    if not can_compile:
+        print(f"[train] torch.compile을 건너뜁니다: {compile_reason}")
+        return base_model, False, "disabled"
+
+    import torch._dynamo
+
+    torch._dynamo.config.suppress_errors = True
+    candidates = _resolve_compile_backend(
+        requested_backend=compile_backend,
+        device=device,
+    )
+
+    last_error = ""
+    for backend, backend_label in candidates:
+        try:
+            kwargs = {}
+            if backend is not None:
+                kwargs["backend"] = backend
+            compiled = torch.compile(base_model, **kwargs)
+            return compiled, True, backend_label
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"[train] torch.compile backend {backend_label} 실패: {exc}")
+
+    if last_error:
+        print(f"[train] torch.compile을 건너뜁니다: {last_error}")
+    return base_model, False, "disabled"
+
+
 def train_action_classifier(
     *,
     train_manifest: Path,
@@ -129,6 +216,7 @@ def train_action_classifier(
     device: str = "cuda",
     amp: bool = True,
     compile_model: bool = False,
+    compile_backend: str | None = None,
     dataset_cache_size: int = 2048,
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
@@ -210,14 +298,12 @@ def train_action_classifier(
                     f"- current labels: {labels}"
                 )
 
-    compiled_model = False
-    if compile_model and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(base_model)
-            compiled_model = True
-        except Exception as exc:
-            print(f"[train] torch.compile을 건너뜁니다: {exc}")
-            model = base_model
+    model, compiled_model, compiled_backend = _compile_model_safely(
+        base_model,
+        compile_model=compile_model,
+        compile_backend=compile_backend,
+        device=device,
+    )
 
     class_weights = _build_class_weights(train_dataset.samples, len(labels)).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -236,6 +322,7 @@ def train_action_classifier(
         f"device={device} "
         f"amp={'on' if use_amp else 'off'} "
         f"compile={'on' if compiled_model else 'off'} "
+        f"compile_backend={compiled_backend} "
         f"resume={resume_mode} "
         f"cache={dataset_cache_size} "
         f"workers={resolved_num_workers} "
@@ -262,6 +349,7 @@ def train_action_classifier(
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
                 "compile_enabled": compiled_model,
+                "compile_backend": compiled_backend,
                 "dataset_cache_size": dataset_cache_size,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
@@ -346,6 +434,7 @@ def train_action_classifier(
                     "val_samples": val_sample_count,
                     "amp_enabled": use_amp,
                     "compile_enabled": compiled_model,
+                    "compile_backend": compiled_backend,
                     "num_workers": resolved_num_workers,
                     "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                     "persistent_workers": use_persistent_workers,
@@ -374,6 +463,7 @@ def train_action_classifier(
                 "resume_mode": resume_mode,
                 "amp_enabled": use_amp,
                 "compile_enabled": compiled_model,
+                "compile_backend": compiled_backend,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
@@ -403,6 +493,7 @@ def train_action_classifier(
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
                 "compile_enabled": compiled_model,
+                "compile_backend": compiled_backend,
                 "num_workers": resolved_num_workers,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
