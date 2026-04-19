@@ -58,15 +58,21 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
 
     total = 0
     by_label: Counter[str] = Counter()
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            payload = json.loads(line)
-            label = str(payload.get(label_field, "unknown"))
-            by_label[label] += 1
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                total += 1
+                label = str(payload.get(label_field, "unknown"))
+                by_label[label] += 1
+    except OSError:
+        return {"total": 0, "by_label": {}}
     summary = {"total": total, "by_label": dict(sorted(by_label.items()))}
     if signature is not None:
         with MANIFEST_SUMMARY_CACHE_LOCK:

@@ -4215,11 +4215,25 @@ def create_app(config_path: Path) -> FastAPI:
       if (document.hidden) {
         return;
       }
-      const response = await fetch('/api/overview');
-      if (!response.ok) {
+      let data;
+      try {
+        const response = await fetch('/api/overview');
+        if (!response.ok) {
+          let detail = `대시보드 상태를 불러오지 못했습니다. (${response.status})`;
+          try {
+            const errorPayload = await response.json();
+            detail = errorPayload?.detail || errorPayload?.message || detail;
+          } catch (parseError) {
+            // ignore response parse error
+          }
+          setLaunchMessage(detail, true);
+          return;
+        }
+        data = await response.json();
+      } catch (error) {
+        setLaunchMessage(error?.message || '대시보드 상태 요청에 실패했습니다.', true);
         return;
       }
-      const data = await response.json();
       if (
         latestOverview &&
         latestOverview.overview_revision &&
