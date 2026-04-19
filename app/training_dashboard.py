@@ -635,18 +635,22 @@ def create_app(config_path: Path) -> FastAPI:
             json.dump(runtime_config, handle, ensure_ascii=False, indent=2)
 
         log_path = job_logs_dir / f"{job['job_id']}.log"
+        startup_message = (
+            f"[launcher] datasetkey {job.get('datasetkey', '-')}"
+            f" | filekey {job['filekey']} 작업을 시작합니다."
+        )
         write_dashboard_status(
             paths,
             stage="queued",
             state="running",
-            message=(
-                f"datasetkey {job.get('datasetkey', '-')}"
-                f" | filekey {job['filekey']} 작업을 시작합니다."
-            ),
+            message=startup_message.replace("[launcher] ", ""),
             current_filekey=job["filekey"],
             current_datasetkey=job.get("datasetkey"),
         )
         with log_path.open("w", encoding="utf-8") as log_handle:
+            log_handle.write(f"{startup_message}\n")
+            log_handle.write(f"[launcher] runtime config: {runtime_config_path}\n")
+            log_handle.flush()
             child_env = os.environ.copy()
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
@@ -3850,10 +3854,16 @@ def create_app(config_path: Path) -> FastAPI:
       const currentMeta = current.filekey
         ? `datasetkey ${current.datasetkey || '-'} | filekey ${current.filekey}${current.path ? ' | ' + current.path : ''}`
         : (current.path || launcher?.log_path || '실행 중인 작업이 없으면 최근 완료 로그를 표시합니다.');
+      const waitingMessage = current.path || launcher?.log_path
+        ? [
+            '로그 파일이 생성되었습니다. 첫 출력이 도착하면 여기에 표시됩니다.',
+            launcher?.message || ''
+          ].filter(Boolean).join('\n')
+        : '표시할 로그가 없습니다.';
       document.getElementById('currentLogMeta').textContent =
         currentMeta;
       document.getElementById('currentLogText').textContent =
-        current.tail || '표시할 로그가 없습니다.';
+        current.tail || waitingMessage;
 
       const errorMeta = latestError.filekey
         ? `최근 실패 datasetkey: ${latestError.datasetkey || '-'} | filekey: ${latestError.filekey}${latestError.path ? ' | ' + latestError.path : ''}`
