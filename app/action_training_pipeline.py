@@ -41,6 +41,7 @@ DOWNLOAD_PROGRESS_PATTERN = re.compile(
     r"(?:^|\s)(?P<percent>\d{1,3})(?:%|\s+\S+\s+\d+\s+\S+)"
 )
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+SIZE_TOKEN_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMGTP]i?B?|B)$", re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -440,6 +441,46 @@ def extract_download_percent(line: str) -> int | None:
     return max(0, min(100, percent))
 
 
+def size_token_to_bytes(token: str) -> float:
+    normalized = token.strip().upper().replace("IB", "I").replace("B", "")
+    match = re.match(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>[KMGTP]?)$", normalized)
+    if not match:
+        return 0.0
+    value = float(match.group("value"))
+    unit = match.group("unit")
+    multiplier = {
+        "": 1.0,
+        "K": 1024.0,
+        "M": 1024.0 ** 2,
+        "G": 1024.0 ** 3,
+        "T": 1024.0 ** 4,
+        "P": 1024.0 ** 5,
+    }.get(unit, 1.0)
+    return value * multiplier
+
+
+def parse_download_snapshot(line: str) -> dict | None:
+    normalized = clean_progress_line(line)
+    if not normalized:
+        return None
+    tokens = normalized.split()
+    size_tokens = [token for token in tokens if SIZE_TOKEN_PATTERN.match(token)]
+    if not size_tokens:
+        return None
+
+    transferred = None
+    if len(size_tokens) >= 2:
+        transferred = max(size_tokens[:-1], key=size_token_to_bytes)
+    else:
+        transferred = size_tokens[0]
+    speed = size_tokens[-1]
+    return {
+        "transferred": transferred,
+        "speed": speed,
+        "raw_line": normalized,
+    }
+
+
 def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: dict) -> None:
     process = subprocess.Popen(
         command,
@@ -452,6 +493,8 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
     last_reported_percent = -1
     last_status_at = 0.0
     last_message_at = 0.0
+    last_snapshot_signature = ""
+    inferred_stage_progress = 0.08
     assert process.stdout is not None
     for raw_line in iter_process_output_lines(process.stdout):
         line = clean_progress_line(raw_line)
@@ -459,18 +502,40 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
             print(line, flush=True)
 
         percent = extract_download_percent(line)
+        if percent == 100 and "%" not in line:
+            percent = None
+
+        snapshot = parse_download_snapshot(line)
         if percent is None:
             if "Download successful" in line or "Request successful with HTTP status 200" in line:
                 percent = 100
             else:
                 now = time.monotonic()
-                if line and (now - last_message_at) >= 2.0:
+                if snapshot:
+                    snapshot_signature = f"{snapshot['transferred']}|{snapshot['speed']}"
+                    if snapshot_signature != last_snapshot_signature or (now - last_message_at) >= 1.0:
+                        inferred_stage_progress = min(0.215, inferred_stage_progress + 0.0025)
+                        write_pipeline_status(
+                            paths,
+                            stage="download",
+                            state="running",
+                            message=(
+                                "AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다. "
+                                f"{snapshot['transferred']} 수신 · {snapshot['speed']}/s"
+                            ),
+                            stage_progress=inferred_stage_progress,
+                            download_transferred=snapshot["transferred"],
+                            download_speed=snapshot["speed"],
+                        )
+                        last_snapshot_signature = snapshot_signature
+                        last_message_at = now
+                elif line and (now - last_message_at) >= 2.0:
                     write_pipeline_status(
                         paths,
                         stage="download",
                         state="running",
                         message=f"AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다. {line[:120]}",
-                        stage_progress=0.08 if last_reported_percent < 0 else 0.08 + ((last_reported_percent / 100.0) * 0.14),
+                        stage_progress=inferred_stage_progress,
                         download_percent=last_reported_percent if last_reported_percent >= 0 else None,
                     )
                     last_message_at = now

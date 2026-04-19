@@ -4044,7 +4044,7 @@ def create_app(config_path: Path) -> FastAPI:
     });
     applyViewerMode();
     refresh();
-    setInterval(refresh, 2000);
+    setInterval(refresh, 1000);
   </script>
 </body>
 </html>"""
