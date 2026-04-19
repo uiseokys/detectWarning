@@ -461,6 +461,80 @@ def format_duration(seconds: int | float | None) -> str:
     return f"{secs}초"
 
 
+def _job_timestamp_from_id(job_id: str | None) -> str | None:
+    if not job_id:
+        return None
+    match = re.match(r"^job_(\d{8}_\d{6}_\d{6})_", str(job_id))
+    if not match:
+        return None
+    try:
+        parsed = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S_%f")
+    except ValueError:
+        return None
+    local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+    return parsed.replace(tzinfo=local_tz).astimezone().isoformat()
+
+
+def infer_job_state_from_log(log_path: Path) -> str:
+    tail = read_log_tail(log_path, max_lines=120, max_chars=12000)
+    lowered = tail.lower()
+    success_markers = ("[train] best model:", "[train] metrics:", "[train] labels:")
+    if any(marker in tail for marker in success_markers):
+        return "completed"
+    if "keyboardinterrupt" in lowered or "강제 중단" in tail:
+        return "aborted"
+    if "traceback" in lowered or "[pipeline][error][error]" in lowered or "runtimeerror:" in lowered:
+        return "error"
+    if "[pipeline][completed][completed]" in lowered or "정상 완료" in tail:
+        return "completed"
+    return "completed_warning"
+
+
+def restore_completed_jobs_from_logs(job_logs_dir: Path, runtime_config_dir: Path, limit: int = 30) -> list[dict]:
+    if not job_logs_dir.exists():
+        return []
+
+    restored_jobs: list[dict] = []
+    log_paths = sorted(
+        (path for path in job_logs_dir.glob("job_*.log") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for log_path in log_paths[:limit]:
+        job_id = log_path.stem
+        runtime_config_path = runtime_config_dir / f"{job_id}.json"
+        runtime_payload = read_json(runtime_config_path) if runtime_config_path.exists() else {}
+        shell_config = runtime_payload.get("aihub_shell", {}) if isinstance(runtime_payload, dict) else {}
+        inferred_started_at = _job_timestamp_from_id(job_id)
+        try:
+            finished_at = datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc).astimezone().isoformat()
+        except OSError:
+            finished_at = None
+        filekey = (
+            shell_config.get("filekey")
+            or job_id.split("_", 4)[-1]
+            or "-"
+        )
+        restored_jobs.append(
+            {
+                "job_id": job_id,
+                "filekey": str(filekey),
+                "datasetkey": shell_config.get("datasetkey"),
+                "retry_of": None,
+                "retry_count": 0,
+                "queued_at": inferred_started_at,
+                "started_at": inferred_started_at,
+                "finished_at": finished_at,
+                "state": infer_job_state_from_log(log_path),
+                "exit_code": None,
+                "runtime_config_path": str(runtime_config_path) if runtime_config_path.exists() else None,
+                "log_path": str(log_path),
+                "result_summary": None,
+            }
+        )
+    return restored_jobs
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -506,6 +580,13 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["completed_jobs"] = completed_jobs
         except (OSError, json.JSONDecodeError):
             launcher_state["completed_jobs"] = []
+
+    if not launcher_state["completed_jobs"]:
+        restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
+        if restored_jobs:
+            launcher_state["completed_jobs"] = restored_jobs
+            persist_launcher_history(launcher_history_path, launcher_state)
+            launcher_state["last_message"] = "기존 job 로그를 바탕으로 학습 완료 이력을 복구했습니다."
 
     def hard_reset_workspace() -> None:
         for key in (
