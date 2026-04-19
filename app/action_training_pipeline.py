@@ -37,7 +37,10 @@ class DownloadedItem:
     metadata: dict
 
 
-DOWNLOAD_PROGRESS_PATTERN = re.compile(r"^\s*(\d{1,3})\s+\S+\s+\d+\s+\S+")
+DOWNLOAD_PROGRESS_PATTERN = re.compile(
+    r"(?:^|\s)(?P<percent>\d{1,3})(?:%|\s+\S+\s+\d+\s+\S+)"
+)
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 def parse_args() -> argparse.Namespace:
@@ -398,6 +401,12 @@ def decode_stream_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def clean_progress_line(line: str) -> str:
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", line or "")
+    cleaned = cleaned.replace("\b", "").replace("\x00", "")
+    return cleaned.strip()
+
+
 def iter_process_output_lines(stream):
     buffer = b""
     while True:
@@ -420,11 +429,12 @@ def iter_process_output_lines(stream):
 
 
 def extract_download_percent(line: str) -> int | None:
-    match = DOWNLOAD_PROGRESS_PATTERN.match(line)
+    normalized = clean_progress_line(line)
+    match = DOWNLOAD_PROGRESS_PATTERN.search(normalized)
     if not match:
         return None
     try:
-        percent = int(match.group(1))
+        percent = int(match.group("percent"))
     except ValueError:
         return None
     return max(0, min(100, percent))
@@ -441,9 +451,10 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
 
     last_reported_percent = -1
     last_status_at = 0.0
+    last_message_at = 0.0
     assert process.stdout is not None
     for raw_line in iter_process_output_lines(process.stdout):
-        line = raw_line.rstrip()
+        line = clean_progress_line(raw_line)
         if line:
             print(line, flush=True)
 
@@ -452,6 +463,17 @@ def run_download_command_with_progress(command: list[str], *, cwd: Path, paths: 
             if "Download successful" in line or "Request successful with HTTP status 200" in line:
                 percent = 100
             else:
+                now = time.monotonic()
+                if line and (now - last_message_at) >= 2.0:
+                    write_pipeline_status(
+                        paths,
+                        stage="download",
+                        state="running",
+                        message=f"AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다. {line[:120]}",
+                        stage_progress=0.08 if last_reported_percent < 0 else 0.08 + ((last_reported_percent / 100.0) * 0.14),
+                        download_percent=last_reported_percent if last_reported_percent >= 0 else None,
+                    )
+                    last_message_at = now
                 continue
 
         now = time.monotonic()
