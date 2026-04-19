@@ -238,6 +238,32 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         file_signature.append((str(path), stat.st_mtime_ns, stat.st_size))
 
     current_job = launcher_status.get("current_job") or {}
+    recent_completed_jobs = [
+        job for job in launcher_status.get("completed_jobs", [])[:10]
+        if isinstance(job, dict)
+    ]
+    latest_completed_job = next(
+        (job for job in recent_completed_jobs if job.get("state") in {"completed", "completed_warning"}),
+        None,
+    )
+    latest_error_job = next(
+        (job for job in recent_completed_jobs if job.get("state") == "error"),
+        None,
+    )
+    dynamic_log_paths = []
+    for candidate in (
+        current_job.get("log_path") if isinstance(current_job, dict) else None,
+        latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
+        latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None,
+    ):
+        if not candidate:
+            continue
+        path = Path(str(candidate))
+        if path.exists():
+            stat = path.stat()
+            dynamic_log_paths.append((str(path), stat.st_mtime_ns, stat.st_size))
+        else:
+            dynamic_log_paths.append((str(path), None, None))
     launcher_signature = (
         launcher_status.get("state"),
         tuple(
@@ -252,9 +278,10 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         ),
         tuple(
             (key, current_job.get(key))
-            for key in ("datasetkey", "filekey", "started_at", "state", "message")
+            for key in ("datasetkey", "filekey", "started_at", "state", "message", "log_path")
             if key in current_job
         ),
+        tuple(dynamic_log_paths),
         launcher_status.get("auto_start_enabled"),
     )
     return (tuple(file_signature), launcher_signature, lite)
@@ -4277,6 +4304,9 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_state["last_message"] = (
                 f"datasetkey {datasetkey} 에 대해 {len(appended)}개 filekey를 대기열에 추가했습니다."
             )
+            if not current_job and isinstance(pending_jobs, list) and pending_jobs:
+                next_job = pending_jobs.pop(0)
+                start_pipeline_for_job(next_job)
 
         return {
             "ok": True,
