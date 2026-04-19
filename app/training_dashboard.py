@@ -461,6 +461,31 @@ def format_duration(seconds: int | float | None) -> str:
     return f"{secs}초"
 
 
+def workspace_has_saved_state(workspace_dir: Path | None) -> bool:
+    if not isinstance(workspace_dir, Path):
+        return False
+    candidates: list[Path] = [
+        workspace_dir / "launcher_history.json",
+        workspace_dir / "artifacts" / "best_action_model.pt",
+        workspace_dir / "artifacts" / "metrics.json",
+        workspace_dir / "manifests" / "cumulative_raw_items.jsonl",
+        workspace_dir / "manifests" / "cumulative_prepared_train.jsonl",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    for directory in (workspace_dir / "job_logs", workspace_dir / "runtime_configs"):
+        try:
+            if directory.exists() and any(directory.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _job_timestamp_from_id(job_id: str | None) -> str | None:
     if not job_id:
         return None
@@ -587,6 +612,25 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_state["completed_jobs"] = restored_jobs
             persist_launcher_history(launcher_history_path, launcher_state)
             launcher_state["last_message"] = "기존 job 로그를 바탕으로 학습 완료 이력을 복구했습니다."
+
+    workspace_default_dir = paths.get("workspace_default_dir")
+    workspace_source = str(paths.get("workspace_source") or "config")
+    workspace_override_env = str(paths.get("workspace_override_env") or "").strip()
+    workspace_override_value = paths.get("workspace_override_value")
+    active_workspace_dir = paths["workspace_dir"]
+    if (
+        workspace_source == "env"
+        and isinstance(workspace_default_dir, Path)
+        and workspace_default_dir != active_workspace_dir
+    ):
+        active_has_state = workspace_has_saved_state(active_workspace_dir)
+        default_has_state = workspace_has_saved_state(workspace_default_dir)
+        if not active_has_state and default_has_state:
+            launcher_state["last_message"] = (
+                f"현재는 환경변수 {workspace_override_env or 'DETECTWARNING_WORKSPACE_DIR'} 때문에 "
+                f"{active_workspace_dir} 작업공간을 보고 있습니다. "
+                f"기본 작업공간 {workspace_default_dir} 에 기존 학습 기록이 남아 있습니다."
+            )
 
     def hard_reset_workspace() -> None:
         for key in (
@@ -4689,6 +4733,12 @@ def build_overview(
         "schema_version": STATE_SCHEMA_VERSION,
         "workspace_dir": str(paths["workspace_dir"]),
         "workspace_name": paths["workspace_dir"].name,
+        "workspace": {
+            "source": paths.get("workspace_source", "config"),
+            "default_dir": str(paths.get("workspace_default_dir") or paths["workspace_dir"]),
+            "override_env": paths.get("workspace_override_env"),
+            "override_value": paths.get("workspace_override_value"),
+        },
         "config_path": str(config_path),
         "target_labels": target_labels,
         "pipeline_status": pipeline_status,

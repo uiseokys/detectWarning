@@ -233,12 +233,19 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
     workspace_dir_setting = paths_config.get("workspace_dir", "training_data/action_pipeline")
     workspace_dir_env = str(paths_config.get("workspace_dir_env", "DETECTWARNING_WORKSPACE_DIR") or "").strip()
     workspace_dir_override = os.environ.get(workspace_dir_env, "").strip() if workspace_dir_env else ""
+    workspace_path = Path(workspace_dir_setting).expanduser()
+    workspace_dir_default = (
+        workspace_path.resolve()
+        if workspace_path.is_absolute()
+        else (base_dir / workspace_path).resolve()
+    )
 
     if workspace_dir_override:
         workspace_dir = Path(workspace_dir_override).expanduser().resolve()
+        workspace_source = "env"
     else:
-        workspace_path = Path(workspace_dir_setting).expanduser()
-        workspace_dir = workspace_path.resolve() if workspace_path.is_absolute() else (base_dir / workspace_path).resolve()
+        workspace_dir = workspace_dir_default
+        workspace_source = "config"
     raw_dir = workspace_dir / "raw_videos"
     import_dir = workspace_dir / "imported_dataset"
     extracted_dir = workspace_dir / "extracted_dataset"
@@ -249,6 +256,10 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         path.mkdir(parents=True, exist_ok=True)
     return {
         "workspace_dir": workspace_dir,
+        "workspace_default_dir": workspace_dir_default,
+        "workspace_source": workspace_source,
+        "workspace_override_env": workspace_dir_env,
+        "workspace_override_value": workspace_dir_override or None,
         "raw_dir": raw_dir,
         "import_dir": import_dir,
         "extracted_dir": extracted_dir,
