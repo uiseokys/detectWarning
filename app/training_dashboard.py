@@ -4258,114 +4258,128 @@ def create_app(config_path: Path) -> FastAPI:
       const stageTimings = pipeline?.stage_timings ? { by_stage: pipeline.stage_timings } : { by_stage: {} };
       const totalDurationSeconds = pipeline?.total_duration_seconds ?? null;
 
-      const stateEl = document.getElementById('pipelineState');
-      const displayState = launcher.state || pipeline.state || 'unknown';
-      stateEl.textContent = formatLauncherState(displayState);
-      stateEl.className = `status-pill ${toneClass(displayState)}`;
-
-      const datasetKey = data.aihub?.datasetkey ?? '-';
-      setText('datasetKeyChip', datasetKey);
-      const datasetKeyInput = document.getElementById('datasetKeyInput');
-      if (datasetKeyInput && datasetKey !== '-' && !datasetKeyInput.value.trim()) {
-        datasetKeyInput.value = datasetKey;
-      }
-      setText('workspaceChip', data.workspace_name || '-');
-      setText('launcherState', formatLauncherState(launcher.state || 'idle'));
-      setText('currentFilekey', formatJob(launcher.current_job));
-      setText(
-        'currentDatasetkey',
-        launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
-      );
-      setText('pendingFilekeys', formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey)));
-      setText('completedJobs', formatCompletedJobs(launcher.completed_jobs || []));
-      setText('autoStartState', launcher.auto_start_enabled === false ? '꺼짐' : '켜짐');
-      setText('launcherLogPath', launcher.log_path || '-');
-      setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
-      updateControlButtons(launcher);
-      renderQueuedJobs(launcher.pending_jobs || []);
-
-      document.getElementById('currentStage').textContent = pipeline.stage || '-';
-      document.getElementById('currentMessage').textContent = pipeline.message || '-';
-      document.getElementById('etaText').textContent = eta.label || '-';
-      document.getElementById('etaMeta').textContent =
-        eta.seconds_remaining !== null && eta.seconds_remaining !== undefined
-          ? `현재 filekey 기준 예상 남은 시간`
-          : '진행률이 쌓이면 계산합니다.';
-
-      document.getElementById('epochProgress').textContent =
-        `${progress.epochs_completed ?? 0} / ${progress.epochs_total ?? 0}`;
-      document.getElementById('bestF1').textContent =
-        `best macro F1: ${progress.best_val_macro_f1 ?? '-'}`;
-
-      const rawTotal = data.dataset?.raw?.total ?? 0;
-      const preparedTotal =
-        (data.dataset?.prepared_train?.total ?? 0) +
-        (data.dataset?.prepared_val?.total ?? 0) +
-        (data.dataset?.prepared_test?.total ?? 0);
-      document.getElementById('datasetTotals').textContent = `${rawTotal} / ${preparedTotal}`;
-      document.getElementById('datasetSummary').textContent = 'raw videos / prepared pose samples';
-
-      document.getElementById('artifactState').textContent = data.artifacts?.has_model ? 'ready' : 'pending';
-      document.getElementById('workspaceDir').textContent = data.workspace_dir || '-';
-      document.getElementById('gpuUsageText').textContent = formatGpuUsage(gpu);
-      document.getElementById('gpuUsageMeta').textContent = formatGpuMeta(gpu);
-      document.getElementById('gpuVramText').textContent = formatGpuVram(gpu);
-      document.getElementById('gpuVramMeta').textContent = formatGpuVramMeta(gpu);
-      document.getElementById('queueProgressText').textContent =
-        `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`;
-      document.getElementById('queueProgressMeta').textContent =
-        `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`;
-      document.getElementById('queueProgressFill').style.width =
-        `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`;
-      renderIssueVideos(skipReport, cumulativeSkipReport);
-
-      if (progress.latest) {
-        document.getElementById('latestEpoch').textContent = `Epoch ${progress.latest.epoch}`;
-        document.getElementById('latestMetrics').textContent =
-          `train loss ${progress.latest.train_loss} / val acc ${progress.latest.val_accuracy} / val f1 ${progress.latest.val_macro_f1}`;
-        document.getElementById('latestLoss').textContent =
-          `train ${progress.latest.train_loss} / val ${progress.latest.val_loss}`;
-        document.getElementById('latestLearningRate').textContent =
-          `lr ${progress.latest.learning_rate ?? '-'}`;
-      } else {
-        document.getElementById('latestEpoch').textContent = '-';
-        document.getElementById('latestMetrics').textContent = '-';
-        document.getElementById('latestLoss').textContent = '-';
-        document.getElementById('latestLearningRate').textContent = '-';
-      }
-
-      document.getElementById('resumeState').textContent =
-        progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습';
-      document.getElementById('sampleCounts').textContent =
-        `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`;
-      document.getElementById('gpuDeviceText').textContent = formatGpuDevice(gpu);
-      document.getElementById('gpuMemoryText').textContent = formatGpuMemory(gpu);
-      document.getElementById('trainingDeviceText').textContent = formatTrainingDevice(progress, gpu);
-      document.getElementById('trainingDeviceMeta').textContent = formatTrainingDeviceMeta(progress);
-      document.getElementById('stageTimingValue').textContent = formatStageTimingValue(stageTimings);
-      document.getElementById('stageTimingCopy').textContent = formatStageTimingMeta(stageTimings, totalDurationSeconds);
-      document.getElementById('currentStageTimingText').textContent = formatStageTimingValue(stageTimings);
-      document.getElementById('currentStageTimingMeta').textContent =
-        formatActiveStageElapsed(pipeline) || formatStageTimingMeta(stageTimings, totalDurationSeconds);
-
-      document.getElementById('updatedAt').textContent = pipeline.updated_at || progress.updated_at || '-';
-      document.getElementById('configPath').textContent = launcher.runtime_config_path || data.config_path || '-';
-
-      renderChart(progress.history || []);
-      renderLossChart(progress.history || []);
-      renderMetricInsights(progress, metrics);
-      renderDatasetTable(data.dataset || {});
-      renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
-      const metricLabels = progress.labels || metrics.labels || [];
-      const finalValidation = progress.final_validation || metrics.final_validation || {};
-      renderPerClassMetrics(
-        metricLabels,
-        finalValidation.per_class || [],
-        finalValidation.confusion_matrix || []
-      );
-      renderConfusionMatrix(metricLabels, finalValidation.confusion_matrix || []);
-      renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
       renderLogPanels(logs, launcher);
+      setLaunchMessage(
+        launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.',
+        launcher.state === 'error'
+      );
+
+      try {
+        const stateEl = document.getElementById('pipelineState');
+        if (stateEl) {
+          const displayState = launcher.state || pipeline.state || 'unknown';
+          stateEl.textContent = formatLauncherState(displayState);
+          stateEl.className = `status-pill ${toneClass(displayState)}`;
+        }
+
+        const datasetKey = data.aihub?.datasetkey ?? '-';
+        setText('datasetKeyChip', datasetKey);
+        const datasetKeyInput = document.getElementById('datasetKeyInput');
+        if (datasetKeyInput && datasetKey !== '-' && !datasetKeyInput.value.trim()) {
+          datasetKeyInput.value = datasetKey;
+        }
+        setText('workspaceChip', data.workspace_name || '-');
+        setText('launcherState', formatLauncherState(launcher.state || 'idle'));
+        setText('currentFilekey', formatJob(launcher.current_job));
+        setText(
+          'currentDatasetkey',
+          launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
+        );
+        setText('pendingFilekeys', formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey)));
+        setText('completedJobs', formatCompletedJobs(launcher.completed_jobs || []));
+        setText('autoStartState', launcher.auto_start_enabled === false ? '꺼짐' : '켜짐');
+        setText('launcherLogPath', launcher.log_path || '-');
+        updateControlButtons(launcher);
+        renderQueuedJobs(launcher.pending_jobs || []);
+
+        setText('currentStage', pipeline.stage || '-');
+        setText('currentMessage', pipeline.message || '-');
+        setText('etaText', eta.label || '-');
+        setText(
+          'etaMeta',
+          eta.seconds_remaining !== null && eta.seconds_remaining !== undefined
+            ? '현재 filekey 기준 예상 남은 시간'
+            : '진행률이 쌓이면 계산합니다.'
+        );
+
+        setText('epochProgress', `${progress.epochs_completed ?? 0} / ${progress.epochs_total ?? 0}`);
+        setText('bestF1', `best macro F1: ${progress.best_val_macro_f1 ?? '-'}`);
+
+        const rawTotal = data.dataset?.raw?.total ?? 0;
+        const preparedTotal =
+          (data.dataset?.prepared_train?.total ?? 0) +
+          (data.dataset?.prepared_val?.total ?? 0) +
+          (data.dataset?.prepared_test?.total ?? 0);
+        setText('datasetTotals', `${rawTotal} / ${preparedTotal}`);
+        setText('datasetSummary', 'raw videos / prepared pose samples');
+
+        setText('artifactState', data.artifacts?.has_model ? 'ready' : 'pending');
+        setText('workspaceDir', data.workspace_dir || '-');
+        setText('gpuUsageText', formatGpuUsage(gpu));
+        setText('gpuUsageMeta', formatGpuMeta(gpu));
+        setText('gpuVramText', formatGpuVram(gpu));
+        setText('gpuVramMeta', formatGpuVramMeta(gpu));
+        setText('queueProgressText', `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`);
+        setText(
+          'queueProgressMeta',
+          `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`
+        );
+        const queueProgressFill = document.getElementById('queueProgressFill');
+        if (queueProgressFill) {
+          queueProgressFill.style.width =
+            `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`;
+        }
+        renderIssueVideos(skipReport, cumulativeSkipReport);
+
+        if (progress.latest) {
+          setText('latestEpoch', `Epoch ${progress.latest.epoch}`);
+          setText(
+            'latestMetrics',
+            `train loss ${progress.latest.train_loss} / val acc ${progress.latest.val_accuracy} / val f1 ${progress.latest.val_macro_f1}`
+          );
+          setText('latestLoss', `train ${progress.latest.train_loss} / val ${progress.latest.val_loss}`);
+          setText('latestLearningRate', `lr ${progress.latest.learning_rate ?? '-'}`);
+        } else {
+          setText('latestEpoch', '-');
+          setText('latestMetrics', '-');
+          setText('latestLoss', '-');
+          setText('latestLearningRate', '-');
+        }
+
+        setText('resumeState', progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습');
+        setText('sampleCounts', `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`);
+        setText('gpuDeviceText', formatGpuDevice(gpu));
+        setText('gpuMemoryText', formatGpuMemory(gpu));
+        setText('trainingDeviceText', formatTrainingDevice(progress, gpu));
+        setText('trainingDeviceMeta', formatTrainingDeviceMeta(progress));
+        setText('stageTimingValue', formatStageTimingValue(stageTimings));
+        setText('stageTimingCopy', formatStageTimingMeta(stageTimings, totalDurationSeconds));
+        setText('currentStageTimingText', formatStageTimingValue(stageTimings));
+        setText(
+          'currentStageTimingMeta',
+          formatActiveStageElapsed(pipeline) || formatStageTimingMeta(stageTimings, totalDurationSeconds)
+        );
+
+        setText('updatedAt', pipeline.updated_at || progress.updated_at || '-');
+        setText('configPath', launcher.runtime_config_path || data.config_path || '-');
+
+        renderChart(progress.history || []);
+        renderLossChart(progress.history || []);
+        renderMetricInsights(progress, metrics);
+        renderDatasetTable(data.dataset || {});
+        renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
+        const metricLabels = progress.labels || metrics.labels || [];
+        const finalValidation = progress.final_validation || metrics.final_validation || {};
+        renderPerClassMetrics(
+          metricLabels,
+          finalValidation.per_class || [],
+          finalValidation.confusion_matrix || []
+        );
+        renderConfusionMatrix(metricLabels, finalValidation.confusion_matrix || []);
+        renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
+      } catch (error) {
+        setLaunchMessage(`대시보드 렌더링 중 오류가 발생했습니다: ${error?.message || String(error)}`, true);
+      }
     }
 
     let latestOverview = null;
