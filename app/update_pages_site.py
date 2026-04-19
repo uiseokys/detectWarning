@@ -6,6 +6,7 @@ from pathlib import Path
 
 from action_training_pipeline import get_target_labels, load_config, resolve_paths
 from reporting import (
+    analyze_class_balance,
     STATE_SCHEMA_VERSION,
     build_per_class_support,
     build_recent_jobs,
@@ -16,6 +17,7 @@ from reporting import (
     now_iso,
     read_json,
     safe_number,
+    summarize_stage_timings,
     summarize_manifest,
 )
 
@@ -151,6 +153,7 @@ def build_latest_result_payload(
     latest_job = get_latest_job(paths)
     launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
     continual_state = read_json(paths["continual_state"]) or {}
+    pipeline_status = read_json(paths["pipeline_status"]) or {}
     cumulative_skip_report = read_json(paths["cumulative_skip_report"]) or {
         "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
         "issues": [],
@@ -175,6 +178,15 @@ def build_latest_result_payload(
     total_val_samples = sum(int(row.get("support", 0)) for row in supports)
     issue_summary = cumulative_skip_report.get("summary") or {}
     recent_jobs = build_recent_jobs(launcher_history)
+    train_distribution = metrics.get("train_distribution") or analyze_class_balance(
+        labels,
+        dataset["prepared_train"].get("by_label"),
+    )
+    val_distribution = metrics.get("val_distribution") or analyze_class_balance(
+        labels,
+        dataset["prepared_val"].get("by_label"),
+    )
+    stage_timing_summary = summarize_stage_timings(pipeline_status.get("stage_timings"))
 
     per_class_rows = []
     for row in final_validation.get("per_class", []) or []:
@@ -227,6 +239,9 @@ def build_latest_result_payload(
                 "broken": int(issue_summary.get("broken_count", 0) or 0),
                 "skipped": int(issue_summary.get("skipped_count", 0) or 0),
             },
+            "stopped_early": bool(metrics.get("stopped_early")),
+            "stop_reason": metrics.get("stop_reason"),
+            "total_duration_seconds": pipeline_status.get("total_duration_seconds"),
         },
         "latest_job": {
             "datasetkey": latest_job.get("datasetkey"),
@@ -251,6 +266,9 @@ def build_latest_result_payload(
         "confusion_matrix": confusion_matrix,
         "dataset": dataset,
         "continual_state": continual_state,
+        "train_distribution": train_distribution,
+        "val_distribution": val_distribution,
+        "stage_timings": stage_timing_summary,
         "issues": cumulative_skip_report,
         "recent_jobs": recent_jobs,
         "notes": [

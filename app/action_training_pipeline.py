@@ -75,6 +75,9 @@ def main() -> None:
     validate_source_config(config, config_path)
     paths = resolve_paths(config, config_path.parent)
     continual_config = get_continual_config(config)
+    pipeline_started_at = current_timestamp_iso()
+    stage_timings: dict[str, dict] = {}
+    active_stage_started_at = pipeline_started_at
     write_pipeline_status(
         paths,
         stage="starting",
@@ -82,6 +85,9 @@ def main() -> None:
         message="학습 파이프라인을 시작합니다.",
         config_path=str(config_path),
         stage_progress=0.0,
+        pipeline_started_at=pipeline_started_at,
+        stage_started_at=active_stage_started_at,
+        stage_timings=stage_timings,
     )
 
     try:
@@ -90,14 +96,19 @@ def main() -> None:
         training_manifests: dict[str, Path] | None = None
 
         if args.stage in {"all", "download"}:
+            active_stage_started_at = current_timestamp_iso()
             write_pipeline_status(
                 paths,
                 stage="download",
                 state="running",
                 message="API에서 영상을 다운로드하는 중입니다.",
                 stage_progress=0.05,
+                pipeline_started_at=pipeline_started_at,
+                stage_started_at=active_stage_started_at,
+                stage_timings=stage_timings,
             )
             downloaded = download_dataset(config, paths)
+            stage_timings["download"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
             split_manifests = split_dataset(downloaded, config, paths)
         elif args.stage == "prepare":
             split_manifests = load_existing_current_split_manifests(paths)
@@ -105,14 +116,19 @@ def main() -> None:
         if args.stage in {"all", "prepare"}:
             if split_manifests is None:
                 split_manifests = load_existing_current_split_manifests(paths)
+            active_stage_started_at = current_timestamp_iso()
             write_pipeline_status(
                 paths,
                 stage="prepare",
                 state="running",
                 message="영상에서 pose 시퀀스를 추출하는 중입니다.",
                 stage_progress=0.55,
+                pipeline_started_at=pipeline_started_at,
+                stage_started_at=active_stage_started_at,
+                stage_timings=stage_timings,
             )
             prepared_manifests = prepare_pose_dataset(config, paths, split_manifests)
+            stage_timings["prepare"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
             training_manifests = update_cumulative_manifests(config, paths, split_manifests, prepared_manifests)
         elif args.stage == "train":
             training_manifests = load_training_manifests(
@@ -128,12 +144,16 @@ def main() -> None:
                     paths,
                     continual_enabled=continual_config["enabled"],
                 )
+            active_stage_started_at = current_timestamp_iso()
             write_pipeline_status(
                 paths,
                 stage="train",
                 state="running",
                 message="행동 분류 모델을 학습하는 중입니다.",
                 stage_progress=0.8,
+                pipeline_started_at=pipeline_started_at,
+                stage_started_at=active_stage_started_at,
+                stage_timings=stage_timings,
             )
             labels = get_target_labels(config)
             train_manifest = training_manifests["train"]
@@ -150,6 +170,7 @@ def main() -> None:
                 labels=labels,
                 epochs=int(config.get("training", {}).get("epochs", 20)),
                 batch_size=int(config.get("training", {}).get("batch_size", 16)),
+                eval_batch_size=int(config.get("training", {}).get("eval_batch_size", 0) or 0),
                 learning_rate=float(config.get("training", {}).get("learning_rate", 1e-3)),
                 hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
                 num_layers=int(config.get("training", {}).get("num_layers", 2)),
@@ -157,14 +178,21 @@ def main() -> None:
                 num_workers=config.get("training", {}).get("num_workers", "auto"),
                 device=str(config.get("training", {}).get("device", "cuda")),
                 amp=bool(config.get("training", {}).get("amp", True)),
+                amp_dtype=str(config.get("training", {}).get("amp_dtype", "auto")),
                 compile_model=bool(config.get("training", {}).get("compile_model", True)),
                 compile_backend=str(config.get("training", {}).get("compile_backend", "auto")),
                 dataset_cache_size=int(config.get("training", {}).get("dataset_cache_size", 2048)),
                 prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
                 persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
+                pin_memory=config.get("training", {}).get("pin_memory", "auto"),
+                early_stopping_patience=int(config.get("training", {}).get("early_stopping_patience", 5)),
+                early_stopping_min_delta=float(config.get("training", {}).get("early_stopping_min_delta", 0.001)),
+                imbalance_warn_min_samples=int(config.get("training", {}).get("imbalance_warn_min_samples", 8)),
+                imbalance_warn_ratio=float(config.get("training", {}).get("imbalance_warn_ratio", 5.0)),
                 progress_path=paths["training_progress"],
                 resume_from=resume_from,
             )
+            stage_timings["train"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
             print(f"[train] best model: {artifacts.best_model_path}")
             print(f"[train] metrics: {artifacts.metrics_path}")
             print(f"[train] labels: {artifacts.labels_path}")
@@ -172,20 +200,30 @@ def main() -> None:
             if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
                 cleanup_transient_job_data(paths)
 
+        stage_timings["total"] = build_stage_timing_entry(pipeline_started_at, current_timestamp_iso())
         write_pipeline_status(
             paths,
             stage="completed",
             state="completed",
             message="학습 파이프라인이 완료되었습니다.",
             stage_progress=1.0,
+            pipeline_started_at=pipeline_started_at,
+            stage_started_at=active_stage_started_at,
+            stage_timings=stage_timings,
+            total_duration_seconds=stage_timings["total"]["duration_seconds"],
         )
     except Exception as exc:
+        stage_timings["total"] = build_stage_timing_entry(pipeline_started_at, current_timestamp_iso())
         write_pipeline_status(
             paths,
             stage="error",
             state="error",
             message=str(exc),
             stage_progress=1.0,
+            pipeline_started_at=pipeline_started_at,
+            stage_started_at=active_stage_started_at,
+            stage_timings=stage_timings,
+            total_duration_seconds=stage_timings["total"]["duration_seconds"],
         )
         raise
 
@@ -244,17 +282,42 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
 
 
 def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, **extra) -> None:
+    existing = read_json_file(paths["pipeline_status"]) or {}
     payload = {
         "stage": stage,
         "state": state,
         "message": message,
         "workspace_dir": str(paths["workspace_dir"]),
         "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "pipeline_started_at": extra.pop("pipeline_started_at", existing.get("pipeline_started_at")),
+        "stage_started_at": extra.pop("stage_started_at", existing.get("stage_started_at")),
+        "stage_timings": extra.pop("stage_timings", existing.get("stage_timings") or {}),
+        "total_duration_seconds": extra.pop("total_duration_seconds", existing.get("total_duration_seconds")),
         **extra,
     }
     with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     print(format_pipeline_status_log(payload))
+
+
+def current_timestamp_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def build_stage_timing_entry(started_at: str | None, finished_at: str | None) -> dict:
+    duration_seconds = None
+    if started_at and finished_at:
+        try:
+            start_dt = datetime.fromisoformat(str(started_at))
+            finish_dt = datetime.fromisoformat(str(finished_at))
+            duration_seconds = max(0.0, (finish_dt - start_dt).total_seconds())
+        except ValueError:
+            duration_seconds = None
+    return {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+    }
 
 
 def create_skip_report() -> dict:

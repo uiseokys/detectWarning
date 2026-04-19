@@ -39,6 +39,7 @@ from dashboard_runtime import (
 )
 from reporting import (
     STATE_SCHEMA_VERSION,
+    analyze_class_balance,
     normalize_metric_payload,
     read_json,
     summarize_manifest,
@@ -2469,6 +2470,21 @@ def create_app(config_path: Path) -> FastAPI:
                 <div class="insight-value" id="dominantClassValue">-</div>
                 <div class="insight-copy" id="dominantClassCopy">validation에서 가장 많은 클래스</div>
               </div>
+              <div class="insight-card">
+                <div class="insight-label">Early Stop</div>
+                <div class="insight-value" id="earlyStopValue">-</div>
+                <div class="insight-copy" id="earlyStopCopy">조기 종료 정보</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Train Imbalance</div>
+                <div class="insight-value" id="trainImbalanceValue">-</div>
+                <div class="insight-copy" id="trainImbalanceCopy">학습 클래스 분포</div>
+              </div>
+              <div class="insight-card">
+                <div class="insight-label">Stage Durations</div>
+                <div class="insight-value" id="stageTimingValue">-</div>
+                <div class="insight-copy" id="stageTimingCopy">download / prepare / train</div>
+              </div>
             </div>
           </div>
           <div class="chart-wrap" style="margin-top:18px;">
@@ -2574,6 +2590,16 @@ def create_app(config_path: Path) -> FastAPI:
             <div class="mini-title">학습 장치</div>
             <div class="mini-value" id="trainingDeviceText">-</div>
             <div class="mini-copy" id="trainingDeviceMeta">학습 프로세스 장치 정보가 없습니다.</div>
+          </div>
+          <div class="mini-card" style="margin-top:12px;">
+            <div class="mini-title">단계별 소요 시간</div>
+            <div class="mini-value" id="currentStageTimingText">-</div>
+            <div class="mini-copy" id="currentStageTimingMeta">download / prepare / train / total</div>
+          </div>
+          <div class="mini-card" style="margin-top:12px;">
+            <div class="mini-title">데이터 분포 경고</div>
+            <div class="mini-value" id="imbalanceStatusText">-</div>
+            <div class="mini-copy" id="imbalanceStatusMeta">학습/검증 클래스 분포를 확인합니다.</div>
           </div>
           <div class="scroll-panel" style="margin-top:16px; max-height: 260px;">
             <table class="table">
@@ -3459,6 +3485,12 @@ def create_app(config_path: Path) -> FastAPI:
       document.getElementById('continualStateText').textContent = resumed;
       document.getElementById('continualStateMeta').textContent =
         `누적 prepared train ${continualTrain} / val ${continualVal}`;
+
+      const trainImbalance = formatImbalanceSummary(progress?.train_distribution || null);
+      const valImbalance = formatImbalanceSummary(progress?.val_distribution || null);
+      document.getElementById('imbalanceStatusText').textContent = trainImbalance.value;
+      document.getElementById('imbalanceStatusMeta').textContent =
+        `train ${trainImbalance.copy} | val ${valImbalance.copy}`;
     }
 
     function buildPerClassSupport(labels, confusion) {
@@ -3476,11 +3508,77 @@ def create_app(config_path: Path) -> FastAPI:
       return supports;
     }
 
+    function formatImbalanceSummary(distribution) {
+      if (!distribution) {
+        return { value: '-', copy: '클래스 분포 정보가 없습니다.' };
+      }
+      const severity = String(distribution.severity || 'ok');
+      const covered = Number(distribution.covered ?? 0);
+      const total = Number(distribution.total ?? 0);
+      const ratio = distribution.imbalance_ratio !== null && distribution.imbalance_ratio !== undefined
+        ? `ratio ${Number(distribution.imbalance_ratio).toFixed(2)}`
+        : 'ratio -';
+      const label =
+        severity === 'critical' ? 'critical' :
+        severity === 'warning' ? 'warning' :
+        'ok';
+      const message = Array.isArray(distribution.messages) && distribution.messages.length
+        ? distribution.messages[0]
+        : '클래스 분포가 크게 치우치지 않았습니다.';
+      return {
+        value: `${label} · ${covered}/${total}`,
+        copy: `${ratio} · ${message}`,
+      };
+    }
+
+    function formatStageTimingValue(stageTimings) {
+      const byStage = stageTimings?.by_stage || {};
+      const parts = ['download', 'prepare', 'train']
+        .map((stage) => {
+          const seconds = byStage?.[stage]?.duration_seconds;
+          if (seconds === null || seconds === undefined) {
+            return null;
+          }
+          return `${stage} ${formatDuration(seconds)}`;
+        })
+        .filter(Boolean);
+      return parts.length ? parts.join(' · ') : '-';
+    }
+
+    function formatStageTimingMeta(stageTimings, totalSeconds) {
+      const byStage = stageTimings?.by_stage || {};
+      const completedCount = ['download', 'prepare', 'train']
+        .filter((stage) => byStage?.[stage]?.duration_seconds !== null && byStage?.[stage]?.duration_seconds !== undefined)
+        .length;
+      const totalLabel =
+        totalSeconds !== null && totalSeconds !== undefined
+          ? `total ${formatDuration(totalSeconds)}`
+          : null;
+      return [totalLabel, `${completedCount}개 단계 기록`]
+        .filter(Boolean)
+        .join(' · ') || 'download / prepare / train 소요 시간이 아직 없습니다.';
+    }
+
+    function formatActiveStageElapsed(pipeline) {
+      if (!pipeline?.stage_started_at || !pipeline?.stage) {
+        return null;
+      }
+      const start = new Date(pipeline.stage_started_at).getTime();
+      if (Number.isNaN(start)) {
+        return null;
+      }
+      const seconds = Math.max(0, Math.round((Date.now() - start) / 1000));
+      return `${pipeline.stage} ${formatDuration(seconds)} 진행 중`;
+    }
+
     function renderMetricInsights(progress, metrics) {
       const finalValidation = progress?.final_validation || metrics?.final_validation || {};
       const history = progress?.history || [];
       const latest = progress?.latest || history[history.length - 1] || null;
       const labels = progress?.labels || metrics?.labels || [];
+      const earlyStopping = progress?.early_stopping || metrics?.early_stopping || {};
+      const stoppedEarly = Boolean(progress?.stopped_early ?? metrics?.stopped_early);
+      const trainImbalance = formatImbalanceSummary(progress?.train_distribution || metrics?.train_distribution || null);
       const supports = buildPerClassSupport(labels, finalValidation?.confusion_matrix || []);
       const totalSupport = supports.reduce((sum, row) => sum + Number(row.support || 0), 0);
       const coveredClasses = supports.filter((row) => Number(row.support || 0) > 0);
@@ -3524,6 +3622,22 @@ def create_app(config_path: Path) -> FastAPI:
         dominant && Number(dominant.support || 0) > 0
           ? `support ${dominant.support}`
           : 'validation에서 가장 많은 클래스';
+
+      document.getElementById('earlyStopValue').textContent =
+        stoppedEarly
+          ? `yes · epoch ${progress?.epochs_completed ?? latest?.epoch ?? '-'}`
+          : (earlyStopping?.enabled ? 'armed' : 'off');
+      document.getElementById('earlyStopCopy').textContent =
+        stoppedEarly
+          ? (progress?.stop_reason || metrics?.stop_reason || '조기 종료되었습니다.')
+          : (
+            earlyStopping?.enabled
+              ? `patience ${earlyStopping?.patience ?? '-'} · min delta ${earlyStopping?.min_delta ?? '-'}`
+              : '조기 종료가 꺼져 있습니다.'
+          );
+
+      document.getElementById('trainImbalanceValue').textContent = trainImbalance.value;
+      document.getElementById('trainImbalanceCopy').textContent = trainImbalance.copy;
     }
 
     function renderPerClassMetrics(labels, perClass, confusion) {
@@ -3632,6 +3746,8 @@ def create_app(config_path: Path) -> FastAPI:
           (summary.prepared_val_total ?? 0) +
           (summary.prepared_test_total ?? 0);
         const issueTotal = Number(summary.total_issues ?? ((summary.broken_count ?? 0) + (summary.skipped_count ?? 0)));
+        const totalDuration = summary.total_duration_seconds;
+        const stoppedEarly = Boolean(summary.stopped_early);
         const stateLabel =
           job.state === 'completed' ? '완료' :
           job.state === 'completed_warning' ? '경고 종료' :
@@ -3642,7 +3758,7 @@ def create_app(config_path: Path) -> FastAPI:
           <tr>
             <td>${escapeHtml(job.filekey || '-')}</td>
             <td>${stateLabel}${job.exit_code !== null && job.exit_code !== undefined ? ` (${job.exit_code})` : ''}</td>
-            <td>${rawTotal} / ${preparedTotal}${issueTotal > 0 ? `<br>issue ${issueTotal}` : ''}</td>
+            <td>${rawTotal} / ${preparedTotal}${issueTotal > 0 ? `<br>issue ${issueTotal}` : ''}${totalDuration !== null && totalDuration !== undefined ? `<br>time ${formatDuration(totalDuration)}` : ''}${stoppedEarly ? '<br>early stop' : ''}</td>
             <td>${formatDateTime(job.started_at)}<br>${formatDateTime(job.finished_at)}</td>
             <td class="mono">${escapeHtml(logPreview)}</td>
           </tr>
@@ -3919,6 +4035,8 @@ def create_app(config_path: Path) -> FastAPI:
       const gpu = data.gpu || {};
       const skipReport = data.skip_report || {};
       const cumulativeSkipReport = data.cumulative_skip_report || {};
+      const stageTimings = pipeline?.stage_timings ? { by_stage: pipeline.stage_timings } : { by_stage: {} };
+      const totalDurationSeconds = pipeline?.total_duration_seconds ?? null;
 
       const stateEl = document.getElementById('pipelineState');
       const displayState = launcher.state || pipeline.state || 'unknown';
@@ -4004,6 +4122,11 @@ def create_app(config_path: Path) -> FastAPI:
       document.getElementById('gpuMemoryText').textContent = formatGpuMemory(gpu);
       document.getElementById('trainingDeviceText').textContent = formatTrainingDevice(progress, gpu);
       document.getElementById('trainingDeviceMeta').textContent = formatTrainingDeviceMeta(progress);
+      document.getElementById('stageTimingValue').textContent = formatStageTimingValue(stageTimings);
+      document.getElementById('stageTimingCopy').textContent = formatStageTimingMeta(stageTimings, totalDurationSeconds);
+      document.getElementById('currentStageTimingText').textContent = formatStageTimingValue(stageTimings);
+      document.getElementById('currentStageTimingMeta').textContent =
+        formatActiveStageElapsed(pipeline) || formatStageTimingMeta(stageTimings, totalDurationSeconds);
 
       document.getElementById('updatedAt').textContent = pipeline.updated_at || progress.updated_at || '-';
       document.getElementById('configPath').textContent = launcher.runtime_config_path || data.config_path || '-';
@@ -4397,6 +4520,48 @@ def build_overview(
     progress_ratio = ((completed_count + failed_count) / total_count) if total_count > 0 else 0.0
     current_job_progress = build_current_job_progress(pipeline_status, training_progress, launcher_status)
     eta = estimate_eta(current_job_progress, launcher_status)
+    dataset_summary = (
+        {
+            "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
+            "train": summarize_manifest(paths["split_train"], label_field="target_label"),
+            "val": summarize_manifest(paths["split_val"], label_field="target_label"),
+            "test": summarize_manifest(paths["split_test"], label_field="target_label"),
+            "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
+            "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
+            "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
+        }
+        if not lite
+        else {}
+    )
+    current_dataset_summary = {
+        "raw": summarize_manifest(paths["current_raw_manifest"], label_field="target_label"),
+        "train": summarize_manifest(paths["current_split_train"], label_field="target_label"),
+        "val": summarize_manifest(paths["current_split_val"], label_field="target_label"),
+        "test": summarize_manifest(paths["current_split_test"], label_field="target_label"),
+        "prepared_train": summarize_manifest(paths["current_prepared_train"], label_field="target_label"),
+        "prepared_val": summarize_manifest(paths["current_prepared_val"], label_field="target_label"),
+        "prepared_test": summarize_manifest(paths["current_prepared_test"], label_field="target_label"),
+    }
+    if "train_distribution" not in training_progress and dataset_summary:
+        training_progress["train_distribution"] = analyze_class_balance(
+            target_labels,
+            dataset_summary["prepared_train"].get("by_label"),
+        )
+    if "val_distribution" not in training_progress and dataset_summary:
+        training_progress["val_distribution"] = analyze_class_balance(
+            target_labels,
+            dataset_summary["prepared_val"].get("by_label"),
+        )
+    if "train_distribution" not in metrics and dataset_summary:
+        metrics["train_distribution"] = analyze_class_balance(
+            target_labels,
+            dataset_summary["prepared_train"].get("by_label"),
+        )
+    if "val_distribution" not in metrics and dataset_summary:
+        metrics["val_distribution"] = analyze_class_balance(
+            target_labels,
+            dataset_summary["prepared_val"].get("by_label"),
+        )
 
     overview = {
         "overview_revision": overview_revision,
@@ -4453,28 +4618,8 @@ def build_overview(
                 "tail": latest_error_log_tail,
             },
         } if not lite else {},
-        "dataset": (
-            {
-                "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
-                "train": summarize_manifest(paths["split_train"], label_field="target_label"),
-                "val": summarize_manifest(paths["split_val"], label_field="target_label"),
-                "test": summarize_manifest(paths["split_test"], label_field="target_label"),
-                "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
-                "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
-                "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
-            }
-            if not lite
-            else {}
-        ),
-        "current_dataset": {
-            "raw": summarize_manifest(paths["current_raw_manifest"], label_field="target_label"),
-            "train": summarize_manifest(paths["current_split_train"], label_field="target_label"),
-            "val": summarize_manifest(paths["current_split_val"], label_field="target_label"),
-            "test": summarize_manifest(paths["current_split_test"], label_field="target_label"),
-            "prepared_train": summarize_manifest(paths["current_prepared_train"], label_field="target_label"),
-            "prepared_val": summarize_manifest(paths["current_prepared_val"], label_field="target_label"),
-            "prepared_test": summarize_manifest(paths["current_prepared_test"], label_field="target_label"),
-        },
+        "dataset": dataset_summary,
+        "current_dataset": current_dataset_summary,
         "continual_state": read_json(paths["continual_state"]),
         "artifacts": {
             "has_model": (paths["artifacts_dir"] / "best_action_model.pt").exists(),

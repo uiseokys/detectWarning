@@ -10,6 +10,8 @@ from pathlib import Path
 STATE_SCHEMA_VERSION = 1
 MANIFEST_SUMMARY_CACHE: dict[tuple[str, str], dict] = {}
 MANIFEST_SUMMARY_CACHE_LOCK = threading.Lock()
+DEFAULT_IMBALANCE_WARN_MIN_SAMPLES = 8
+DEFAULT_IMBALANCE_WARN_RATIO = 5.0
 
 
 def now_iso() -> str:
@@ -73,6 +75,105 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
                 "value": summary,
             }
     return dict(summary)
+
+
+def build_label_counts(labels: list[str], by_label: dict | None) -> list[dict]:
+    counts = by_label or {}
+    normalized_labels = normalize_label_list(labels)
+    rows: list[dict] = []
+    for label in normalized_labels:
+        rows.append(
+            {
+                "label": label,
+                "count": int(counts.get(label, 0) or 0),
+            }
+        )
+    return rows
+
+
+def analyze_class_balance(
+    labels: list[str],
+    by_label: dict | None,
+    *,
+    min_samples: int = DEFAULT_IMBALANCE_WARN_MIN_SAMPLES,
+    ratio_warn: float = DEFAULT_IMBALANCE_WARN_RATIO,
+) -> dict:
+    rows = build_label_counts(labels, by_label)
+    nonzero_rows = [row for row in rows if int(row.get("count", 0) or 0) > 0]
+    empty_labels = [row["label"] for row in rows if int(row.get("count", 0) or 0) <= 0]
+    low_sample_rows = [
+        {"label": row["label"], "count": int(row.get("count", 0) or 0)}
+        for row in nonzero_rows
+        if int(row.get("count", 0) or 0) < max(int(min_samples), 1)
+    ]
+
+    dominant = max(nonzero_rows, key=lambda row: int(row.get("count", 0) or 0), default=None)
+    minority = min(nonzero_rows, key=lambda row: int(row.get("count", 0) or 0), default=None)
+    dominant_count = int(dominant.get("count", 0) or 0) if dominant else 0
+    minority_count = int(minority.get("count", 0) or 0) if minority else 0
+    imbalance_ratio = (
+        round(dominant_count / minority_count, 3)
+        if dominant_count > 0 and minority_count > 0
+        else None
+    )
+
+    messages: list[str] = []
+    severity = "ok"
+    if empty_labels:
+        severity = "critical"
+        messages.append(f"비어 있는 클래스: {', '.join(empty_labels)}")
+    if low_sample_rows:
+        severity = "warning" if severity == "ok" else severity
+        summary = ", ".join(f"{row['label']} {row['count']}" for row in low_sample_rows[:5])
+        if len(low_sample_rows) > 5:
+            summary = f"{summary} 외 {len(low_sample_rows) - 5}개"
+        messages.append(f"샘플이 적은 클래스: {summary}")
+    if imbalance_ratio is not None and imbalance_ratio >= float(ratio_warn):
+        severity = "warning" if severity == "ok" else severity
+        messages.append(
+            "클래스 편중이 큽니다: "
+            f"{dominant.get('label') if dominant else '-'} {dominant_count} / "
+            f"{minority.get('label') if minority else '-'} {minority_count}"
+        )
+
+    if not messages:
+        messages.append("클래스 분포가 크게 치우치지 않았습니다.")
+
+    return {
+        "severity": severity,
+        "counts": rows,
+        "covered": len(nonzero_rows),
+        "total": len(rows),
+        "empty_labels": empty_labels,
+        "low_sample_labels": low_sample_rows,
+        "dominant_label": dominant.get("label") if dominant else None,
+        "dominant_count": dominant_count,
+        "minority_label": minority.get("label") if minority else None,
+        "minority_count": minority_count,
+        "imbalance_ratio": imbalance_ratio,
+        "messages": messages,
+        "min_samples": int(min_samples),
+        "ratio_warn": float(ratio_warn),
+    }
+
+
+def summarize_stage_timings(stage_timings: dict | None) -> dict:
+    timings = stage_timings if isinstance(stage_timings, dict) else {}
+    ordered = []
+    for key in ("download", "prepare", "train", "total"):
+        info = timings.get(key) if isinstance(timings.get(key), dict) else {}
+        ordered.append(
+            {
+                "stage": key,
+                "started_at": info.get("started_at"),
+                "finished_at": info.get("finished_at"),
+                "duration_seconds": info.get("duration_seconds"),
+            }
+        )
+    return {
+        "ordered": ordered,
+        "by_stage": {row["stage"]: row for row in ordered},
+    }
 
 
 def normalize_label_list(labels) -> list[str]:

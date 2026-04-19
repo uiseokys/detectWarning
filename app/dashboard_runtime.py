@@ -141,6 +141,8 @@ def persist_launcher_history(launcher_history_path: Path, launcher_state: dict) 
 
 
 def collect_result_summary(paths: dict) -> dict:
+    pipeline_status = read_json(paths["pipeline_status"]) or {}
+    training_progress = read_json(paths["training_progress"]) or {}
     current_skip_report = read_json(paths["current_skip_report"]) or {}
     current_skip_summary = current_skip_report.get("summary", {}) if isinstance(current_skip_report, dict) else {}
     return {
@@ -154,6 +156,12 @@ def collect_result_summary(paths: dict) -> dict:
         "broken_count": int(current_skip_summary.get("broken_count", 0) or 0),
         "skipped_count": int(current_skip_summary.get("skipped_count", 0) or 0),
         "total_issues": int(current_skip_summary.get("total_issues", 0) or 0),
+        "stage_timings": pipeline_status.get("stage_timings") or {},
+        "total_duration_seconds": pipeline_status.get("total_duration_seconds"),
+        "stopped_early": bool(training_progress.get("stopped_early")),
+        "stop_reason": training_progress.get("stop_reason"),
+        "train_distribution": training_progress.get("train_distribution") or {},
+        "val_distribution": training_progress.get("val_distribution") or {},
     }
 
 

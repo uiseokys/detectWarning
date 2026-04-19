@@ -899,6 +899,37 @@
       return `${mins}분`;
     }
 
+    function formatSecondsDuration(seconds) {
+      if (seconds === null || seconds === undefined || seconds === "") return "-";
+      const total = Number(seconds);
+      if (Number.isNaN(total)) return String(seconds);
+      const rounded = Math.max(0, Math.round(total));
+      const hours = Math.floor(rounded / 3600);
+      const minutes = Math.floor((rounded % 3600) / 60);
+      const secs = rounded % 60;
+      if (hours > 0) return `${hours}시간 ${minutes}분`;
+      if (minutes > 0) return `${minutes}분 ${secs}초`;
+      return `${secs}초`;
+    }
+
+    function formatDistributionSummary(distribution) {
+      if (!distribution) return "-";
+      const severity = String(distribution.severity || "ok");
+      const covered = `${distribution.covered ?? 0}/${distribution.total ?? 0}`;
+      const ratio = distribution.imbalance_ratio !== null && distribution.imbalance_ratio !== undefined
+        ? `ratio ${Number(distribution.imbalance_ratio).toFixed(2)}`
+        : "ratio -";
+      return `${severity} · ${covered} · ${ratio}`;
+    }
+
+    function formatStageTimingSummary(stageTimings) {
+      const stages = stageTimings?.ordered || [];
+      const parts = stages
+        .filter((row) => row.stage !== "total" && row.duration_seconds !== null && row.duration_seconds !== undefined)
+        .map((row) => `${row.stage} ${formatSecondsDuration(row.duration_seconds)}`);
+      return parts.length ? parts.join(" · ") : "-";
+    }
+
     function stateLabel(state) {
       if (state === "completed") return "완료";
       if (state === "completed_warning") return "경고 종료";
@@ -1077,6 +1108,9 @@
       const artifacts = report.artifacts || {};
       const continualState = report.continual_state || {};
       const issues = report.issues?.summary || {};
+      const trainDistribution = report.train_distribution || {};
+      const valDistribution = report.val_distribution || {};
+      const stageTimings = report.stage_timings || {};
 
       document.getElementById("latestJobState").innerHTML =
         `<span class="${stateClass(latestJob.state)}">${stateLabel(latestJob.state)}</span>`;
@@ -1113,6 +1147,11 @@
         filekey: ${escapeHtml(latestJob.filekey || "-")}<br />
         시작: ${formatDateTime(latestJob.started_at)}<br />
         종료: ${formatDateTime(latestJob.finished_at)}<br />
+        조기 종료: ${summary.stopped_early ? "예" : "아니오"}<br />
+        단계별 소요: ${escapeHtml(formatStageTimingSummary(stageTimings))}<br />
+        총 소요: ${escapeHtml(formatSecondsDuration(summary.total_duration_seconds))}<br />
+        train 분포: ${escapeHtml(formatDistributionSummary(trainDistribution))}<br />
+        val 분포: ${escapeHtml(formatDistributionSummary(valDistribution))}<br />
         모델: ${escapeHtml(artifacts.best_model || "-")}<br />
         메트릭: ${escapeHtml(artifacts.metrics || "-")}<br />
         라벨: ${escapeHtml(artifacts.labels || "-")}<br /><br />

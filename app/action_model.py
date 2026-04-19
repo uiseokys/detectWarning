@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import inspect
 from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+from reporting import analyze_class_balance
 
 
 @dataclass
@@ -208,6 +211,7 @@ def train_action_classifier(
     labels: list[str],
     epochs: int = 20,
     batch_size: int = 16,
+    eval_batch_size: int | None = None,
     learning_rate: float = 1e-3,
     hidden_dim: int = 128,
     num_layers: int = 2,
@@ -215,11 +219,17 @@ def train_action_classifier(
     num_workers: int | str = 0,
     device: str = "cuda",
     amp: bool = True,
+    amp_dtype: str = "auto",
     compile_model: bool = False,
     compile_backend: str | None = None,
     dataset_cache_size: int = 2048,
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
+    pin_memory: bool | str = "auto",
+    early_stopping_patience: int = 5,
+    early_stopping_min_delta: float = 0.001,
+    imbalance_warn_min_samples: int = 8,
+    imbalance_warn_ratio: float = 5.0,
     progress_path: Path | None = None,
     resume_from: Path | None = None,
 ) -> TrainingArtifacts:
@@ -228,32 +238,50 @@ def train_action_classifier(
     metrics_path = output_dir / "metrics.json"
     best_model_path = output_dir / "best_action_model.pt"
 
-    train_dataset = PoseSequenceDataset(train_manifest, cache_size=dataset_cache_size)
-    val_dataset = PoseSequenceDataset(val_manifest, cache_size=dataset_cache_size)
-
     use_cuda = _uses_cuda(device)
     use_amp = bool(amp and use_cuda and torch.cuda.is_available())
-    resolved_num_workers = _resolve_num_workers(num_workers, batch_size=batch_size)
+    resolved_amp_dtype, resolved_amp_dtype_label = _resolve_amp_dtype(
+        device=device,
+        enabled=use_amp,
+        requested_dtype=amp_dtype,
+    )
+    resolved_batch_size = max(int(batch_size), 1)
+    resolved_eval_batch_size = _resolve_eval_batch_size(eval_batch_size, train_batch_size=resolved_batch_size)
+    resolved_num_workers = _resolve_num_workers(num_workers, batch_size=resolved_batch_size)
     resolved_prefetch_factor = max(int(prefetch_factor), 1)
     use_persistent_workers = bool(persistent_workers and resolved_num_workers > 0)
+    use_pin_memory = _resolve_pin_memory(pin_memory, use_cuda=use_cuda)
+    resolved_pin_memory_device = _resolve_pin_memory_device(
+        use_pin_memory=use_pin_memory,
+        device=device,
+    )
+    effective_cache_size = _resolve_dataset_cache_size(
+        dataset_cache_size,
+        num_workers=resolved_num_workers,
+    )
+
+    train_dataset = PoseSequenceDataset(train_manifest, cache_size=effective_cache_size)
+    val_dataset = PoseSequenceDataset(val_manifest, cache_size=effective_cache_size)
 
     _configure_training_acceleration(device=device, use_cuda=use_cuda)
 
     train_loader = _build_dataloader(
         dataset=train_dataset,
-        batch_size=batch_size,
+        batch_size=resolved_batch_size,
         shuffle=True,
         num_workers=resolved_num_workers,
-        pin_memory=use_cuda,
+        pin_memory=use_pin_memory,
+        pin_memory_device=resolved_pin_memory_device,
         prefetch_factor=resolved_prefetch_factor,
         persistent_workers=use_persistent_workers,
     )
     val_loader = _build_dataloader(
         dataset=val_dataset,
-        batch_size=batch_size,
+        batch_size=resolved_eval_batch_size,
         shuffle=False,
         num_workers=resolved_num_workers,
-        pin_memory=use_cuda,
+        pin_memory=use_pin_memory,
+        pin_memory_device=resolved_pin_memory_device,
         prefetch_factor=resolved_prefetch_factor,
         persistent_workers=use_persistent_workers,
     )
@@ -314,21 +342,53 @@ def train_action_classifier(
     history: list[dict] = []
     best_val_f1 = -1.0
     best_epoch = 0
+    effective_patience = max(int(early_stopping_patience), 0)
+    effective_min_delta = max(float(early_stopping_min_delta), 0.0)
+    epochs_without_improvement = 0
+    stopped_early = False
+    stop_reason: str | None = None
     train_sample_count = len(train_dataset)
     val_sample_count = len(val_dataset)
+    train_distribution = _summarize_class_distribution(
+        train_dataset.samples,
+        labels,
+        min_samples=imbalance_warn_min_samples,
+        ratio_warn=imbalance_warn_ratio,
+    )
+    val_distribution = _summarize_class_distribution(
+        val_dataset.samples,
+        labels,
+        min_samples=imbalance_warn_min_samples,
+        ratio_warn=imbalance_warn_ratio,
+    )
 
     print(
         "[train] acceleration "
         f"device={device} "
         f"amp={'on' if use_amp else 'off'} "
+        f"amp_dtype={resolved_amp_dtype_label} "
         f"compile={'on' if compiled_model else 'off'} "
         f"compile_backend={compiled_backend} "
         f"resume={resume_mode} "
-        f"cache={dataset_cache_size} "
+        f"batch(train/val)={resolved_batch_size}/{resolved_eval_batch_size} "
+        f"cache={effective_cache_size} "
         f"workers={resolved_num_workers} "
+        f"pin_memory={'on' if use_pin_memory else 'off'} "
         f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
         f"persistent={'on' if use_persistent_workers else 'off'}"
     )
+    if train_distribution.get("messages"):
+        print(
+            "[train] class-balance "
+            f"train={train_distribution.get('severity')} | "
+            + " / ".join(str(message) for message in train_distribution.get("messages", []))
+        )
+    if val_distribution.get("messages"):
+        print(
+            "[train] class-balance "
+            f"val={val_distribution.get('severity')} | "
+            + " / ".join(str(message) for message in val_distribution.get("messages", []))
+        )
 
     if progress_path is not None:
         _write_progress(
@@ -348,12 +408,28 @@ def train_action_classifier(
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
+                "amp_dtype": resolved_amp_dtype_label,
                 "compile_enabled": compiled_model,
                 "compile_backend": compiled_backend,
-                "dataset_cache_size": dataset_cache_size,
+                "batch_size": resolved_batch_size,
+                "eval_batch_size": resolved_eval_batch_size,
+                "dataset_cache_size": effective_cache_size,
                 "num_workers": resolved_num_workers,
+                "pin_memory": use_pin_memory,
+                "pin_memory_device": resolved_pin_memory_device,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
+                "train_distribution": train_distribution,
+                "val_distribution": val_distribution,
+                "stopped_early": False,
+                "stop_reason": None,
+                "early_stopping": {
+                    "enabled": effective_patience > 0,
+                    "patience": effective_patience,
+                    "min_delta": effective_min_delta,
+                    "metric": "val_macro_f1",
+                    "epochs_without_improvement": 0,
+                },
             },
         )
 
@@ -367,6 +443,7 @@ def train_action_classifier(
             device=device,
             train=True,
             use_amp=use_amp,
+            amp_dtype=resolved_amp_dtype,
             scaler=scaler,
         )
         val_metrics = _evaluate(
@@ -376,6 +453,7 @@ def train_action_classifier(
             device=device,
             num_classes=len(labels),
             use_amp=use_amp,
+            amp_dtype=resolved_amp_dtype,
         )
         scheduler.step()
 
@@ -399,9 +477,11 @@ def train_action_classifier(
             f"val_f1={val_metrics['macro_f1']:.4f}"
         )
 
-        if val_metrics["macro_f1"] >= best_val_f1:
+        improved = val_metrics["macro_f1"] > (best_val_f1 + effective_min_delta)
+        if best_epoch == 0 or improved:
             best_val_f1 = val_metrics["macro_f1"]
             best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": base_model.state_dict(),
@@ -414,6 +494,8 @@ def train_action_classifier(
                 },
                 best_model_path,
             )
+        else:
+            epochs_without_improvement += 1
 
         if progress_path is not None:
             _write_progress(
@@ -433,24 +515,56 @@ def train_action_classifier(
                     "train_samples": train_sample_count,
                     "val_samples": val_sample_count,
                     "amp_enabled": use_amp,
+                    "amp_dtype": resolved_amp_dtype_label,
                     "compile_enabled": compiled_model,
                     "compile_backend": compiled_backend,
+                    "batch_size": resolved_batch_size,
+                    "eval_batch_size": resolved_eval_batch_size,
                     "num_workers": resolved_num_workers,
+                    "pin_memory": use_pin_memory,
+                    "pin_memory_device": resolved_pin_memory_device,
                     "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                     "persistent_workers": use_persistent_workers,
+                    "train_distribution": train_distribution,
+                    "val_distribution": val_distribution,
+                    "stopped_early": False,
+                    "stop_reason": None,
+                    "early_stopping": {
+                        "enabled": effective_patience > 0,
+                        "patience": effective_patience,
+                        "min_delta": effective_min_delta,
+                        "metric": "val_macro_f1",
+                        "epochs_without_improvement": epochs_without_improvement,
+                    },
                 },
             )
+
+        if effective_patience > 0 and epochs_without_improvement >= effective_patience:
+            stopped_early = True
+            stop_reason = (
+                f"val_macro_f1가 {effective_patience} epoch 동안 "
+                f"{effective_min_delta:.4f} 이상 개선되지 않아 조기 종료합니다."
+            )
+            print(f"[train] early stopping triggered: {stop_reason}")
+            break
 
     with labels_path.open("w", encoding="utf-8") as handle:
         json.dump({"labels": labels}, handle, ensure_ascii=False, indent=2)
 
+    if best_model_path.exists():
+        best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=True)
+        best_state = best_checkpoint.get("model_state_dict", {}) or {}
+        if best_state:
+            base_model.load_state_dict(best_state, strict=False)
+
     final_metrics = _evaluate(
-        model=model,
+        model=base_model,
         loader=val_loader,
         criterion=criterion,
         device=device,
         num_classes=len(labels),
         use_amp=use_amp,
+        amp_dtype=resolved_amp_dtype,
     )
     with metrics_path.open("w", encoding="utf-8") as handle:
         json.dump(
@@ -462,11 +576,27 @@ def train_action_classifier(
                 "resumed_from_checkpoint": resumed_from_checkpoint,
                 "resume_mode": resume_mode,
                 "amp_enabled": use_amp,
+                "amp_dtype": resolved_amp_dtype_label,
                 "compile_enabled": compiled_model,
                 "compile_backend": compiled_backend,
+                "batch_size": resolved_batch_size,
+                "eval_batch_size": resolved_eval_batch_size,
                 "num_workers": resolved_num_workers,
+                "pin_memory": use_pin_memory,
+                "pin_memory_device": resolved_pin_memory_device,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
+                "train_distribution": train_distribution,
+                "val_distribution": val_distribution,
+                "stopped_early": stopped_early,
+                "stop_reason": stop_reason,
+                "early_stopping": {
+                    "enabled": effective_patience > 0,
+                    "patience": effective_patience,
+                    "min_delta": effective_min_delta,
+                    "metric": "val_macro_f1",
+                    "epochs_without_improvement": epochs_without_improvement,
+                },
             },
             handle,
             ensure_ascii=False,
@@ -480,7 +610,7 @@ def train_action_classifier(
                 "state": "completed",
                 "device": device,
                 "epochs_total": epochs,
-                "epochs_completed": epochs,
+                "epochs_completed": len(history),
                 "best_val_macro_f1": round(best_val_f1, 6),
                 "best_epoch": best_epoch,
                 "latest": history[-1] if history else None,
@@ -492,11 +622,27 @@ def train_action_classifier(
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
                 "amp_enabled": use_amp,
+                "amp_dtype": resolved_amp_dtype_label,
                 "compile_enabled": compiled_model,
                 "compile_backend": compiled_backend,
+                "batch_size": resolved_batch_size,
+                "eval_batch_size": resolved_eval_batch_size,
                 "num_workers": resolved_num_workers,
+                "pin_memory": use_pin_memory,
+                "pin_memory_device": resolved_pin_memory_device,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
+                "train_distribution": train_distribution,
+                "val_distribution": val_distribution,
+                "stopped_early": stopped_early,
+                "stop_reason": stop_reason,
+                "early_stopping": {
+                    "enabled": effective_patience > 0,
+                    "patience": effective_patience,
+                    "min_delta": effective_min_delta,
+                    "metric": "val_macro_f1",
+                    "epochs_without_improvement": epochs_without_improvement,
+                },
             },
         )
 
@@ -516,6 +662,28 @@ def _build_class_weights(samples: list[dict], num_classes: int) -> torch.Tensor:
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def _summarize_class_distribution(
+    samples: list[dict],
+    labels: list[str],
+    *,
+    min_samples: int,
+    ratio_warn: float,
+) -> dict:
+    by_label: dict[str, int] = {label: 0 for label in labels}
+    for sample in samples:
+        label_idx = int(sample.get("label_idx", -1) or -1)
+        if 0 <= label_idx < len(labels):
+            by_label[labels[label_idx]] = int(by_label.get(labels[label_idx], 0) or 0) + 1
+    summary = analyze_class_balance(
+        labels,
+        by_label,
+        min_samples=min_samples,
+        ratio_warn=ratio_warn,
+    )
+    summary["total_samples"] = len(samples)
+    return summary
+
+
 def _run_epoch(
     *,
     model: nn.Module,
@@ -525,6 +693,7 @@ def _run_epoch(
     device: str,
     train: bool,
     use_amp: bool,
+    amp_dtype: torch.dtype | None,
     scaler,
 ) -> float:
     if train:
@@ -543,7 +712,7 @@ def _run_epoch(
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        with _autocast_context(device=device, enabled=use_amp):
+        with _autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype):
             logits = model(pose, mask)
             loss = criterion(logits, labels)
 
@@ -572,6 +741,7 @@ def _evaluate(
     device: str,
     num_classes: int,
     use_amp: bool,
+    amp_dtype: torch.dtype | None,
 ) -> dict:
     model.eval()
     total_loss = 0.0
@@ -583,7 +753,7 @@ def _evaluate(
         mask = mask.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with _autocast_context(device=device, enabled=use_amp):
+        with _autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype):
             logits = model(pose, mask)
             loss = criterion(logits, labels)
         preds = logits.argmax(dim=1)
@@ -656,6 +826,7 @@ def _build_dataloader(
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
+    pin_memory_device: str | None,
     prefetch_factor: int,
     persistent_workers: bool,
 ) -> DataLoader:
@@ -665,6 +836,8 @@ def _build_dataloader(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
+    if pin_memory and pin_memory_device and "pin_memory_device" in inspect.signature(DataLoader).parameters:
+        kwargs["pin_memory_device"] = pin_memory_device
     if num_workers > 0:
         kwargs["prefetch_factor"] = prefetch_factor
         kwargs["persistent_workers"] = persistent_workers
@@ -693,11 +866,54 @@ def _resolve_num_workers(value: int | str, *, batch_size: int) -> int:
     return min(auto_workers, max(int(batch_size), 1))
 
 
+def _resolve_eval_batch_size(value: int | None, *, train_batch_size: int) -> int:
+    if value is None:
+        requested = 0
+    else:
+        requested = int(value)
+    if requested > 0:
+        return requested
+    return max(train_batch_size, train_batch_size * 2)
+
+
+def _resolve_dataset_cache_size(value: int, *, num_workers: int) -> int:
+    requested = max(int(value), 0)
+    if requested == 0:
+        return 0
+    if num_workers <= 0:
+        return requested
+    return max(128, requested // (num_workers + 1))
+
+
+def _resolve_pin_memory(value: bool | str, *, use_cuda: bool) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "auto", "default"}:
+            return bool(use_cuda)
+        return normalized in {"1", "true", "yes", "on"}
+    return bool(value and use_cuda)
+
+
+def _resolve_pin_memory_device(*, use_pin_memory: bool, device: str) -> str | None:
+    if not use_pin_memory:
+        return None
+    if not _uses_cuda(device):
+        return None
+    if device.strip().lower() == "cuda":
+        return "cuda"
+    return str(device).strip()
+
+
 def _configure_training_acceleration(*, device: str, use_cuda: bool) -> None:
     if not use_cuda:
         return
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = True
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
@@ -717,15 +933,48 @@ def _create_grad_scaler(*, enabled: bool):
     return None
 
 
-def _autocast_context(*, device: str, enabled: bool):
+def _resolve_amp_dtype(*, device: str, enabled: bool, requested_dtype: str | None) -> tuple[torch.dtype | None, str]:
+    if not enabled or not _uses_cuda(device):
+        return None, "disabled"
+
+    normalized = str(requested_dtype or "auto").strip().lower()
+    if normalized in {"float16", "fp16", "half"}:
+        return torch.float16, "float16"
+    if normalized in {"bfloat16", "bf16"}:
+        is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+        if callable(is_bf16_supported) and is_bf16_supported():
+            return torch.bfloat16, "bfloat16"
+        return torch.float16, "float16"
+
+    is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+    if callable(is_bf16_supported) and is_bf16_supported():
+        return torch.bfloat16, "bfloat16"
+    return torch.float16, "float16"
+
+
+def _autocast_context(*, device: str, enabled: bool, amp_dtype: torch.dtype | None):
     if not enabled:
         return nullcontext()
     device_type = "cuda" if _uses_cuda(device) else "cpu"
     if hasattr(torch, "autocast"):
-        return torch.autocast(device_type=device_type, enabled=True)
+        kwargs = {"device_type": device_type, "enabled": True}
+        if amp_dtype is not None:
+            kwargs["dtype"] = amp_dtype
+        try:
+            return torch.autocast(**kwargs)
+        except TypeError:
+            kwargs.pop("dtype", None)
+            return torch.autocast(**kwargs)
     amp_module = getattr(torch.cuda, "amp", None)
     if amp_module is not None and hasattr(amp_module, "autocast"):
-        return amp_module.autocast(enabled=True)
+        kwargs = {"enabled": True}
+        if amp_dtype is not None:
+            kwargs["dtype"] = amp_dtype
+        try:
+            return amp_module.autocast(**kwargs)
+        except TypeError:
+            kwargs.pop("dtype", None)
+            return amp_module.autocast(**kwargs)
     return nullcontext()
 
 
