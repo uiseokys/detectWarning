@@ -630,6 +630,19 @@ def create_app(config_path: Path) -> FastAPI:
             persist_launcher_history(launcher_history_path, launcher_state)
             launcher_state["last_message"] = "기존 job 로그를 바탕으로 학습 완료 이력을 복구했습니다."
 
+    def reload_completed_jobs_from_history() -> list[dict]:
+        history_payload = read_json(launcher_history_path) or {}
+        completed_jobs = history_payload.get("completed_jobs", [])
+        if isinstance(completed_jobs, list) and completed_jobs:
+            launcher_state["completed_jobs"] = completed_jobs
+            return completed_jobs
+        restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
+        if restored_jobs:
+            launcher_state["completed_jobs"] = restored_jobs
+            persist_launcher_history(launcher_history_path, launcher_state)
+            return restored_jobs
+        return []
+
     workspace_default_dir = paths.get("workspace_default_dir")
     workspace_source = str(paths.get("workspace_source") or "config")
     workspace_override_env = str(paths.get("workspace_override_env") or "").strip()
@@ -922,6 +935,8 @@ def create_app(config_path: Path) -> FastAPI:
             current_job = snapshot_job(launcher_state.get("current_job"))
             queued_jobs = launcher_state.get("queued_jobs", [])
             completed_jobs = launcher_state.get("completed_jobs", [])
+            if (not isinstance(completed_jobs, list) or not completed_jobs) and current_job is None:
+                completed_jobs = reload_completed_jobs_from_history()
         return {
             "state": launcher_state.get("last_state", "idle"),
             "message": launcher_state.get("last_message", ""),
