@@ -1,6 +1,60 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from html import escape
+
+STATE_LABELS = {
+    "completed": "완료",
+    "completed_warning": "경고 포함 완료",
+    "online": "온라인",
+    "running": "실행 중",
+    "queued": "대기 중",
+    "paused": "일시 중지",
+    "prepare": "전처리",
+    "download": "다운로드",
+    "train": "학습 중",
+    "warning": "주의",
+    "error": "오류",
+    "aborted": "중단됨",
+    "offline": "오프라인",
+    "idle": "대기",
+    "starting": "시작 중",
+}
+
+SPLIT_LABELS = {
+    "raw": "원본",
+    "train": "학습",
+    "val": "검증",
+    "test": "테스트",
+    "prepared_train": "전처리 학습",
+    "prepared_val": "전처리 검증",
+    "prepared_test": "전처리 테스트",
+}
+
+RESUME_MODE_LABELS = {
+    "full": "이전 체크포인트 이어서",
+    "new": "새로 시작",
+    "none": "새로 시작",
+}
+
+SPLIT_SEQUENCE = (
+    "raw",
+    "train",
+    "val",
+    "test",
+    "prepared_train",
+    "prepared_val",
+    "prepared_test",
+)
+
+SECTION_NAV_ITEMS = (
+    ("overview", "개요"),
+    ("training", "학습"),
+    ("dataset", "데이터셋"),
+    ("validation", "검증"),
+    ("jobs", "작업"),
+    ("logs", "로그"),
+)
 
 
 def _text(value, default: str = "-") -> str:
@@ -51,53 +105,22 @@ def _state_tone(state: str | None) -> str:
 
 def _state_label(state: str | None) -> str:
     normalized = str(state or "").strip().lower()
-    labels = {
-        "completed": "완료",
-        "completed_warning": "경고 포함 완료",
-        "online": "온라인",
-        "running": "실행 중",
-        "queued": "대기 중",
-        "paused": "일시 중지",
-        "prepare": "전처리",
-        "download": "다운로드",
-        "train": "학습 중",
-        "warning": "주의",
-        "error": "오류",
-        "aborted": "중단됨",
-        "offline": "오프라인",
-        "idle": "대기",
-        "starting": "시작 중",
-    }
-    if normalized in labels:
-        return labels[normalized]
+    if normalized in STATE_LABELS:
+        return STATE_LABELS[normalized]
     return _text(state)
 
 
 def _split_label(name: str | None) -> str:
     normalized = str(name or "").strip().lower()
-    labels = {
-        "raw": "원본",
-        "train": "학습",
-        "val": "검증",
-        "test": "테스트",
-        "prepared_train": "전처리 학습",
-        "prepared_val": "전처리 검증",
-        "prepared_test": "전처리 테스트",
-    }
-    if normalized in labels:
-        return labels[normalized]
+    if normalized in SPLIT_LABELS:
+        return SPLIT_LABELS[normalized]
     return _text(name)
 
 
 def _resume_mode_label(value: str | None) -> str:
     normalized = str(value or "").strip().lower()
-    labels = {
-        "full": "이전 체크포인트 이어서",
-        "new": "새로 시작",
-        "none": "새로 시작",
-    }
-    if normalized in labels:
-        return labels[normalized]
+    if normalized in RESUME_MODE_LABELS:
+        return RESUME_MODE_LABELS[normalized]
     return _text(value)
 
 
@@ -109,9 +132,7 @@ def _render_table(headers: list[str], rows: list[list[str]], empty_message: str,
             for row in rows
         )
     else:
-        body_html = (
-            f"<tr><td colspan=\"{len(headers)}\" class=\"empty-cell\">{_text(empty_message)}</td></tr>"
-        )
+        body_html = f"<tr><td colspan=\"{len(headers)}\" class=\"empty-cell\">{_text(empty_message)}</td></tr>"
     compact_class = " data-table-compact" if compact else ""
     return (
         "<div class=\"table-wrap\">"
@@ -146,21 +167,28 @@ def _render_banner(message: str, tone: str, title: str) -> str:
 
 
 def _render_warning_banner(diagnostics: dict) -> str:
-    warnings = diagnostics.get("warnings") or []
+    warnings = list(diagnostics.get("warnings") or [])
     if not warnings:
         return ""
     items = "".join(f"<li>{_text(item)}</li>" for item in warnings)
     return (
         "<section class=\"banner banner-warn\">"
         "<div class=\"banner-title\">상태 진단</div>"
-        f"<ul class=\"banner-list\">{items}</ul>"
+        "<div class=\"banner-copy\">"
+        "<ul class=\"banner-list\">"
+        f"{items}"
+        "</ul>"
+        "</div>"
         "</section>"
     )
 
 
 def _render_diagnostics_details(diagnostics: dict) -> str:
-    files = diagnostics.get("files") or {}
+    if not diagnostics:
+        return ""
     pipeline = diagnostics.get("pipeline") or {}
+    files = diagnostics.get("files") or {}
+
     file_rows = []
     for key, payload in files.items():
         if not isinstance(payload, dict):
@@ -174,21 +202,25 @@ def _render_diagnostics_details(diagnostics: dict) -> str:
                 _text(payload.get("path")),
             ]
         )
+
     pipeline_rows = [[_text("source"), _text(pipeline.get("source"))]]
     for warning in pipeline.get("warnings") or []:
         pipeline_rows.append([_text("warning"), _text(warning)])
+
     return (
         "<details class=\"detail-panel\">"
-        "<summary>진단 상세 보기</summary>"
+        "<summary class=\"detail-summary\">진단 상세 보기</summary>"
+        "<div class=\"detail-body\">"
         "<div class=\"detail-grid\">"
         "<section class=\"mini-panel\">"
-        "<h3>Pipeline 진단</h3>"
-        + _render_table(["kind", "value"], pipeline_rows, "pipeline 진단 정보가 없습니다.", compact=True)
+        "<h3>파이프라인 진단</h3>"
+        + _render_table(["kind", "value"], pipeline_rows, "파이프라인 진단 정보가 없습니다.", compact=True)
         + "</section>"
         "<section class=\"mini-panel\">"
-        "<h3>파일 진단</h3>"
+        "<h3>파일 상태</h3>"
         + _render_table(["file", "exists", "updated_at", "size", "path"], file_rows, "진단 파일 정보가 없습니다.", compact=True)
         + "</section>"
+        "</div>"
         "</div>"
         "</details>"
     )
@@ -204,6 +236,7 @@ def _render_actions_panel(default_datasetkey: str, controls_enabled: bool) -> st
             "</div>"
             "</section>"
         )
+
     return (
         "<section class=\"panel sidebar-panel\">"
         "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>스크립트 없이도 동작하는 기본 입력 폼입니다.</p></div></div>"
@@ -251,12 +284,12 @@ def _render_queue_panel(launcher: dict, current_job_progress: dict) -> str:
             "</li>"
         )
     queue_html = "".join(queue_items) or "<li class=\"queue-empty\">대기 중인 작업이 없습니다.</li>"
+
     return (
         "<section class=\"panel sidebar-panel\">"
-        "<div class=\"panel-head\"><div><h2>현재 작업과 대기열</h2><p>현재 상태와 다음 실행 대상을 빠르게 확인합니다.</p></div></div>"
+        "<div class=\"panel-head\"><div><h2>현재 작업과 대기열</h2><p>지금 상태와 다음 실행 대상을 빠르게 확인합니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
         "<div class=\"key-metric-grid\">"
-        f"<div><span>current filekey</span><strong>{_text(current_job.get('filekey'))}</strong></div>"
         f"<div><span>현재 datasetkey</span><strong>{_text(current_job.get('datasetkey'))}</strong></div>"
         f"<div><span>현재 단계</span><strong>{_text(current_job_progress.get('detail'))}</strong></div>"
         f"<div><span>실행 설정</span><strong>{_text(launcher.get('runtime_config_path'))}</strong></div>"
@@ -307,33 +340,1476 @@ def _render_logs(logs: dict) -> str:
         ("latest_error", "최근 오류 로그", False),
     ):
         payload = logs.get(key) or {}
+        body = _text(payload.get("tail"), "표시할 로그가 없습니다.")
         open_attr = " open" if opened else ""
         sections.append(
-            f"<details class=\"detail-panel\"{open_attr}>"
+            f"<details class=\"log-card\"{open_attr}>"
             f"<summary>{_text(title)}</summary>"
-            "<div class=\"detail-body stack\">"
-            f"<div class=\"path-box\"><div class=\"path-label\">path</div><div class=\"path-value\">{_text(payload.get('path'))}</div></div>"
-            f"<pre class=\"log-box\">{_text(payload.get('tail'))}</pre>"
+            "<div class=\"detail-body\">"
+            f"<div class=\"muted-block\">filekey {_text(payload.get('filekey'))} / datasetkey {_text(payload.get('datasetkey'))}</div>"
+            f"<pre class=\"log-box\">{body}</pre>"
             "</div>"
             "</details>"
         )
     return "".join(sections)
 
 
+@lru_cache(maxsize=1)
 def _render_section_nav() -> str:
-    items = [
-        ("overview", "개요"),
-        ("training", "학습"),
-        ("dataset", "데이터셋"),
-        ("validation", "검증"),
-        ("jobs", "작업"),
-        ("logs", "로그"),
-    ]
     return (
         "<nav class=\"section-nav\">"
-        + "".join(f"<a href=\"#{_text(anchor)}\">{_text(label)}</a>" for anchor, label in items)
+        + "".join(f"<a href=\"#{_text(anchor)}\">{_text(label)}</a>" for anchor, label in SECTION_NAV_ITEMS)
         + "</nav>"
     )
+
+
+def _prepared_total_from_job(job: dict) -> int:
+    summary = job.get("result_summary") or {}
+    if not isinstance(summary, dict):
+        return 0
+    return sum(
+        int(summary.get(key) or 0)
+        for key in ("prepared_train_total", "prepared_val_total", "prepared_test_total")
+    )
+
+
+def _coerce_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_dataset_rows(dataset_summary: dict) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for key in SPLIT_SEQUENCE:
+        info = dataset_summary.get(key) or {}
+        rows.append(
+            [
+                _split_label(key),
+                _int_text(info.get("total"), "0"),
+                _text(_join_label_counts(info), "-"),
+            ]
+        )
+    return rows
+
+
+def _build_history_bundle(progress: dict, metrics: dict) -> dict:
+    source_rows = progress.get("history") or metrics.get("history") or []
+    history_rows: list[list[str]] = []
+    epoch_labels: list[str] = []
+    val_accuracy_values: list[float | None] = []
+    val_f1_values: list[float | None] = []
+    train_loss_values: list[float | None] = []
+    val_loss_values: list[float | None] = []
+
+    normalized_rows: list[dict] = []
+    for row in list(source_rows)[-20:]:
+        if not isinstance(row, dict):
+            continue
+        normalized_rows.append(row)
+        epoch_label = _text(row.get("epoch"))
+        train_loss = _coerce_float(row.get("train_loss"))
+        val_loss = _coerce_float(row.get("val_loss"))
+        val_accuracy = _coerce_float(row.get("val_accuracy"))
+        val_macro_f1 = _coerce_float(row.get("val_macro_f1"))
+
+        epoch_labels.append(epoch_label)
+        train_loss_values.append(train_loss)
+        val_loss_values.append(val_loss)
+        val_accuracy_values.append(val_accuracy)
+        val_f1_values.append(val_macro_f1)
+        history_rows.append(
+            [
+                epoch_label,
+                _float_text(train_loss),
+                _float_text(val_loss),
+                _float_text(val_accuracy),
+                _float_text(val_macro_f1),
+                _float_text(_coerce_float(row.get("learning_rate")), 6),
+            ]
+        )
+
+    return {
+        "rows": history_rows,
+        "source_rows": normalized_rows,
+        "epoch_labels": epoch_labels,
+        "train_loss_values": train_loss_values,
+        "val_loss_values": val_loss_values,
+        "val_accuracy_values": val_accuracy_values,
+        "val_f1_values": val_f1_values,
+    }
+
+
+def _build_support_map(confusion: list[list[int]] | None) -> dict[int, int]:
+    support_map: dict[int, int] = {}
+    if isinstance(confusion, list):
+        for index, matrix_row in enumerate(confusion):
+            if isinstance(matrix_row, list):
+                support_map[index] = sum(int(value or 0) for value in matrix_row)
+    return support_map
+
+
+def _build_per_class_rows(final_validation: dict, labels: list[str], support_map: dict[int, int]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for index, row in enumerate(final_validation.get("per_class") or []):
+        if not isinstance(row, dict):
+            continue
+        class_index = int(row.get("class_index", index) or index)
+        label = labels[class_index] if 0 <= class_index < len(labels) else row.get("label") or class_index
+        rows.append(
+            [
+                _text(label),
+                _float_text(row.get("precision"), 4, "-"),
+                _float_text(row.get("recall"), 4, "-"),
+                _float_text(row.get("f1"), 4, "-"),
+                _int_text(support_map.get(class_index), "0"),
+            ]
+        )
+    return rows
+
+
+def _build_recent_job_rows(completed_jobs: list[dict], limit: int = 20) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for job in completed_jobs[:limit]:
+        if not isinstance(job, dict):
+            continue
+        rows.append(
+            [
+                _text(job.get("filekey")),
+                _text(job.get("datasetkey")),
+                _state_label(job.get("state")),
+                _int_text(_prepared_total_from_job(job), "0"),
+                _text(job.get("finished_at") or job.get("started_at")),
+                _text(job.get("message")),
+            ]
+        )
+    return rows
+
+
+def _build_issue_rows(issues: list[dict], limit: int = 20) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for issue in issues[:limit]:
+        if not isinstance(issue, dict):
+            continue
+        rows.append(
+            [
+                _split_label(issue.get("split")),
+                _text(issue.get("video_name")),
+                _text(issue.get("reason")),
+                _int_text(issue.get("valid_frames"), "0"),
+                _int_text(issue.get("confirmed_frames"), "0"),
+            ]
+        )
+    return rows
+
+
+def _build_distribution_entries(dataset: dict, labels: list[str]) -> list[tuple[str, int]]:
+    prepared_train_counts = ((dataset.get("prepared_train") or {}).get("by_label") or {})
+    distribution_labels = labels or sorted(prepared_train_counts.keys())
+    return [
+        (str(label), int(prepared_train_counts.get(label) or 0))
+        for label in distribution_labels
+    ]
+
+
+def _render_line_chart(
+    title: str,
+    subtitle: str,
+    x_labels: list[str],
+    series: list[tuple[str, str, list[float | None]]],
+    *,
+    fixed_min: float | None = None,
+    fixed_max: float | None = None,
+    decimals: int = 4,
+    span_all: bool = False,
+) -> str:
+    valid_values = [value for _, _, values in series for value in values if value is not None]
+    panel_class = "panel chart-panel chart-panel-span" if span_all else "panel chart-panel"
+    if not x_labels or not valid_values:
+        return (
+            f"<article class=\"{panel_class}\">"
+            f"<div class=\"panel-head\"><div><h2>{_text(title)}</h2><p>{_text(subtitle)}</p></div></div>"
+            "<div class=\"panel-body\">"
+            "<div class=\"chart-empty\">그래프를 그릴 학습 기록이 아직 없습니다.</div>"
+            "</div></article>"
+        )
+
+    width = 720
+    height = 280
+    pad_left = 52
+    pad_right = 18
+    pad_top = 20
+    pad_bottom = 38
+    inner_w = width - pad_left - pad_right
+    inner_h = height - pad_top - pad_bottom
+
+    y_min = fixed_min if fixed_min is not None else min(valid_values)
+    y_max = fixed_max if fixed_max is not None else max(valid_values)
+    if y_max <= y_min:
+        y_max = y_min + 1.0
+    if fixed_min is None or fixed_max is None:
+        padding = (y_max - y_min) * 0.12 or 0.1
+        if fixed_min is None:
+            y_min -= padding
+        if fixed_max is None:
+            y_max += padding
+
+    def x_pos(index: int) -> float:
+        if len(x_labels) == 1:
+            return pad_left + inner_w / 2
+        return pad_left + (inner_w * index / (len(x_labels) - 1))
+
+    def y_pos(value: float) -> float:
+        ratio = (value - y_min) / (y_max - y_min)
+        ratio = max(0.0, min(1.0, ratio))
+        return pad_top + (1.0 - ratio) * inner_h
+
+    grid_lines = []
+    for step in range(5):
+        ratio = step / 4
+        y = pad_top + ratio * inner_h
+        tick_value = y_max - ((y_max - y_min) * ratio)
+        grid_lines.append(
+            f"<line x1=\"{pad_left}\" y1=\"{y:.2f}\" x2=\"{width - pad_right}\" y2=\"{y:.2f}\" class=\"chart-grid-line\" />"
+            f"<text x=\"{pad_left - 10}\" y=\"{y + 4:.2f}\" text-anchor=\"end\" class=\"chart-axis-label\">{tick_value:.{decimals}f}</text>"
+        )
+
+    tick_indexes = sorted(set([0, len(x_labels) - 1] + list(range(0, len(x_labels), max(1, len(x_labels) // 5 or 1)))))
+    x_ticks = []
+    for index in tick_indexes:
+        x = x_pos(index)
+        x_ticks.append(
+            f"<text x=\"{x:.2f}\" y=\"{height - 12}\" text-anchor=\"middle\" class=\"chart-axis-label\">{_text(x_labels[index])}</text>"
+        )
+
+    series_paths: list[str] = []
+    legend_items: list[str] = []
+    for name, color, values in series:
+        segments: list[list[tuple[float, float]]] = []
+        current_segment: list[tuple[float, float]] = []
+        points_markup: list[str] = []
+        last_value = None
+        for index, value in enumerate(values):
+            if value is None:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            x = x_pos(index)
+            y = y_pos(value)
+            current_segment.append((x, y))
+            points_markup.append(
+                f"<circle cx=\"{x:.2f}\" cy=\"{y:.2f}\" r=\"4.2\" fill=\"{color}\" class=\"chart-point\" />"
+            )
+            last_value = value
+        if current_segment:
+            segments.append(current_segment)
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            points = " ".join(f"{x:.2f},{y:.2f}" for x, y in segment)
+            series_paths.append(
+                f"<polyline fill=\"none\" stroke=\"{color}\" stroke-width=\"3.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"{points}\" />"
+            )
+        series_paths.extend(points_markup)
+        legend_items.append(
+            "<div class=\"legend-item\">"
+            f"<span class=\"legend-swatch\" style=\"background:{color};\"></span>"
+            f"<span>{_text(name)}</span>"
+            f"<strong>{'-' if last_value is None else f'{last_value:.{decimals}f}'}</strong>"
+            "</div>"
+        )
+
+    svg = (
+        f"<svg class=\"metric-chart\" viewBox=\"0 0 {width} {height}\" preserveAspectRatio=\"none\">"
+        + "".join(grid_lines)
+        + f"<line x1=\"{pad_left}\" y1=\"{height - pad_bottom}\" x2=\"{width - pad_right}\" y2=\"{height - pad_bottom}\" class=\"chart-axis\" />"
+        + f"<line x1=\"{pad_left}\" y1=\"{pad_top}\" x2=\"{pad_left}\" y2=\"{height - pad_bottom}\" class=\"chart-axis\" />"
+        + "".join(series_paths)
+        + "".join(x_ticks)
+        + "</svg>"
+    )
+
+    return (
+        f"<article class=\"{panel_class}\">"
+        f"<div class=\"panel-head\"><div><h2>{_text(title)}</h2><p>{_text(subtitle)}</p></div></div>"
+        "<div class=\"panel-body\">"
+        "<div class=\"chart-wrap\">"
+        f"{svg}"
+        "<div class=\"chart-legend\">"
+        + "".join(legend_items)
+        + "</div></div></div></article>"
+    )
+
+
+def _render_distribution_chart(title: str, subtitle: str, entries: list[tuple[str, int]]) -> str:
+    non_empty = [(label, count) for label, count in entries if count > 0]
+    if not non_empty:
+        return (
+            "<article class=\"panel chart-panel chart-panel-span\">"
+            f"<div class=\"panel-head\"><div><h2>{_text(title)}</h2><p>{_text(subtitle)}</p></div></div>"
+            "<div class=\"panel-body\">"
+            "<div class=\"chart-empty\">분포를 그릴 클래스 샘플이 아직 없습니다.</div>"
+            "</div></article>"
+        )
+
+    max_count = max(count for _, count in non_empty) or 1
+    rows = []
+    for label, count in non_empty:
+        width = (count / max_count) * 100
+        rows.append(
+            "<div class=\"bar-row\">"
+            "<div class=\"bar-meta\">"
+            f"<span>{_text(label)}</span>"
+            f"<strong>{count}</strong>"
+            "</div>"
+            "<div class=\"bar-track\">"
+            f"<div class=\"bar-fill\" style=\"width:{width:.2f}%\"></div>"
+            "</div>"
+            "</div>"
+        )
+
+    return (
+        "<article class=\"panel chart-panel chart-panel-span\">"
+        f"<div class=\"panel-head\"><div><h2>{_text(title)}</h2><p>{_text(subtitle)}</p></div></div>"
+        "<div class=\"panel-body\">"
+        "<div class=\"bar-chart\">"
+        + "".join(rows)
+        + "</div></div></article>"
+    )
+
+
+def _render_confusion_matrix(labels: list[str], confusion: list[list[int]] | None) -> str:
+    if not isinstance(confusion, list) or not confusion:
+        return (
+            "<article class=\"panel chart-panel chart-panel-span\">"
+            "<div class=\"panel-head\"><div><h2>혼동 행렬</h2><p>최종 검증 결과를 실제 행렬 형태로 보여줍니다.</p></div></div>"
+            "<div class=\"panel-body\">"
+            "<div class=\"chart-empty\">혼동 행렬이 없습니다.</div>"
+            "</div></article>"
+        )
+
+    size = max(len(labels), len(confusion), max((len(row) for row in confusion if isinstance(row, list)), default=0))
+    if size <= 0:
+        return (
+            "<article class=\"panel chart-panel chart-panel-span\">"
+            "<div class=\"panel-head\"><div><h2>혼동 행렬</h2><p>최종 검증 결과를 실제 행렬 형태로 보여줍니다.</p></div></div>"
+            "<div class=\"panel-body\">"
+            "<div class=\"chart-empty\">혼동 행렬이 없습니다.</div>"
+            "</div></article>"
+        )
+
+    resolved_labels = [str(labels[index]) if index < len(labels) else f"class {index}" for index in range(size)]
+    normalized_rows: list[list[int]] = []
+    row_totals: list[int] = []
+    col_totals = [0 for _ in range(size)]
+    diagonal_total = 0
+    max_value = 0
+    top_errors: list[tuple[int, str, str]] = []
+
+    for row_index in range(size):
+        raw_row = confusion[row_index] if row_index < len(confusion) and isinstance(confusion[row_index], list) else []
+        normalized_row: list[int] = []
+        row_total = 0
+        for col_index in range(size):
+            raw_value = raw_row[col_index] if col_index < len(raw_row) else 0
+            try:
+                value = int(raw_value or 0)
+            except (TypeError, ValueError):
+                value = 0
+            normalized_row.append(value)
+            row_total += value
+            col_totals[col_index] += value
+            if row_index == col_index:
+                diagonal_total += value
+            elif value > 0:
+                top_errors.append((value, resolved_labels[row_index], resolved_labels[col_index]))
+            max_value = max(max_value, value)
+        normalized_rows.append(normalized_row)
+        row_totals.append(row_total)
+
+    overall_total = sum(row_totals)
+    overall_accuracy = (diagonal_total / overall_total) if overall_total else None
+    top_errors.sort(key=lambda item: item[0], reverse=True)
+    top_error_text = (
+        f"{top_errors[0][1]} → {top_errors[0][2]} ({top_errors[0][0]})"
+        if top_errors
+        else "눈에 띄는 오분류가 없습니다"
+    )
+
+    header_cells = "".join(
+        "<th class=\"matrix-col-head\">"
+        f"<div class=\"matrix-col-label\">{_text(label)}</div>"
+        "</th>"
+        for label in resolved_labels
+    )
+
+    body_rows = []
+    denominator = max(max_value, 1)
+    for row_index, row_values in enumerate(normalized_rows):
+        label = resolved_labels[row_index]
+        row_total = row_totals[row_index]
+        diagonal_value = row_values[row_index] if row_index < len(row_values) else 0
+        recall = (diagonal_value / row_total) if row_total else None
+        cell_markup = []
+        for col_index, value in enumerate(row_values):
+            intensity = value / denominator if denominator else 0.0
+            opacity = 0.08 + (intensity * 0.60)
+            is_diagonal = row_index == col_index
+            color = f"rgba(5, 150, 105, {opacity:.3f})" if is_diagonal else f"rgba(220, 38, 38, {opacity:.3f})"
+            share = (value / row_total) if row_total else None
+            cell_markup.append(
+                "<td class=\"matrix-cell{diag}{zero}\" style=\"background:{bg};\" title=\"{title}\">"
+                "<span class=\"matrix-count\">{count}</span>"
+                "<span class=\"matrix-share\">{share}</span>"
+                "</td>".format(
+                    diag=" is-diagonal" if is_diagonal else "",
+                    zero=" is-zero" if value == 0 else "",
+                    bg=color if value > 0 else "rgba(148, 163, 184, 0.06)",
+                    title=escape(
+                        f"실제 {label} / 예측 {resolved_labels[col_index]} / count {value} / share "
+                        + ("-" if share is None else f"{share:.1%}")
+                    ),
+                    count=value,
+                    share="-" if share is None or value == 0 else f"{share:.0%}",
+                )
+            )
+
+        body_rows.append(
+            "<tr>"
+            "<th class=\"matrix-row-head\">"
+            f"<div class=\"matrix-row-label\">{_text(label)}</div>"
+            f"<div class=\"matrix-row-meta\">실제 {row_total} / 정답 {'-' if recall is None else f'{recall:.0%}'}</div>"
+            "</th>"
+            + "".join(cell_markup)
+            + f"<td class=\"matrix-total-cell\"><span class=\"matrix-total-count\">{row_total}</span><span class=\"matrix-total-meta\">row total</span></td>"
+            "</tr>"
+        )
+
+    footer_cells = "".join(
+        f"<td class=\"matrix-total-cell\"><span class=\"matrix-total-count\">{value}</span><span class=\"matrix-total-meta\">pred total</span></td>"
+        for value in col_totals
+    )
+
+    summary_html = (
+        "<div class=\"confusion-summary\">"
+        "<div class=\"confusion-kpi\">"
+        "<span>전체 정확도</span>"
+        f"<strong>{'-' if overall_accuracy is None else f'{overall_accuracy:.1%}'}</strong>"
+        "</div>"
+        "<div class=\"confusion-kpi\">"
+        "<span>정답 / 전체</span>"
+        f"<strong>{diagonal_total} / {overall_total}</strong>"
+        "</div>"
+        "<div class=\"confusion-kpi confusion-kpi-wide\">"
+        "<span>가장 큰 혼동</span>"
+        f"<strong>{_text(top_error_text)}</strong>"
+        "</div>"
+        "</div>"
+    )
+
+    legend_html = (
+        "<div class=\"confusion-legend\">"
+        "<span><i class=\"legend-box legend-box-diag\"></i>대각선: 정답 예측</span>"
+        "<span><i class=\"legend-box legend-box-error\"></i>비대각선: 오분류</span>"
+        "<span><i class=\"legend-box legend-box-total\"></i>행/열 합계</span>"
+        "</div>"
+    )
+
+    matrix_html = (
+        "<div class=\"matrix-wrap\">"
+        "<table class=\"matrix-table\">"
+        "<thead><tr>"
+        "<th class=\"matrix-corner\">실제 \\ 예측</th>"
+        f"{header_cells}"
+        "<th class=\"matrix-col-head matrix-total-head\">행 합계</th>"
+        "</tr></thead>"
+        "<tbody>"
+        + "".join(body_rows)
+        + "<tr>"
+        "<th class=\"matrix-row-head matrix-total-head\">열 합계</th>"
+        + footer_cells
+        + f"<td class=\"matrix-total-cell matrix-grand-total\"><span class=\"matrix-total-count\">{overall_total}</span><span class=\"matrix-total-meta\">overall</span></td>"
+        + "</tr>"
+        "</tbody></table></div>"
+    )
+
+    return (
+        "<article class=\"panel chart-panel chart-panel-span confusion-panel\">"
+        "<div class=\"panel-head\"><div><h2>혼동 행렬</h2><p>대각선은 정답, 비대각선은 오분류입니다. 색이 진할수록 빈도가 큽니다.</p></div></div>"
+        "<div class=\"panel-body\">"
+        f"{summary_html}"
+        f"{legend_html}"
+        f"{matrix_html}"
+        "</div></article>"
+    )
+
+
+@lru_cache(maxsize=1)
+def _styles() -> str:
+    return """
+  <style>
+    :root {
+      --bg: #edf3fb;
+      --bg-deep: #e4edf8;
+      --panel: rgba(255, 255, 255, 0.96);
+      --panel-soft: rgba(248, 251, 255, 0.94);
+      --ink: #11233d;
+      --muted: #5c6b80;
+      --line: rgba(148, 163, 184, 0.22);
+      --accent: #0f6fff;
+      --accent-soft: rgba(15, 111, 255, 0.12);
+      --good: #059669;
+      --warn: #d97706;
+      --danger: #dc2626;
+      --shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
+      --shadow-soft: 0 10px 22px rgba(15, 23, 42, 0.05);
+      --radius-xl: 26px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --max-width: 1560px;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html {
+      scroll-behavior: smooth;
+    }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(15,111,255,0.10), transparent 28%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-deep) 100%);
+      color: var(--ink);
+      font-family: "Segoe UI", "Noto Sans KR", sans-serif;
+      line-height: 1.55;
+    }
+    a {
+      color: inherit;
+    }
+    .page {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 22px 20px 44px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.7fr);
+      gap: 18px;
+      padding: 26px;
+      border-radius: 30px;
+      border: 1px solid rgba(15,111,255,0.16);
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.94), rgba(246,250,255,0.92)),
+        radial-gradient(circle at top right, rgba(15,111,255,0.12), transparent 40%);
+      box-shadow: var(--shadow);
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.82);
+      border: 1px solid rgba(15,111,255,0.18);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: var(--shadow-soft);
+    }
+    .hero h1 {
+      margin: 12px 0 8px;
+      font-size: 38px;
+      line-height: 1.12;
+      letter-spacing: -0.02em;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 860px;
+    }
+    .hero-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .hero-links a {
+      text-decoration: none;
+      border-radius: 999px;
+      border: 1px solid rgba(15,111,255,0.16);
+      background: rgba(255,255,255,0.75);
+      padding: 9px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .hero-kpis {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .hero-kpi {
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(148,163,184,0.18);
+      box-shadow: var(--shadow-soft);
+    }
+    .hero-kpi span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .hero-kpi strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 16px;
+      font-weight: 800;
+      color: var(--ink);
+    }
+    .status-card {
+      padding: 22px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.88), rgba(246,248,253,0.88));
+      border: 1px solid rgba(15,111,255,0.14);
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      align-content: start;
+      gap: 14px;
+    }
+    .status-badge {
+      display: inline-flex;
+      width: fit-content;
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: #fff;
+    }
+    .status-badge.good { background: var(--good); }
+    .status-badge.warn { background: var(--warn); }
+    .status-badge.danger { background: var(--danger); }
+    .status-badge.accent,
+    .status-badge.neutral { background: var(--accent); }
+    .status-main {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .status-main strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--ink);
+      font-size: 18px;
+      line-height: 1.35;
+    }
+    .mini-stack {
+      display: grid;
+      gap: 10px;
+    }
+    .mini-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(248,251,255,0.92);
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .mini-row span {
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .mini-row strong {
+      text-align: right;
+      font-weight: 800;
+      color: var(--ink);
+    }
+    .banner {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid transparent;
+      box-shadow: var(--shadow-soft);
+    }
+    .banner-good {
+      background: rgba(5,150,105,0.10);
+      border-color: rgba(5,150,105,0.18);
+    }
+    .banner-warn {
+      background: rgba(217,119,6,0.10);
+      border-color: rgba(217,119,6,0.18);
+    }
+    .banner-danger {
+      background: rgba(220,38,38,0.10);
+      border-color: rgba(220,38,38,0.18);
+    }
+    .banner-neutral,
+    .banner-accent {
+      background: rgba(15,111,255,0.10);
+      border-color: rgba(15,111,255,0.18);
+    }
+    .banner-title {
+      font-weight: 900;
+      margin-bottom: 8px;
+    }
+    .banner-copy {
+      color: var(--ink);
+    }
+    .banner-list {
+      margin: 0;
+      padding-left: 18px;
+    }
+    .section-nav {
+      position: sticky;
+      top: 12px;
+      z-index: 20;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 18px 0;
+      padding: 12px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.82);
+      border: 1px solid rgba(148,163,184,0.18);
+      backdrop-filter: blur(14px);
+      box-shadow: var(--shadow-soft);
+    }
+    .section-nav a {
+      text-decoration: none;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(15,111,255,0.08);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+    .sidebar {
+      display: grid;
+      grid-template-columns: minmax(360px, 1.2fr) repeat(2, minmax(260px, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+    .content {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+    .panel {
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      border: 1px solid rgba(148,163,184,0.16);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel-span-full {
+      grid-column: 1 / -1;
+    }
+    .panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid rgba(148,163,184,0.12);
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,251,255,0.92));
+    }
+    .panel-head h2 {
+      margin: 0 0 6px;
+      font-size: 20px;
+      line-height: 1.18;
+      letter-spacing: -0.01em;
+    }
+    .panel-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .panel-body {
+      padding: 18px 20px 20px;
+    }
+    .sidebar-panel .panel-body {
+      padding-top: 16px;
+    }
+    .sidebar-panel {
+      min-width: 0;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .summary-card {
+      padding: 18px;
+      border-radius: 22px;
+      border: 1px solid rgba(148,163,184,0.14);
+      background: var(--panel);
+      box-shadow: var(--shadow-soft);
+      min-height: 140px;
+      display: grid;
+      align-content: start;
+      gap: 10px;
+    }
+    .summary-card-good { border-color: rgba(5,150,105,0.18); }
+    .summary-card-warn { border-color: rgba(217,119,6,0.18); }
+    .summary-card-danger { border-color: rgba(220,38,38,0.18); }
+    .summary-card-accent { border-color: rgba(15,111,255,0.20); }
+    .summary-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .summary-value {
+      font-size: 26px;
+      line-height: 1.15;
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      color: var(--ink);
+    }
+    .summary-copy {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .stack,
+    .stack-form {
+      display: grid;
+      gap: 12px;
+    }
+    .field-label {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+    .field-label input,
+    .field-label textarea {
+      width: 100%;
+      padding: 12px 13px;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,0.24);
+      background: rgba(248,251,255,0.95);
+      font: inherit;
+      color: var(--ink);
+    }
+    .field-label textarea {
+      resize: vertical;
+      min-height: 150px;
+    }
+    .primary-button,
+    .secondary-button {
+      appearance: none;
+      border: none;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+      transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+    }
+    .primary-button:hover,
+    .secondary-button:hover {
+      transform: translateY(-1px);
+    }
+    .primary-button {
+      padding: 13px 16px;
+      border-radius: 14px;
+      color: #fff;
+      background: linear-gradient(135deg, #0f6fff, #245dff);
+      box-shadow: 0 12px 22px rgba(15,111,255,0.26);
+    }
+    .action-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .action-grid form {
+      margin: 0;
+    }
+    .secondary-button {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 14px;
+      background: rgba(15,111,255,0.10);
+      color: var(--accent);
+      border: 1px solid rgba(15,111,255,0.14);
+    }
+    .secondary-button-warn {
+      background: rgba(217,119,6,0.10);
+      color: var(--warn);
+      border-color: rgba(217,119,6,0.14);
+    }
+    .secondary-button-danger {
+      background: rgba(220,38,38,0.10);
+      color: var(--danger);
+      border-color: rgba(220,38,38,0.14);
+    }
+    .key-metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 12px;
+    }
+    .key-metric-grid div {
+      padding: 12px 13px;
+      border-radius: 14px;
+      background: rgba(248,251,255,0.9);
+      border: 1px solid rgba(148,163,184,0.16);
+    }
+    .key-metric-grid span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .key-metric-grid strong {
+      display: block;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.35;
+    }
+    .path-box {
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(248,251,255,0.92);
+      border: 1px solid rgba(148,163,184,0.16);
+    }
+    .path-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+    .path-value {
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .link-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .link-row a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .content-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .chart-panel-span {
+      grid-column: 1 / -1;
+    }
+    .chart-wrap {
+      display: grid;
+      gap: 14px;
+    }
+    .metric-chart {
+      width: 100%;
+      height: 290px;
+      display: block;
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, rgba(248,251,255,0.98), rgba(241,246,252,0.96));
+      border: 1px solid rgba(148,163,184,0.14);
+    }
+    .chart-grid-line {
+      stroke: rgba(148,163,184,0.18);
+      stroke-width: 1;
+    }
+    .chart-axis {
+      stroke: rgba(100,116,139,0.42);
+      stroke-width: 1.2;
+    }
+    .chart-axis-label {
+      fill: #64748b;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .chart-point {
+      filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.12));
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      background: rgba(248,251,255,0.92);
+      border: 1px solid rgba(148,163,184,0.16);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .legend-item strong {
+      color: var(--ink);
+      font-weight: 800;
+    }
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: none;
+      box-shadow: 0 0 0 3px rgba(255,255,255,0.72);
+    }
+    .chart-empty {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px dashed rgba(148,163,184,0.3);
+      background: rgba(248,251,255,0.9);
+      color: var(--muted);
+      text-align: center;
+      font-weight: 700;
+    }
+    .bar-chart {
+      display: grid;
+      gap: 12px;
+    }
+    .bar-row {
+      display: grid;
+      gap: 6px;
+    }
+    .bar-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+    }
+    .bar-meta span {
+      color: var(--ink);
+      font-weight: 700;
+    }
+    .bar-meta strong {
+      color: var(--muted);
+      font-weight: 800;
+    }
+    .bar-track {
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(203,213,225,0.34);
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #0f6fff, #34c3ff);
+      box-shadow: 0 8px 18px rgba(15,111,255,0.18);
+    }
+    .confusion-panel .panel-body {
+      display: grid;
+      gap: 14px;
+    }
+    .confusion-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .confusion-kpi {
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(248,251,255,0.92);
+      border: 1px solid rgba(148,163,184,0.16);
+    }
+    .confusion-kpi span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+    .confusion-kpi strong {
+      display: block;
+      color: var(--ink);
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    .confusion-kpi-wide {
+      grid-column: span 1;
+    }
+    .confusion-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .confusion-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .legend-box {
+      width: 12px;
+      height: 12px;
+      border-radius: 4px;
+      display: inline-block;
+      border: 1px solid rgba(148,163,184,0.16);
+    }
+    .legend-box-diag {
+      background: rgba(5, 150, 105, 0.5);
+    }
+    .legend-box-error {
+      background: rgba(220, 38, 38, 0.4);
+    }
+    .legend-box-total {
+      background: rgba(15, 23, 42, 0.08);
+    }
+    .matrix-wrap {
+      overflow: auto;
+      border-radius: 18px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(252,253,255,0.96);
+    }
+    .matrix-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      min-width: 760px;
+      table-layout: fixed;
+    }
+    .matrix-table th,
+    .matrix-table td {
+      border-right: 1px solid rgba(148,163,184,0.10);
+      border-bottom: 1px solid rgba(148,163,184,0.10);
+      vertical-align: middle;
+    }
+    .matrix-corner,
+    .matrix-col-head,
+    .matrix-row-head,
+    .matrix-total-head {
+      background: rgba(246,249,253,0.98);
+    }
+    .matrix-corner {
+      position: sticky;
+      top: 0;
+      left: 0;
+      z-index: 4;
+      min-width: 160px;
+      padding: 14px 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      text-align: center;
+    }
+    .matrix-col-head {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      padding: 12px 10px;
+      min-width: 86px;
+      text-align: center;
+    }
+    .matrix-col-label {
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--ink);
+      word-break: break-word;
+    }
+    .matrix-row-head {
+      position: sticky;
+      left: 0;
+      z-index: 2;
+      min-width: 170px;
+      padding: 12px 14px;
+      text-align: left;
+    }
+    .matrix-row-label {
+      font-size: 13px;
+      font-weight: 800;
+      color: var(--ink);
+      margin-bottom: 4px;
+    }
+    .matrix-row-meta {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .matrix-cell {
+      min-width: 86px;
+      padding: 10px 8px;
+      text-align: center;
+      transition: background 0.16s ease;
+    }
+    .matrix-cell.is-diagonal {
+      box-shadow: inset 0 0 0 1px rgba(5,150,105,0.12);
+    }
+    .matrix-cell.is-zero {
+      color: rgba(100,116,139,0.9);
+    }
+    .matrix-count {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 900;
+      line-height: 1.1;
+    }
+    .matrix-share {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .matrix-total-head {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      min-width: 92px;
+      padding: 12px 10px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+    }
+    .matrix-total-cell {
+      min-width: 92px;
+      padding: 10px 8px;
+      text-align: center;
+      background: rgba(15,23,42,0.05);
+    }
+    .matrix-total-count {
+      display: block;
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 900;
+      line-height: 1.15;
+    }
+    .matrix-total-meta {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .matrix-grand-total {
+      background: rgba(15,111,255,0.10);
+    }
+    .mini-panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel-soft);
+      padding: 16px;
+    }
+    .mini-panel h3 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      letter-spacing: -0.01em;
+    }
+    .table-wrap {
+      overflow: auto;
+      border-radius: 16px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(252,253,255,0.94);
+    }
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 480px;
+    }
+    .data-table th,
+    .data-table td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(148,163,184,0.12);
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    .data-table th {
+      position: sticky;
+      top: 0;
+      background: rgba(246,249,253,0.98);
+      color: var(--muted);
+      font-weight: 800;
+      z-index: 1;
+    }
+    .data-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+    .data-table-compact {
+      min-width: 0;
+    }
+    .data-table-compact th,
+    .data-table-compact td {
+      padding: 10px 12px;
+      font-size: 12px;
+    }
+    .empty-cell {
+      color: var(--muted);
+    }
+    .queue-list {
+      display: grid;
+      gap: 10px;
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .queue-item,
+    .queue-empty {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(248,251,255,0.92);
+    }
+    .queue-main {
+      min-width: 0;
+    }
+    .queue-main strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+    .queue-copy,
+    .muted-block {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .detail-panel {
+      border-radius: 20px;
+      border: 1px solid rgba(148,163,184,0.18);
+      background: rgba(255,255,255,0.92);
+      box-shadow: var(--shadow-soft);
+    }
+    .detail-summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 16px 18px;
+      font-size: 15px;
+      font-weight: 900;
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,251,255,0.92));
+    }
+    .detail-summary::-webkit-details-marker {
+      display: none;
+    }
+    .detail-body {
+      padding: 0 18px 18px;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .log-stack {
+      display: grid;
+      gap: 14px;
+    }
+    .log-card {
+      border-radius: 18px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(248,251,255,0.96);
+      overflow: hidden;
+    }
+    .log-card summary {
+      cursor: pointer;
+      padding: 14px 16px;
+      font-weight: 900;
+      list-style: none;
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,251,255,0.92));
+    }
+    .log-card summary::-webkit-details-marker {
+      display: none;
+    }
+    .log-box {
+      margin: 10px 0 0;
+      padding: 14px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #0f172a, #111827);
+      color: #e2e8f0;
+      min-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "Consolas", "SFMono-Regular", monospace;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    code {
+      font-family: "Consolas", "SFMono-Regular", monospace;
+      font-size: 12px;
+    }
+    @media (max-width: 1280px) {
+      .summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .sidebar {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .chart-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 860px) {
+      .page {
+        padding: 16px 14px 28px;
+      }
+      .hero {
+        grid-template-columns: 1fr;
+        padding: 20px;
+      }
+      .hero h1 {
+        font-size: 30px;
+      }
+      .hero-kpis,
+      .summary-grid,
+      .chart-grid,
+      .confusion-summary,
+      .content-row,
+      .detail-grid,
+      .key-metric-grid,
+      .sidebar,
+      .action-grid {
+        grid-template-columns: 1fr;
+      }
+      .section-nav {
+        top: 8px;
+      }
+      .data-table {
+        min-width: 0;
+      }
+    }
+  </style>
+"""
 
 
 def render_dashboard_page(
@@ -374,12 +1850,10 @@ def render_dashboard_page(
     )
     latest = progress.get("latest") or {}
     updated_at = progress.get("updated_at") or pipeline.get("updated_at") or "-"
+    latest_loss = _float_text(latest.get("val_loss"))
+
     refresh_seconds = max(0, min(int(refresh_seconds), 300))
-    meta_refresh = (
-        f"<meta http-equiv=\"refresh\" content=\"{refresh_seconds};url=/\" />"
-        if refresh_seconds > 0
-        else ""
-    )
+    meta_refresh = f"<meta http-equiv=\"refresh\" content=\"{refresh_seconds};url=/\" />" if refresh_seconds > 0 else ""
 
     banners = []
     if notice:
@@ -412,116 +1886,58 @@ def render_dashboard_page(
         "</div>"
     )
 
-    dataset_rows = []
-    for key in ("raw", "train", "val", "test", "prepared_train", "prepared_val", "prepared_test"):
-        info = dataset.get(key) or {}
-        dataset_rows.append(
-            [
-                _split_label(key),
-                _int_text(info.get("total"), "0"),
-                _text(_join_label_counts(info), "-"),
-            ]
-        )
+    dataset_rows = _build_dataset_rows(dataset)
+    current_dataset_rows = _build_dataset_rows(current_dataset)
 
-    current_dataset_rows = []
-    for key in ("raw", "train", "val", "test", "prepared_train", "prepared_val", "prepared_test"):
-        info = current_dataset.get(key) or {}
-        current_dataset_rows.append(
-            [
-                _split_label(key),
-                _int_text(info.get("total"), "0"),
-                _text(_join_label_counts(info), "-"),
-            ]
-        )
+    history_bundle = _build_history_bundle(progress, metrics)
+    history_rows = history_bundle["rows"]
 
-    history_rows = []
-    for row in list(progress.get("history") or metrics.get("history") or [])[-20:]:
-        if not isinstance(row, dict):
-            continue
-        history_rows.append(
-            [
-                _text(row.get("epoch")),
-                _float_text(row.get("train_loss")),
-                _float_text(row.get("val_loss")),
-                _float_text(row.get("val_accuracy")),
-                _float_text(row.get("val_macro_f1")),
-                _float_text(row.get("learning_rate"), 6),
-            ]
-        )
-
-    support_map: dict[int, int] = {}
     confusion = final_validation.get("confusion_matrix") or []
-    if isinstance(confusion, list):
-        for index, matrix_row in enumerate(confusion):
-            if isinstance(matrix_row, list):
-                support_map[index] = sum(int(value or 0) for value in matrix_row)
+    support_map = _build_support_map(confusion if isinstance(confusion, list) else None)
+    per_class_rows = _build_per_class_rows(final_validation, labels, support_map)
+    confusion_matrix_html = _render_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
 
-    per_class_rows = []
-    for index, row in enumerate(final_validation.get("per_class") or []):
-        if not isinstance(row, dict):
-            continue
-        class_index = int(row.get("class_index", index) or index)
-        label = labels[class_index] if 0 <= class_index < len(labels) else row.get("label") or class_index
-        per_class_rows.append(
-            [
-                _text(label),
-                _float_text(row.get("precision")),
-                _float_text(row.get("recall")),
-                _float_text(row.get("f1")),
-                _int_text(support_map.get(class_index, 0)),
-            ]
-        )
+    recent_job_rows = _build_recent_job_rows(completed_jobs)
+    issue_rows = _build_issue_rows(skip_report.get("issues") or [])
 
-    confusion_rows = []
-    if isinstance(confusion, list) and confusion:
-        for row_index, matrix_row in enumerate(confusion):
-            if not isinstance(matrix_row, list):
-                continue
-            label = labels[row_index] if row_index < len(labels) else f"class_{row_index}"
-            confusion_rows.append([_text(label)] + [_int_text(value, "0") for value in matrix_row])
-    confusion_headers = ["actual \\ predicted"] + [_text(label) for label in labels] if labels else ["matrix"]
-
-    recent_job_rows = []
-    for job in completed_jobs[:20]:
-        if not isinstance(job, dict):
-            continue
-        summary = job.get("result_summary") or {}
-        prepared_count = sum(
-            int(summary.get(key, 0) or 0)
-            for key in ("prepared_train_total", "prepared_val_total", "prepared_test_total")
-        )
-        recent_job_rows.append(
-            [
-                _text(job.get("filekey")),
-                _text(job.get("datasetkey")),
-                _state_label(job.get("state")),
-                _int_text(prepared_count, "0"),
-                _text(job.get("finished_at") or job.get("started_at")),
-                _text(job.get("message")),
-            ]
-        )
-
-    issue_rows = []
-    for issue in list((skip_report.get("issues") or []))[-20:]:
-        if not isinstance(issue, dict):
-            continue
-        issue_rows.append(
-            [
-                _text(issue.get("category")),
-                _text(issue.get("split")),
-                _text(issue.get("video_name")),
-                _text(issue.get("reason")),
-                _text(issue.get("created_at")),
-            ]
-        )
-
-    latest_loss = (
-        f"train {_float_text(latest.get('train_loss'))} / val {_float_text(latest.get('val_loss'))}"
-        if latest
-        else "-"
-    )
     train_distribution = progress.get("train_distribution") or metrics.get("train_distribution") or {}
     val_distribution = progress.get("val_distribution") or metrics.get("val_distribution") or {}
+
+    epoch_labels = history_bundle["epoch_labels"]
+    val_accuracy_values = history_bundle["val_accuracy_values"]
+    val_f1_values = history_bundle["val_f1_values"]
+    train_loss_values = history_bundle["train_loss_values"]
+    val_loss_values = history_bundle["val_loss_values"]
+
+    distribution_entries = _build_distribution_entries(dataset, labels)
+
+    performance_chart_html = _render_line_chart(
+        "성능 추이",
+        "epoch별 검증 정확도와 macro F1을 바로 비교할 수 있습니다.",
+        epoch_labels,
+        [
+            ("검증 정확도", "#2563eb", val_accuracy_values),
+            ("검증 macro F1", "#059669", val_f1_values),
+        ],
+        fixed_min=0.0,
+        fixed_max=1.0,
+        decimals=3,
+    )
+    loss_chart_html = _render_line_chart(
+        "손실 추이",
+        "train / validation loss 변화를 함께 보면서 과적합 여부를 판단할 수 있습니다.",
+        epoch_labels,
+        [
+            ("학습 손실", "#2563eb", train_loss_values),
+            ("검증 손실", "#f97316", val_loss_values),
+        ],
+        decimals=4,
+    )
+    distribution_chart_html = _render_distribution_chart(
+        "학습 데이터 분포",
+        "전처리된 학습 세트 기준 클래스별 샘플 수입니다.",
+        distribution_entries,
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -530,613 +1946,7 @@ def render_dashboard_page(
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   {meta_refresh}
   <title>detectWarning 학습 대시보드</title>
-  <style>
-    :root {{
-      --bg: #edf3fb;
-      --bg-deep: #e4edf8;
-      --panel: rgba(255, 255, 255, 0.96);
-      --panel-soft: rgba(248, 251, 255, 0.94);
-      --ink: #11233d;
-      --muted: #5c6b80;
-      --line: rgba(148, 163, 184, 0.22);
-      --accent: #0f6fff;
-      --accent-soft: rgba(15, 111, 255, 0.12);
-      --good: #059669;
-      --warn: #d97706;
-      --danger: #dc2626;
-      --shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
-      --radius-xl: 26px;
-      --radius-lg: 20px;
-      --radius-md: 16px;
-      --radius-sm: 12px;
-    }}
-    * {{ box-sizing: border-box; }}
-    html {{ scroll-behavior: smooth; }}
-    body {{
-      margin: 0;
-      color: var(--ink);
-      font-family: "Segoe UI", "Pretendard", "Apple SD Gothic Neo", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(15, 111, 255, 0.12), transparent 24%),
-        radial-gradient(circle at top right, rgba(14, 165, 233, 0.08), transparent 20%),
-        linear-gradient(180deg, #f8fbff 0%, var(--bg) 52%, var(--bg-deep) 100%);
-      min-height: 100vh;
-    }}
-    .page {{
-      max-width: 1560px;
-      margin: 0 auto;
-      padding: 24px 24px 36px;
-    }}
-    .hero {{
-      display: grid;
-      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
-      gap: 18px;
-      padding: 24px;
-      border-radius: var(--radius-xl);
-      background:
-        radial-gradient(circle at top right, rgba(15, 111, 255, 0.14), transparent 32%),
-        linear-gradient(135deg, rgba(255,255,255,0.98), rgba(245,249,255,0.95));
-      border: 1px solid rgba(255,255,255,0.78);
-      box-shadow: var(--shadow);
-      margin-bottom: 18px;
-    }}
-    .hero h1 {{
-      margin: 8px 0 10px;
-      font-size: 38px;
-      line-height: 1;
-      letter-spacing: -0.04em;
-    }}
-    .hero p {{
-      margin: 0;
-      color: var(--muted);
-      font-size: 15px;
-      line-height: 1.65;
-      max-width: 760px;
-    }}
-    .eyebrow {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }}
-    .eyebrow::before {{
-      content: "";
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #0f6fff, #0ea5e9);
-    }}
-    .hero-links {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 16px;
-    }}
-    .hero-links a {{
-      color: var(--accent);
-      text-decoration: none;
-      font-weight: 700;
-    }}
-    .hero-kpis {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 18px;
-    }}
-    .hero-kpi {{
-      padding: 14px;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.82);
-    }}
-    .hero-kpi span {{
-      display: block;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.07em;
-      text-transform: uppercase;
-      margin-bottom: 8px;
-    }}
-    .hero-kpi strong {{
-      display: block;
-      font-size: 14px;
-      line-height: 1.5;
-      word-break: break-word;
-    }}
-    .status-card {{
-      display: grid;
-      gap: 14px;
-      padding: 18px;
-      border-radius: 20px;
-      background: linear-gradient(180deg, rgba(249,252,255,0.98), rgba(244,248,252,0.95));
-      border: 1px solid var(--line);
-    }}
-    .status-badge {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      width: fit-content;
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }}
-    .status-badge.good {{ background: rgba(5,150,105,0.10); color: var(--good); }}
-    .status-badge.warn {{ background: rgba(217,119,6,0.10); color: var(--warn); }}
-    .status-badge.danger {{ background: rgba(220,38,38,0.10); color: var(--danger); }}
-    .status-badge.accent {{ background: rgba(15,111,255,0.10); color: var(--accent); }}
-    .status-badge.neutral {{ background: rgba(148,163,184,0.12); color: #475569; }}
-    .status-main {{
-      font-size: 15px;
-      line-height: 1.7;
-      color: var(--muted);
-    }}
-    .status-main strong {{
-      display: block;
-      color: var(--ink);
-      font-size: 28px;
-      line-height: 1.1;
-      letter-spacing: -0.04em;
-      margin-bottom: 8px;
-    }}
-    .mini-stack {{
-      display: grid;
-      gap: 10px;
-    }}
-    .mini-stack .mini-row {{
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.82);
-    }}
-    .mini-row span {{
-      display: block;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.07em;
-      text-transform: uppercase;
-      margin-bottom: 6px;
-    }}
-    .mini-row strong {{
-      display: block;
-      font-size: 14px;
-      line-height: 1.5;
-      word-break: break-word;
-    }}
-    .banner {{
-      margin-bottom: 14px;
-      padding: 14px 16px;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: var(--panel);
-    }}
-    .banner-title {{
-      font-size: 13px;
-      font-weight: 900;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      margin-bottom: 6px;
-    }}
-    .banner-copy,
-    .banner-list {{
-      margin: 0;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.7;
-    }}
-    .banner-list {{
-      padding-left: 18px;
-    }}
-    .banner-good {{ background: rgba(5,150,105,0.08); border-color: rgba(5,150,105,0.18); }}
-    .banner-warn {{ background: rgba(217,119,6,0.08); border-color: rgba(217,119,6,0.18); }}
-    .banner-danger {{ background: rgba(220,38,38,0.08); border-color: rgba(220,38,38,0.18); }}
-    .banner-accent {{ background: rgba(15,111,255,0.08); border-color: rgba(15,111,255,0.18); }}
-    .section-nav {{
-      position: sticky;
-      top: 12px;
-      z-index: 5;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin: 0 0 16px;
-      padding: 12px;
-      border-radius: 18px;
-      background: rgba(255,255,255,0.88);
-      border: 1px solid rgba(148,163,184,0.16);
-      backdrop-filter: blur(12px);
-      box-shadow: 0 10px 26px rgba(15,23,42,0.06);
-    }}
-    .section-nav a {{
-      padding: 8px 12px;
-      border-radius: 999px;
-      background: rgba(15,111,255,0.08);
-      color: var(--accent);
-      text-decoration: none;
-      font-size: 13px;
-      font-weight: 800;
-    }}
-    .layout {{
-      display: grid;
-      grid-template-columns: minmax(320px, 0.82fr) minmax(0, 1.68fr);
-      gap: 18px;
-      align-items: start;
-    }}
-    .sidebar {{
-      display: grid;
-      gap: 16px;
-      position: sticky;
-      top: 72px;
-    }}
-    .content {{
-      display: grid;
-      gap: 16px;
-      min-width: 0;
-    }}
-    .summary-grid {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 14px;
-    }}
-    .summary-card {{
-      padding: 18px;
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: var(--panel);
-      box-shadow: 0 14px 28px rgba(15,23,42,0.04);
-    }}
-    .summary-card-good {{ background: linear-gradient(180deg, rgba(236,253,245,0.92), rgba(255,255,255,0.96)); }}
-    .summary-card-warn {{ background: linear-gradient(180deg, rgba(255,247,237,0.92), rgba(255,255,255,0.96)); }}
-    .summary-card-danger {{ background: linear-gradient(180deg, rgba(254,242,242,0.92), rgba(255,255,255,0.96)); }}
-    .summary-card-accent {{ background: linear-gradient(180deg, rgba(239,246,255,0.92), rgba(255,255,255,0.96)); }}
-    .summary-label {{
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      margin-bottom: 10px;
-    }}
-    .summary-value {{
-      font-size: 28px;
-      font-weight: 900;
-      line-height: 1.05;
-      letter-spacing: -0.04em;
-      margin-bottom: 8px;
-      word-break: break-word;
-    }}
-    .summary-copy {{
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.6;
-      word-break: break-word;
-    }}
-    .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      box-shadow: 0 14px 28px rgba(15,23,42,0.05);
-      overflow: hidden;
-    }}
-    .panel-head {{
-      padding: 18px 20px;
-      border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,0.95), rgba(248,251,255,0.92));
-    }}
-    .panel-head h2 {{
-      margin: 0 0 4px;
-      font-size: 20px;
-      line-height: 1.15;
-      letter-spacing: -0.03em;
-    }}
-    .panel-head p {{
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.55;
-    }}
-    .panel-body {{
-      padding: 18px 20px 20px;
-    }}
-    .sidebar-panel .panel-body {{
-      padding-top: 16px;
-    }}
-    .stack {{
-      display: grid;
-      gap: 12px;
-    }}
-    .stack-form {{
-      display: grid;
-      gap: 12px;
-    }}
-    .field-label {{
-      display: grid;
-      gap: 6px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }}
-    input[type="text"],
-    input[type="password"],
-    textarea {{
-      width: 100%;
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid rgba(148,163,184,0.28);
-      background: #ffffff;
-      color: var(--ink);
-      font: inherit;
-    }}
-    textarea {{
-      resize: vertical;
-      min-height: 130px;
-      font-family: "Consolas", "SFMono-Regular", monospace;
-      line-height: 1.6;
-    }}
-    .primary-button,
-    .secondary-button {{
-      width: 100%;
-      border: none;
-      border-radius: 14px;
-      padding: 12px 14px;
-      font: inherit;
-      font-weight: 900;
-      cursor: pointer;
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
-    }}
-    .primary-button {{
-      background: linear-gradient(135deg, #0f6fff, #1d4ed8);
-      color: white;
-      box-shadow: 0 12px 24px rgba(15,111,255,0.22);
-    }}
-    .secondary-button {{
-      background: #eef4fb;
-      color: var(--ink);
-      border: 1px solid rgba(148,163,184,0.2);
-    }}
-    .secondary-button-warn {{
-      background: #fff2de;
-      color: #a25a00;
-    }}
-    .secondary-button-danger {{
-      background: #ffe6e6;
-      color: #9b1c1c;
-    }}
-    .primary-button:hover,
-    .secondary-button:hover {{
-      transform: translateY(-1px);
-    }}
-    .action-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }}
-    .key-metric-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }}
-    .key-metric-grid > div {{
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: var(--panel-soft);
-      border: 1px solid var(--line);
-    }}
-    .key-metric-grid span {{
-      display: block;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      margin-bottom: 6px;
-    }}
-    .key-metric-grid strong {{
-      display: block;
-      font-size: 14px;
-      line-height: 1.55;
-      word-break: break-word;
-    }}
-    .queue-list {{
-      display: grid;
-      gap: 10px;
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }}
-    .queue-item,
-    .queue-empty {{
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: var(--panel-soft);
-    }}
-    .queue-main {{
-      min-width: 0;
-    }}
-    .queue-main strong {{
-      display: block;
-      margin-bottom: 4px;
-      word-break: break-word;
-    }}
-    .queue-copy,
-    .muted-block {{
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.6;
-      word-break: break-word;
-    }}
-    .path-box {{
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: var(--panel-soft);
-    }}
-    .path-label {{
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      margin-bottom: 6px;
-    }}
-    .path-value {{
-      font-family: "Consolas", "SFMono-Regular", monospace;
-      font-size: 12px;
-      line-height: 1.65;
-      word-break: break-all;
-    }}
-    .content-row {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }}
-    .table-wrap {{
-      overflow: auto;
-      border-radius: 14px;
-      border: 1px solid rgba(148,163,184,0.16);
-      background: rgba(255,255,255,0.7);
-    }}
-    .data-table {{
-      width: 100%;
-      min-width: 680px;
-      border-collapse: collapse;
-    }}
-    .data-table-compact {{
-      min-width: 560px;
-    }}
-    .data-table th,
-    .data-table td {{
-      padding: 11px 10px;
-      border-bottom: 1px solid rgba(148,163,184,0.14);
-      text-align: left;
-      vertical-align: top;
-      word-break: break-word;
-    }}
-    .data-table thead th {{
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: #f8fbff;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 900;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }}
-    .data-table tbody tr:nth-child(even) {{
-      background: rgba(248,251,255,0.6);
-    }}
-    .empty-cell {{
-      text-align: center;
-      color: var(--muted);
-      padding: 18px 10px;
-    }}
-    .detail-panel {{
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: var(--panel);
-      overflow: hidden;
-    }}
-    .detail-panel + .detail-panel {{
-      margin-top: 12px;
-    }}
-    .detail-panel summary {{
-      cursor: pointer;
-      list-style: none;
-      padding: 16px 18px;
-      font-size: 15px;
-      font-weight: 900;
-      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,251,255,0.92));
-    }}
-    .detail-body {{
-      padding: 0 18px 18px;
-    }}
-    .detail-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      margin-top: 14px;
-    }}
-    .mini-panel {{
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: var(--panel-soft);
-      padding: 14px;
-    }}
-    .mini-panel h3 {{
-      margin: 0 0 10px;
-      font-size: 15px;
-    }}
-    .log-box {{
-      margin: 0;
-      padding: 14px;
-      border-radius: 14px;
-      background: linear-gradient(180deg, #0f172a, #111827);
-      color: #e2e8f0;
-      min-height: 220px;
-      overflow: auto;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: "Consolas", "SFMono-Regular", monospace;
-      font-size: 12px;
-      line-height: 1.7;
-    }}
-    code {{
-      font-family: "Consolas", "SFMono-Regular", monospace;
-      font-size: 12px;
-    }}
-    @media (max-width: 1280px) {{
-      .summary-grid {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }}
-      .layout {{
-        grid-template-columns: 1fr;
-      }}
-      .sidebar {{
-        position: static;
-      }}
-    }}
-    @media (max-width: 860px) {{
-      .page {{
-        padding: 16px 16px 28px;
-      }}
-      .hero {{
-        grid-template-columns: 1fr;
-        padding: 18px;
-      }}
-      .hero h1 {{
-        font-size: 30px;
-      }}
-      .hero-kpis,
-      .summary-grid,
-      .content-row,
-      .action-grid,
-      .key-metric-grid,
-      .detail-grid {{
-        grid-template-columns: 1fr;
-      }}
-      .section-nav {{
-        top: 8px;
-      }}
-    }}
-  </style>
+  {_styles()}
 </head>
 <body>
   <div class="page">
@@ -1180,6 +1990,12 @@ def render_dashboard_page(
       <main class="content">
         <section class="summary-grid">
           {summary_cards}
+        </section>
+
+        <section class="chart-grid">
+          {performance_chart_html}
+          {loss_chart_html}
+          {distribution_chart_html}
         </section>
 
         <section class="panel" id="training">
@@ -1235,39 +2051,39 @@ def render_dashboard_page(
         </section>
 
         <section class="content-row" id="validation">
-          <article class="panel">
-            <div class="panel-head"><div><h2>클래스별 검증 지표</h2><p>precision / recall / f1 / support를 바로 비교할 수 있습니다.</p></div></div>
+          <article class="panel panel-span-full">
+            <div class="panel-head"><div><h2>클래스별 지표</h2><p>최종 검증 결과를 클래스별로 바로 읽을 수 있게 정리했습니다.</p></div></div>
             <div class="panel-body">
               {_render_table(["label", "precision", "recall", "f1", "support"], per_class_rows, "클래스별 지표가 없습니다.")}
             </div>
           </article>
-          <article class="panel">
-            <div class="panel-head"><div><h2>혼동 행렬</h2><p>최종 검증 결과를 실제 행렬 형태로 보여줍니다.</p></div></div>
-            <div class="panel-body">
-              {_render_table(confusion_headers, confusion_rows, "confusion matrix가 없습니다.")}
-            </div>
-          </article>
+        </section>
+
+        <section class="chart-grid" id="validation-matrix">
+          {confusion_matrix_html}
         </section>
 
         <section class="content-row" id="jobs">
           <article class="panel">
-            <div class="panel-head"><div><h2>최근 작업 이력</h2><p>무슨 filekey가 어떤 상태로 끝났는지 바로 확인할 수 있습니다.</p></div></div>
+            <div class="panel-head"><div><h2>최근 작업 이력</h2><p>최근 완료 또는 중단된 작업을 위에서부터 보여줍니다.</p></div></div>
             <div class="panel-body">
               {_render_table(["filekey", "datasetkey", "state", "prepared", "finished", "message"], recent_job_rows, "최근 작업 이력이 없습니다.")}
             </div>
           </article>
           <article class="panel">
-            <div class="panel-head"><div><h2>문제 영상 이력</h2><p>skip / broken 원인을 최근 순서대로 봅니다.</p></div></div>
+            <div class="panel-head"><div><h2>현재 스킵 이슈</h2><p>이번 작업에서 건너뛴 항목만 따로 모아 보여줍니다.</p></div></div>
             <div class="panel-body">
-              {_render_table(["category", "split", "video", "reason", "created_at"], issue_rows, "최근 문제 영상 기록이 없습니다.")}
+              {_render_table(["split", "video", "reason", "valid_frames", "confirmed_frames"], issue_rows, "표시할 현재 스킵 이슈가 없습니다.")}
             </div>
           </article>
         </section>
 
         <section class="panel" id="logs">
-          <div class="panel-head"><div><h2>로그</h2><p>기본은 현재 로그를 펼쳐 놓고, 나머지는 필요할 때만 펼쳐 보도록 정리했습니다.</p></div></div>
-          <div class="panel-body stack">
-            {_render_logs(logs)}
+          <div class="panel-head"><div><h2>로그</h2><p>필요한 로그만 열어 볼 수 있게 접이식으로 정리했습니다.</p></div></div>
+          <div class="panel-body">
+            <div class="log-stack">
+              {_render_logs(logs)}
+            </div>
           </div>
         </section>
 
@@ -1276,4 +2092,5 @@ def render_dashboard_page(
     </div>
   </div>
 </body>
-</html>"""
+</html>
+"""

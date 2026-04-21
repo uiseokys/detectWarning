@@ -52,6 +52,7 @@ from reporting import (
     summarize_manifest,
 )
 from training_config import resolve_pages_sync_config
+from training_dashboard_view import render_dashboard_page
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
@@ -5284,7 +5285,21 @@ def create_app(config_path: Path) -> FastAPI:
                     launcher_payload["state"] = "error"
                 elif notice_level == "warn":
                     launcher_payload["state"] = launcher_payload.get("state") or "warning"
-        html = render_dashboard(initial_overview)
+        html = render_dashboard_page(
+            initial_overview,
+            config_path=str(config_path),
+            default_datasetkey=str(
+                (
+                    (initial_overview.get("aihub") or {}).get("datasetkey")
+                    or config.get("aihub_shell", {}).get("datasetkey")
+                    or ""
+                )
+            ),
+            controls_enabled=str(config.get("dataset_source") or "").strip().lower() == "aihub_shell",
+            notice=notice,
+            notice_level=notice_level,
+            refresh_seconds=15,
+        )
         return HTMLResponse(html, headers=NO_CACHE_HEADERS)
 
     @app.get("/api/overview")
