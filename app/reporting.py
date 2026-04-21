@@ -28,6 +28,265 @@ def read_json(path: Path) -> dict | list | None:
         return None
 
 
+def parse_iso_datetime(value) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_path_diagnostic(path: Path) -> dict:
+    payload = {
+        "path": str(path),
+        "exists": False,
+        "size": None,
+        "updated_at": None,
+    }
+    try:
+        if not path.exists():
+            return payload
+        stat = path.stat()
+    except OSError:
+        return payload
+    payload["exists"] = True
+    payload["size"] = int(stat.st_size)
+    payload["updated_at"] = datetime.fromtimestamp(
+        stat.st_mtime,
+        tz=timezone.utc,
+    ).astimezone().isoformat()
+    return payload
+
+
+def compute_job_duration_minutes(job: dict | None) -> float | None:
+    if not isinstance(job, dict):
+        return None
+    existing = safe_number(job.get("duration_minutes"))
+    if existing is not None:
+        return round(existing, 2)
+    started_at = parse_iso_datetime(job.get("started_at"))
+    finished_at = parse_iso_datetime(job.get("finished_at"))
+    if started_at is None or finished_at is None:
+        return None
+    seconds = max(0.0, (finished_at - started_at).total_seconds())
+    return round(seconds / 60.0, 2)
+
+
+def infer_job_message(job: dict | None) -> str:
+    if not isinstance(job, dict):
+        return "최근 작업 정보가 없습니다."
+    state = str(job.get("state") or "").strip().lower()
+    filekey = str(job.get("filekey") or "-")
+    datasetkey = str(job.get("datasetkey") or "-")
+    exit_code = job.get("exit_code")
+    if state == "completed":
+        return f"datasetkey {datasetkey} | filekey {filekey} 학습이 완료되었습니다."
+    if state == "completed_warning":
+        return (
+            f"datasetkey {datasetkey} | filekey {filekey} 학습 결과는 생성됐지만 "
+            f"종료 코드 {exit_code} 경고가 남았습니다."
+        )
+    if state == "aborted":
+        return f"datasetkey {datasetkey} | filekey {filekey} 작업이 강제 중단되었습니다."
+    if state == "error":
+        return (
+            f"datasetkey {datasetkey} | filekey {filekey} 작업이 실패했습니다."
+            + (f" (exit {exit_code})" if exit_code not in (None, "") else "")
+        )
+    if state == "running":
+        return f"datasetkey {datasetkey} | filekey {filekey} 작업이 실행 중입니다."
+    if state == "queued":
+        return f"datasetkey {datasetkey} | filekey {filekey} 작업이 대기 중입니다."
+    return f"datasetkey {datasetkey} | filekey {filekey} 작업 상태를 확인하세요."
+
+
+def enrich_completed_job(job: dict | None) -> dict:
+    if not isinstance(job, dict):
+        return {}
+    enriched = dict(job)
+    enriched["duration_minutes"] = compute_job_duration_minutes(enriched)
+    enriched["message"] = str(enriched.get("message") or infer_job_message(enriched))
+    return enriched
+
+
+def sort_jobs_by_recency(jobs: list[dict] | None) -> list[dict]:
+    enriched_jobs = [enrich_completed_job(job) for job in (jobs or []) if isinstance(job, dict)]
+
+    def sort_key(job: dict) -> tuple[float, str]:
+        latest = (
+            parse_iso_datetime(job.get("finished_at"))
+            or parse_iso_datetime(job.get("started_at"))
+            or datetime.fromtimestamp(0, tz=timezone.utc)
+        )
+        return (latest.timestamp(), str(job.get("job_id") or ""))
+
+    return sorted(enriched_jobs, key=sort_key, reverse=True)
+
+
+def build_restored_launcher_summary(
+    completed_jobs: list[dict] | None,
+    *,
+    pipeline_status: dict | None = None,
+    training_progress: dict | None = None,
+) -> dict:
+    jobs = sort_jobs_by_recency(completed_jobs)
+    latest_job = jobs[0] if jobs else None
+    pipeline_status = pipeline_status or {}
+    training_progress = training_progress or {}
+    if latest_job:
+        return {
+            "state": str(latest_job.get("state") or "idle"),
+            "message": str(latest_job.get("message") or infer_job_message(latest_job)),
+            "log_path": latest_job.get("log_path"),
+            "last_exit_code": latest_job.get("exit_code"),
+            "latest_job": latest_job,
+        }
+    progress_state = str(training_progress.get("state") or "").strip().lower()
+    if progress_state == "completed":
+        return {
+            "state": "completed",
+            "message": "최근 학습 결과를 불러왔습니다.",
+            "log_path": None,
+            "last_exit_code": 0,
+            "latest_job": None,
+        }
+    pipeline_state = str(pipeline_status.get("state") or "").strip().lower()
+    if pipeline_state:
+        return {
+            "state": pipeline_state,
+            "message": str(pipeline_status.get("message") or "최근 상태를 불러왔습니다."),
+            "log_path": None,
+            "last_exit_code": None,
+            "latest_job": None,
+        }
+    return {
+        "state": "idle",
+        "message": "아직 실행 기록이 없습니다.",
+        "log_path": None,
+        "last_exit_code": None,
+        "latest_job": None,
+    }
+
+
+def build_effective_pipeline_status(
+    pipeline_status: dict | None,
+    *,
+    training_progress: dict | None = None,
+    completed_jobs: list[dict] | None = None,
+    workspace_dir: Path | None = None,
+) -> tuple[dict, dict]:
+    raw = dict(pipeline_status or {})
+    progress = training_progress or {}
+    jobs = sort_jobs_by_recency(completed_jobs)
+    latest_job = jobs[0] if jobs else None
+    latest_success_job = next(
+        (job for job in jobs if str(job.get("state") or "").strip().lower() in {"completed", "completed_warning"}),
+        None,
+    )
+
+    raw_updated = parse_iso_datetime(raw.get("updated_at"))
+    progress_updated = parse_iso_datetime(progress.get("updated_at"))
+    latest_job_updated = parse_iso_datetime(
+        latest_job.get("finished_at") if isinstance(latest_job, dict) else None
+    ) or parse_iso_datetime(latest_job.get("started_at") if isinstance(latest_job, dict) else None)
+
+    warnings: list[str] = []
+    effective = dict(raw)
+    effective_source = "pipeline_status"
+
+    expected_workspace = None
+    if workspace_dir is not None:
+        try:
+            expected_workspace = str(workspace_dir.resolve())
+        except OSError:
+            expected_workspace = str(workspace_dir)
+
+    raw_workspace = str(raw.get("workspace_dir") or "").strip()
+    workspace_mismatch = False
+    if expected_workspace and raw_workspace:
+        workspace_mismatch = raw_workspace.replace("\\", "/").rstrip("/") != expected_workspace.replace("\\", "/").rstrip("/")
+        if workspace_mismatch:
+            warnings.append(
+                "pipeline_status.json의 workspace_dir가 현재 대시보드 workspace와 달라 오래된 상태 파일일 가능성이 큽니다."
+            )
+
+    freshest_nonraw = None
+    for candidate in (progress_updated, latest_job_updated):
+        if candidate is None:
+            continue
+        if freshest_nonraw is None or candidate > freshest_nonraw:
+            freshest_nonraw = candidate
+
+    stale_pipeline_status = False
+    if freshest_nonraw is not None:
+        if raw_updated is None or raw_updated < freshest_nonraw:
+            stale_pipeline_status = True
+            warnings.append("pipeline_status.json보다 최신 학습 결과 또는 실행 이력이 발견되어 상태를 보정했습니다.")
+    if workspace_mismatch:
+        stale_pipeline_status = True
+
+    if stale_pipeline_status:
+        if latest_job is not None and latest_job_updated is not None and (
+            progress_updated is None or latest_job_updated >= progress_updated
+        ):
+            latest_job_state = str(latest_job.get("state") or "").strip().lower() or "completed"
+            effective.update(
+                {
+                    "stage": (
+                        "completed"
+                        if latest_job_state in {"completed", "completed_warning"}
+                        else ("error" if latest_job_state in {"error", "aborted"} else latest_job_state)
+                    ),
+                    "state": latest_job_state,
+                    "message": str(latest_job.get("message") or infer_job_message(latest_job)),
+                    "workspace_dir": expected_workspace or raw_workspace or None,
+                    "updated_at": latest_job.get("finished_at") or latest_job.get("started_at"),
+                }
+            )
+            effective_source = "launcher_history"
+        elif progress_updated is not None:
+            progress_state = str(progress.get("state") or "completed").strip().lower() or "completed"
+            effective.update(
+                {
+                    "stage": "completed" if progress_state == "completed" else str(raw.get("stage") or progress_state),
+                    "state": progress_state,
+                    "message": (
+                        str(raw.get("message") or "").strip()
+                        if progress_state != "completed" and str(raw.get("message") or "").strip()
+                        else "최근 학습 결과를 표시합니다."
+                    ),
+                    "workspace_dir": expected_workspace or raw_workspace or None,
+                    "updated_at": progress.get("updated_at"),
+                }
+            )
+            effective_source = "training_progress"
+
+    if expected_workspace and not effective.get("workspace_dir"):
+        effective["workspace_dir"] = expected_workspace
+
+    diagnostics = {
+        "warnings": warnings,
+        "pipeline_status_source": effective_source,
+        "pipeline_status_stale": stale_pipeline_status,
+        "sources": {
+            "pipeline_status": {
+                "updated_at": raw.get("updated_at"),
+                "state": raw.get("state"),
+                "workspace_dir": raw.get("workspace_dir"),
+            },
+            "training_progress": {
+                "updated_at": progress.get("updated_at"),
+                "state": progress.get("state"),
+                "history_len": len(progress.get("history") or []) if isinstance(progress, dict) else 0,
+            },
+            "latest_job": latest_job,
+            "latest_success_job": latest_success_job,
+        },
+    }
+    return effective, diagnostics
+
+
 def summarize_manifest_total(path: Path) -> int:
     if not path.exists():
         return 0
@@ -305,9 +564,7 @@ def build_recent_jobs(launcher_history: dict, limit: int = 5) -> list[dict]:
         return []
 
     recent: list[dict] = []
-    for job in completed_jobs[:limit]:
-        if not isinstance(job, dict):
-            continue
+    for job in sort_jobs_by_recency(completed_jobs)[:limit]:
         recent.append(
             {
                 "datasetkey": job.get("datasetkey"),
@@ -327,6 +584,13 @@ def get_latest_job(paths: dict) -> dict:
     completed_jobs = launcher_history.get("completed_jobs") or []
     if not isinstance(completed_jobs, list) or not completed_jobs:
         pipeline_status = read_json(paths["pipeline_status"]) or {}
+        training_progress = read_json(paths["training_progress"]) or {}
+        effective_pipeline_status, _diagnostics = build_effective_pipeline_status(
+            pipeline_status,
+            training_progress=training_progress,
+            completed_jobs=[],
+            workspace_dir=paths.get("workspace_dir"),
+        )
         metrics_path = paths["artifacts_dir"] / "metrics.json"
         model_path = paths["artifacts_dir"] / "best_action_model.pt"
         has_recent_artifacts = metrics_path.exists() or model_path.exists()
@@ -348,24 +612,21 @@ def get_latest_job(paths: dict) -> dict:
                 "filekey": None,
                 "state": "completed",
                 "started_at": None,
-                "finished_at": fallback_finished_at or pipeline_status.get("updated_at"),
+                "finished_at": fallback_finished_at or effective_pipeline_status.get("updated_at"),
                 "duration_minutes": None,
-                "message": pipeline_status.get("message") or "최근 학습 결과를 불러왔습니다.",
+                "message": effective_pipeline_status.get("message") or "최근 학습 결과를 불러왔습니다.",
             }
         return {
             "datasetkey": None,
             "filekey": None,
-            "state": pipeline_status.get("state") or "offline",
+            "state": effective_pipeline_status.get("state") or "offline",
             "started_at": None,
-            "finished_at": pipeline_status.get("updated_at"),
+            "finished_at": effective_pipeline_status.get("updated_at"),
             "duration_minutes": None,
-            "message": pipeline_status.get("message") or "최근 학습 기록이 아직 없습니다.",
+            "message": effective_pipeline_status.get("message") or "최근 학습 기록이 아직 없습니다.",
         }
 
-    def sort_key(job: dict) -> str:
-        return str(job.get("finished_at") or job.get("started_at") or "")
-
-    latest_job = max(completed_jobs, key=sort_key)
+    latest_job = sort_jobs_by_recency(completed_jobs)[0]
     return {
         "datasetkey": latest_job.get("datasetkey"),
         "filekey": latest_job.get("filekey"),

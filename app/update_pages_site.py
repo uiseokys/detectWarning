@@ -9,6 +9,8 @@ from reporting import (
     analyze_class_balance,
     STATE_SCHEMA_VERSION,
     build_per_class_support,
+    build_effective_pipeline_status,
+    build_path_diagnostic,
     build_recent_jobs,
     get_best_macro_f1,
     get_latest_job,
@@ -17,6 +19,7 @@ from reporting import (
     now_iso,
     read_json,
     safe_number,
+    sort_jobs_by_recency,
     summarize_stage_timings,
     summarize_manifest,
 )
@@ -153,7 +156,15 @@ def build_latest_result_payload(
     latest_job = get_latest_job(paths)
     launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
     continual_state = read_json(paths["continual_state"]) or {}
-    pipeline_status = read_json(paths["pipeline_status"]) or {}
+    training_progress = read_json(paths["training_progress"]) or {}
+    raw_pipeline_status = read_json(paths["pipeline_status"]) or {}
+    completed_jobs = sort_jobs_by_recency(launcher_history.get("completed_jobs") or [])
+    pipeline_status, pipeline_diagnostics = build_effective_pipeline_status(
+        raw_pipeline_status,
+        training_progress=training_progress,
+        completed_jobs=completed_jobs,
+        workspace_dir=paths.get("workspace_dir"),
+    )
     cumulative_skip_report = read_json(paths["cumulative_skip_report"]) or {
         "summary": {"total_issues": 0, "broken_count": 0, "skipped_count": 0},
         "issues": [],
@@ -271,6 +282,15 @@ def build_latest_result_payload(
         "stage_timings": stage_timing_summary,
         "issues": cumulative_skip_report,
         "recent_jobs": recent_jobs,
+        "diagnostics": {
+            "pipeline": pipeline_diagnostics,
+            "files": {
+                "pipeline_status": build_path_diagnostic(paths["pipeline_status"]),
+                "training_progress": build_path_diagnostic(paths["training_progress"]),
+                "metrics": build_path_diagnostic(paths["artifacts_dir"] / "metrics.json"),
+                "launcher_history": build_path_diagnostic(paths["workspace_dir"] / "launcher_history.json"),
+            },
+        },
         "notes": [
             "실시간 대시보드가 켜져 있으면 이 페이지는 live 화면으로 자동 전환됩니다.",
             "경고 종료는 산출물 저장까지 완료되었지만 종료 단계에서만 경고 코드가 남은 상태입니다.",

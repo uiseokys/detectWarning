@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from reporting import read_json, summarize_manifest
+from reporting import enrich_completed_job, read_json, summarize_manifest
 from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
 
@@ -100,6 +100,7 @@ def build_retry_job_from(job: dict) -> dict:
 def snapshot_job(job: dict | None) -> dict | None:
     if not job:
         return None
+    job = enrich_completed_job(job)
     return {
         "job_id": job.get("job_id"),
         "filekey": job.get("filekey"),
@@ -111,6 +112,8 @@ def snapshot_job(job: dict | None) -> dict | None:
         "finished_at": job.get("finished_at"),
         "state": job.get("state"),
         "exit_code": job.get("exit_code"),
+        "duration_minutes": job.get("duration_minutes"),
+        "message": job.get("message"),
         "runtime_config_path": str(job["runtime_config_path"]) if job.get("runtime_config_path") else None,
         "log_path": str(job["log_path"]) if job.get("log_path") else None,
         "result_summary": job.get("result_summary"),

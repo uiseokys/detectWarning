@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import hashlib
+from html import escape
 import json
 import os
 import re
@@ -14,11 +15,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from action_training_pipeline import get_target_labels, load_config, resolve_paths
 from dashboard_runtime import (
@@ -40,10 +42,16 @@ from dashboard_runtime import (
 from reporting import (
     STATE_SCHEMA_VERSION,
     analyze_class_balance,
+    build_effective_pipeline_status,
+    build_path_diagnostic,
+    build_restored_launcher_summary,
+    enrich_completed_job,
     normalize_metric_payload,
     read_json,
+    sort_jobs_by_recency,
     summarize_manifest,
 )
+from training_dashboard_view import render_dashboard_page
 from training_config import resolve_pages_sync_config
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
@@ -52,6 +60,11 @@ GPU_STATUS_CACHE: dict[str, object] = {"timestamp": 0.0, "value": None}
 GPU_STATUS_CACHE_LOCK = threading.Lock()
 OVERVIEW_CACHE: dict[tuple, dict] = {}
 OVERVIEW_CACHE_LOCK = threading.Lock()
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -611,7 +624,53 @@ def create_app(config_path: Path) -> FastAPI:
         "last_exit_code": None,
         "last_message": "아직 실행 기록이 없습니다.",
         "log_path": None,
+        "pages_sync_warning": None,
     }
+
+    def apply_restored_launcher_summary(completed_jobs_override: list[dict] | None = None) -> None:
+        if isinstance(launcher_state.get("process"), subprocess.Popen):
+            return
+        completed_jobs = (
+            completed_jobs_override
+            if isinstance(completed_jobs_override, list)
+            else launcher_state.get("completed_jobs", [])
+        )
+        summary = build_restored_launcher_summary(
+            completed_jobs if isinstance(completed_jobs, list) else [],
+            pipeline_status=read_json(paths["pipeline_status"]) or {},
+            training_progress=read_json(paths["training_progress"]) or {},
+        )
+        launcher_state["last_state"] = summary.get("state") or launcher_state.get("last_state") or "idle"
+        launcher_state["last_message"] = summary.get("message") or launcher_state.get("last_message") or "아직 실행 기록이 없습니다."
+        if summary.get("log_path"):
+            launcher_state["log_path"] = summary.get("log_path")
+        if summary.get("last_exit_code") is not None:
+            launcher_state["last_exit_code"] = summary.get("last_exit_code")
+
+    def remember_pages_sync_warning(action: str, exc: Exception) -> None:
+        message = f"[pages-sync] {action} failed: {exc}"
+        print(message, file=sys.stderr)
+        launcher_state["pages_sync_warning"] = str(exc)
+
+    def safe_sync_pages_report(action: str = "report") -> None:
+        try:
+            sync_pages_report(
+                paths,
+                pages_sync,
+                project_name=str(pages_sync["project_name"]),
+                report_title=str(pages_sync["report_title"]),
+                target_labels=get_target_labels(config),
+            )
+            launcher_state["pages_sync_warning"] = None
+        except Exception as exc:
+            remember_pages_sync_warning(action, exc)
+
+    def safe_sync_pages_live(status: str, *, action: str) -> None:
+        try:
+            sync_pages_live(pages_sync, status)
+            launcher_state["pages_sync_warning"] = None
+        except Exception as exc:
+            remember_pages_sync_warning(action, exc)
 
     if launcher_history_path.exists():
         try:
@@ -619,28 +678,37 @@ def create_app(config_path: Path) -> FastAPI:
                 history_payload = json.load(handle)
             completed_jobs = history_payload.get("completed_jobs", [])
             if isinstance(completed_jobs, list):
-                launcher_state["completed_jobs"] = completed_jobs
+                normalized_completed_jobs = sort_jobs_by_recency(completed_jobs)
+                launcher_state["completed_jobs"] = normalized_completed_jobs
+                if normalized_completed_jobs != completed_jobs:
+                    persist_launcher_history(launcher_history_path, launcher_state)
+                apply_restored_launcher_summary(launcher_state["completed_jobs"])
         except (OSError, json.JSONDecodeError):
             launcher_state["completed_jobs"] = []
 
     if not launcher_state["completed_jobs"]:
         restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
         if restored_jobs:
-            launcher_state["completed_jobs"] = restored_jobs
+            launcher_state["completed_jobs"] = sort_jobs_by_recency(restored_jobs)
             persist_launcher_history(launcher_history_path, launcher_state)
-            launcher_state["last_message"] = "기존 job 로그를 바탕으로 학습 완료 이력을 복구했습니다."
+            apply_restored_launcher_summary(launcher_state["completed_jobs"])
 
     def reload_completed_jobs_from_history() -> list[dict]:
         history_payload = read_json(launcher_history_path) or {}
         completed_jobs = history_payload.get("completed_jobs", [])
         if isinstance(completed_jobs, list) and completed_jobs:
-            launcher_state["completed_jobs"] = completed_jobs
-            return completed_jobs
+            normalized_completed_jobs = sort_jobs_by_recency(completed_jobs)
+            launcher_state["completed_jobs"] = normalized_completed_jobs
+            if normalized_completed_jobs != completed_jobs:
+                persist_launcher_history(launcher_history_path, launcher_state)
+            apply_restored_launcher_summary(launcher_state["completed_jobs"])
+            return launcher_state["completed_jobs"]
         restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
         if restored_jobs:
-            launcher_state["completed_jobs"] = restored_jobs
+            launcher_state["completed_jobs"] = sort_jobs_by_recency(restored_jobs)
             persist_launcher_history(launcher_history_path, launcher_state)
-            return restored_jobs
+            apply_restored_launcher_summary(launcher_state["completed_jobs"])
+            return launcher_state["completed_jobs"]
         return []
 
     workspace_default_dir = paths.get("workspace_default_dir")
@@ -730,13 +798,7 @@ def create_app(config_path: Path) -> FastAPI:
             stage_progress=0.0,
         )
         persist_launcher_history(launcher_history_path, launcher_state)
-        sync_pages_report(
-            paths,
-            pages_sync,
-            project_name=str(pages_sync["project_name"]),
-            report_title=str(pages_sync["report_title"]),
-            target_labels=get_target_labels(config),
-        )
+        safe_sync_pages_report("reset workspace report")
 
     def stop_process_tree(process: subprocess.Popen | None) -> int | None:
         if not isinstance(process, subprocess.Popen):
@@ -845,6 +907,7 @@ def create_app(config_path: Path) -> FastAPI:
         job["state"] = "running"
         job["runtime_config_path"] = runtime_config_path
         job["log_path"] = log_path
+        job["message"] = startup_message.replace("[launcher] ", "")
         launcher_state["process"] = process
         launcher_state["started_at"] = job["started_at"]
         launcher_state["runtime_config_path"] = runtime_config_path
@@ -855,7 +918,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_message"] = (
             f"datasetkey {job.get('datasetkey', '-')} | filekey {job['filekey']} 학습을 진행 중입니다."
         )
-        sync_pages_live(pages_sync, "online")
+        safe_sync_pages_live("online", action="job start live status")
 
     def update_process_state() -> None:
         process = launcher_state.get("process")
@@ -885,19 +948,15 @@ def create_app(config_path: Path) -> FastAPI:
                     current_job["exit_code"] = exit_code
                     final_state, final_message = classify_job_exit(paths, current_job, exit_code)
                     current_job["state"] = final_state
+                    current_job["message"] = final_message
                     current_job["result_summary"] = collect_result_summary(paths)
+                    current_job = enrich_completed_job(current_job)
                     completed_jobs = launcher_state.setdefault("completed_jobs", [])
                     if isinstance(completed_jobs, list):
                         completed_jobs.insert(0, snapshot_job(current_job))
                         del completed_jobs[30:]
                     persist_launcher_history(launcher_history_path, launcher_state)
-                    sync_pages_report(
-                        paths,
-                        pages_sync,
-                        project_name=str(pages_sync["project_name"]),
-                        report_title=str(pages_sync["report_title"]),
-                        target_labels=get_target_labels(config),
-                    )
+                    safe_sync_pages_report("job completion report")
                 launcher_state["process"] = None
                 launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
@@ -937,9 +996,12 @@ def create_app(config_path: Path) -> FastAPI:
             completed_jobs = launcher_state.get("completed_jobs", [])
             if (not isinstance(completed_jobs, list) or not completed_jobs) and current_job is None:
                 completed_jobs = reload_completed_jobs_from_history()
+            elif current_job is None:
+                apply_restored_launcher_summary(completed_jobs if isinstance(completed_jobs, list) else [])
         return {
             "state": launcher_state.get("last_state", "idle"),
             "message": launcher_state.get("last_message", ""),
+            "pages_sync_warning": launcher_state.get("pages_sync_warning"),
             "pid": active_pid,
             "started_at": launcher_state.get("started_at"),
             "auto_start_enabled": bool(launcher_state.get("auto_start_enabled", True)),
@@ -953,28 +1015,16 @@ def create_app(config_path: Path) -> FastAPI:
             "log_path": str(launcher_state["log_path"]) if launcher_state.get("log_path") else None,
         }
 
-    sync_pages_report(
-        paths,
-        pages_sync,
-        project_name=str(pages_sync["project_name"]),
-        report_title=str(pages_sync["report_title"]),
-        target_labels=get_target_labels(config),
-    )
-    sync_pages_live(pages_sync, "online")
+    safe_sync_pages_report("startup report")
+    safe_sync_pages_live("online", action="startup live status")
 
     def sync_pages_shutdown() -> None:
         try:
-            sync_pages_report(
-                paths,
-                pages_sync,
-                project_name=str(pages_sync["project_name"]),
-                report_title=str(pages_sync["report_title"]),
-                target_labels=get_target_labels(config),
-            )
+            safe_sync_pages_report("shutdown report")
         except Exception as exc:
             print(f"[pages-sync] 종료 시 report 동기화 실패: {exc}")
         try:
-            sync_pages_live(pages_sync, "offline")
+            safe_sync_pages_live("offline", action="shutdown live status")
         except Exception as exc:
             print(f"[pages-sync] 종료 시 offline 동기화 실패: {exc}")
         try:
@@ -987,14 +1037,370 @@ def create_app(config_path: Path) -> FastAPI:
     worker = threading.Thread(target=queue_worker, daemon=True)
     worker.start()
 
-    def render_dashboard() -> str:
-        return """<!DOCTYPE html>
+    def server_tone_class(state: str) -> str:
+        normalized = str(state or "").strip().lower()
+        if normalized in {"completed", "completed_warning", "online"}:
+            return "tone-good"
+        if normalized in {"running", "queued"}:
+            return "tone-accent"
+        if normalized in {"paused", "warning"}:
+            return "tone-warn"
+        if normalized in {"error", "aborted", "offline"}:
+            return "tone-danger"
+        return "tone-neutral"
+
+    def build_server_snapshot_html(overview: dict | None) -> str:
+        overview = overview or {}
+        launcher = overview.get("launcher") or {}
+        pipeline = overview.get("pipeline_status") or {}
+        progress = overview.get("training_progress") or {}
+        dataset = overview.get("dataset") or {}
+        latest = progress.get("latest") or {}
+        current_state = launcher.get("state") or pipeline.get("state") or "idle"
+        prepared_total = sum(
+            int((dataset.get(key) or {}).get("total", 0) or 0)
+            for key in ("prepared_train", "prepared_val", "prepared_test")
+        )
+        raw_total = int((dataset.get("raw") or {}).get("total", 0) or 0)
+        completed_jobs = launcher.get("completed_jobs") or []
+        latest_jobs = []
+        for job in completed_jobs[:5]:
+            if not isinstance(job, dict):
+                continue
+            latest_jobs.append(
+                "<li>"
+                f"<strong>{escape(str(job.get('filekey') or '-'))}</strong>"
+                f" <span style=\"color: var(--muted);\">{escape(str(job.get('state') or '-'))}</span>"
+                "</li>"
+            )
+        jobs_html = "".join(latest_jobs) or "<li>완료된 작업 기록이 없습니다.</li>"
+        pages_sync_warning = launcher.get("pages_sync_warning")
+        warning_html = ""
+        if pages_sync_warning:
+            warning_html = (
+                "<div style=\"margin-top:12px;padding:12px 14px;border-radius:14px;"
+                "background:rgba(217,119,6,0.08);border:1px solid rgba(217,119,6,0.16);"
+                "color:#9a3412;font-size:13px;line-height:1.6;\">"
+                "<strong>Pages 동기화 경고</strong><br>"
+                f"{escape(str(pages_sync_warning))}"
+                "</div>"
+            )
+        latest_epoch = latest.get("epoch", "-")
+        latest_acc = latest.get("val_accuracy")
+        latest_f1 = latest.get("val_macro_f1")
+        best_f1 = progress.get("best_val_macro_f1")
+        best_epoch = progress.get("best_epoch", "-")
+        latest_acc_text = f"{float(latest_acc):.3f}" if latest_acc is not None else "-"
+        latest_f1_text = f"{float(latest_f1):.3f}" if latest_f1 is not None else "-"
+        best_f1_text = f"{float(best_f1):.3f}" if best_f1 is not None else "-"
+        message = launcher.get("message") or pipeline.get("message") or "상세 메시지가 없습니다."
+        return (
+            "<section class=\"card\" style=\"margin-bottom:20px;padding:24px 24px 18px;\">"
+            "<div style=\"display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start;\">"
+            "<div>"
+            "<div class=\"hero-side-label\">Server Snapshot</div>"
+            "<h2 style=\"margin:6px 0 8px;font-size:24px;letter-spacing:-0.03em;\">"
+            "현재 결과 요약</h2>"
+            "<div style=\"color:var(--muted);font-size:14px;line-height:1.7;\">"
+            "스크립트 렌더링이 멈춰도 이 영역은 서버가 직접 채웁니다."
+            "</div>"
+            "</div>"
+            f"<div class=\"status-pill {server_tone_class(current_state)}\">{escape(str(current_state))}</div>"
+            "</div>"
+            "<div class=\"hero-meta\" style=\"margin-top:16px;\">"
+            f"<div class=\"hero-chip\"><strong>Best F1</strong> {best_f1_text} @ epoch {escape(str(best_epoch))}</div>"
+            f"<div class=\"hero-chip\"><strong>Latest</strong> epoch {escape(str(latest_epoch))} / acc {latest_acc_text} / f1 {latest_f1_text}</div>"
+            f"<div class=\"hero-chip\"><strong>Dataset</strong> raw {raw_total} / prepared {prepared_total}</div>"
+            f"<div class=\"hero-chip\"><strong>Completed Jobs</strong> {len(completed_jobs)}</div>"
+            "</div>"
+            "<div style=\"margin-top:14px;padding:12px 14px;border-radius:14px;background:rgba(255,255,255,0.78);"
+            "border:1px solid rgba(148,163,184,0.16);color:var(--muted);font-size:13px;line-height:1.7;\">"
+            f"{escape(str(message))}"
+            "</div>"
+            f"{warning_html}"
+            "<div style=\"margin-top:16px;display:grid;grid-template-columns:minmax(0,1.3fr) minmax(240px,0.7fr);gap:16px;\">"
+            "<div style=\"padding:16px;border-radius:18px;background:rgba(248,250,252,0.88);border:1px solid rgba(148,163,184,0.14);\">"
+            "<div class=\"hero-side-label\">Workspace</div>"
+            f"<div style=\"margin-top:8px;font-size:13px;line-height:1.7;color:var(--muted);word-break:break-all;\">{escape(str(overview.get('workspace_dir') or '-'))}</div>"
+            "</div>"
+            "<div style=\"padding:16px;border-radius:18px;background:rgba(248,250,252,0.88);border:1px solid rgba(148,163,184,0.14);\">"
+            "<div class=\"hero-side-label\">Recent Jobs</div>"
+            f"<ol style=\"margin:10px 0 0;padding-left:18px;color:var(--ink);line-height:1.8;\">{jobs_html}</ol>"
+            "</div>"
+            "</div>"
+            "</section>"
+        )
+
+    def build_server_fallback_sections_html(overview: dict | None) -> str:
+        overview = overview or {}
+        progress = overview.get("training_progress") or {}
+        metrics = overview.get("metrics") or {}
+        dataset = overview.get("dataset") or {}
+        launcher = overview.get("launcher") or {}
+        diagnostics = overview.get("diagnostics") or {}
+        final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
+        labels = progress.get("labels") or metrics.get("labels") or []
+        history = list(progress.get("history") or metrics.get("history") or [])
+        completed_jobs = launcher.get("completed_jobs") or []
+        per_class_rows = final_validation.get("per_class") or []
+        warning_rows = diagnostics.get("warnings") or []
+
+        def fmt(value, digits: int = 3) -> str:
+            if value in (None, ""):
+                return "-"
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return escape(str(value))
+
+        dataset_rows = []
+        for key in ("raw", "train", "val", "test", "prepared_train", "prepared_val", "prepared_test"):
+            info = dataset.get(key) or {}
+            total = int(info.get("total", 0) or 0)
+            if total <= 0:
+                continue
+            labels_text = ", ".join(
+                f"{label} {count}" for label, count in sorted((info.get("by_label") or {}).items())
+            ) or "-"
+            dataset_rows.append(
+                "<tr>"
+                f"<td>{escape(key)}</td>"
+                f"<td>{total}</td>"
+                f"<td>{escape(labels_text)}</td>"
+                "</tr>"
+            )
+        dataset_html = "".join(dataset_rows) or (
+            "<tr><td colspan=\"3\" style=\"text-align:center;color:var(--muted);\">표시할 누적 데이터가 없습니다.</td></tr>"
+        )
+        dataset_list_items = []
+        for key in ("raw", "train", "val", "test", "prepared_train", "prepared_val", "prepared_test"):
+            info = dataset.get(key) or {}
+            total = int(info.get("total", 0) or 0)
+            if total <= 0:
+                continue
+            labels_text = ", ".join(
+                f"{label} {count}" for label, count in sorted((info.get("by_label") or {}).items())
+            ) or "-"
+            dataset_list_items.append(
+                f"<li><strong>{escape(key)}</strong> {total}개"
+                f"<div class=\"server-fallback-copy\">{escape(labels_text)}</div></li>"
+            )
+        dataset_list_html = "".join(dataset_list_items) or (
+            "<li><strong>누적 데이터셋</strong><div class=\"server-fallback-copy\">표시할 데이터가 없습니다.</div></li>"
+        )
+
+        history_rows = []
+        for row in history[-10:]:
+            if not isinstance(row, dict):
+                continue
+            history_rows.append(
+                "<tr>"
+                f"<td>{escape(str(row.get('epoch', '-')))}</td>"
+                f"<td>{fmt(row.get('train_loss'), 4)}</td>"
+                f"<td>{fmt(row.get('val_loss'), 4)}</td>"
+                f"<td>{fmt(row.get('val_accuracy'), 4)}</td>"
+                f"<td>{fmt(row.get('val_macro_f1'), 4)}</td>"
+                "</tr>"
+            )
+        history_html = "".join(history_rows) or (
+            "<tr><td colspan=\"5\" style=\"text-align:center;color:var(--muted);\">epoch history가 없습니다.</td></tr>"
+        )
+        history_list_items = []
+        for row in history[-5:]:
+            if not isinstance(row, dict):
+                continue
+            history_list_items.append(
+                "<li>"
+                f"<strong>epoch {escape(str(row.get('epoch', '-')))}</strong>"
+                f"<div class=\"server-fallback-copy\">"
+                f"train {fmt(row.get('train_loss'), 4)} / val {fmt(row.get('val_loss'), 4)} / "
+                f"acc {fmt(row.get('val_accuracy'), 4)} / f1 {fmt(row.get('val_macro_f1'), 4)}"
+                "</div>"
+                "</li>"
+            )
+        history_list_html = "".join(history_list_items) or (
+            "<li><strong>Epoch History</strong><div class=\"server-fallback-copy\">기록이 없습니다.</div></li>"
+        )
+
+        support_map: dict[int, int] = {}
+        confusion = final_validation.get("confusion_matrix") or []
+        if isinstance(confusion, list):
+            for index, row in enumerate(confusion):
+                if isinstance(row, list):
+                    support_map[index] = sum(int(value or 0) for value in row)
+        per_class_html_rows = []
+        for index, row in enumerate(per_class_rows):
+            if not isinstance(row, dict):
+                continue
+            class_index = int(row.get("class_index", index) or index)
+            label = labels[class_index] if 0 <= class_index < len(labels) else str(row.get("label") or class_index)
+            per_class_html_rows.append(
+                "<tr>"
+                f"<td>{escape(label)}</td>"
+                f"<td>{fmt(row.get('precision'), 4)}</td>"
+                f"<td>{fmt(row.get('recall'), 4)}</td>"
+                f"<td>{fmt(row.get('f1'), 4)}</td>"
+                f"<td>{support_map.get(class_index, 0)}</td>"
+                "</tr>"
+            )
+        per_class_html = "".join(per_class_html_rows) or (
+            "<tr><td colspan=\"5\" style=\"text-align:center;color:var(--muted);\">클래스별 지표가 없습니다.</td></tr>"
+        )
+        per_class_list_items = []
+        for index, row in enumerate(per_class_rows):
+            if not isinstance(row, dict):
+                continue
+            class_index = int(row.get("class_index", index) or index)
+            label = labels[class_index] if 0 <= class_index < len(labels) else str(row.get("label") or class_index)
+            per_class_list_items.append(
+                "<li>"
+                f"<strong>{escape(label)}</strong>"
+                f"<div class=\"server-fallback-copy\">"
+                f"precision {fmt(row.get('precision'), 4)} / "
+                f"recall {fmt(row.get('recall'), 4)} / "
+                f"f1 {fmt(row.get('f1'), 4)} / "
+                f"support {support_map.get(class_index, 0)}"
+                "</div>"
+                "</li>"
+            )
+        per_class_list_html = "".join(per_class_list_items) or (
+            "<li><strong>클래스별 지표</strong><div class=\"server-fallback-copy\">기록이 없습니다.</div></li>"
+        )
+
+        job_rows = []
+        for job in completed_jobs[:8]:
+            if not isinstance(job, dict):
+                continue
+            summary = job.get("result_summary") or {}
+            prepared_total = sum(
+                int(summary.get(key, 0) or 0)
+                for key in ("prepared_train_total", "prepared_val_total", "prepared_test_total")
+            )
+            job_rows.append(
+                "<tr>"
+                f"<td>{escape(str(job.get('filekey') or '-'))}</td>"
+                f"<td>{escape(str(job.get('state') or '-'))}</td>"
+                f"<td>{prepared_total}</td>"
+                f"<td>{escape(str(job.get('finished_at') or job.get('started_at') or '-'))}</td>"
+                "</tr>"
+            )
+        jobs_fallback_html = "".join(job_rows) or (
+            "<tr><td colspan=\"4\" style=\"text-align:center;color:var(--muted);\">완료 이력이 없습니다.</td></tr>"
+        )
+        jobs_list_items = []
+        for job in completed_jobs[:6]:
+            if not isinstance(job, dict):
+                continue
+            summary = job.get("result_summary") or {}
+            prepared_total = sum(
+                int(summary.get(key, 0) or 0)
+                for key in ("prepared_train_total", "prepared_val_total", "prepared_test_total")
+            )
+            jobs_list_items.append(
+                "<li>"
+                f"<strong>{escape(str(job.get('filekey') or '-'))} / {escape(str(job.get('state') or '-'))}</strong>"
+                f"<div class=\"server-fallback-copy\">prepared {prepared_total} / "
+                f"finished {escape(str(job.get('finished_at') or job.get('started_at') or '-'))}</div>"
+                "</li>"
+            )
+        jobs_list_html = "".join(jobs_list_items) or (
+            "<li><strong>최근 작업 이력</strong><div class=\"server-fallback-copy\">기록이 없습니다.</div></li>"
+        )
+
+        warning_html = ""
+        if warning_rows:
+            warning_items = "".join(
+                f"<li style=\"margin:4px 0;\">{escape(str(item))}</li>"
+                for item in warning_rows[:6]
+            )
+            warning_html = (
+                "<div style=\"margin-bottom:16px;padding:14px 16px;border-radius:16px;"
+                "background:rgba(217,119,6,0.08);border:1px solid rgba(217,119,6,0.16);"
+                "color:#9a3412;font-size:13px;line-height:1.7;\">"
+                "<strong>상태 진단</strong>"
+                f"<ul style=\"margin:8px 0 0 18px;padding:0;\">{warning_items}</ul>"
+                "</div>"
+            )
+
+        return (
+            "<section class=\"server-fallback-data\">"
+            "<div class=\"section-title\">"
+            "<div><h2>서버 렌더링 결과</h2><p>브라우저 스크립트가 실행되지 않아도 핵심 학습 데이터를 바로 보여줍니다.</p></div>"
+            "<div class=\"section-pill\">Fallback</div>"
+            "</div>"
+            f"{warning_html}"
+            "<div class=\"server-fallback-summary\">"
+            "<article class=\"mini-card\"><div class=\"mini-title\">누적 데이터셋</div>"
+            f"<ul class=\"server-fallback-list\">{dataset_list_html}</ul></article>"
+            "<article class=\"mini-card\"><div class=\"mini-title\">최근 Epoch</div>"
+            f"<ul class=\"server-fallback-list\">{history_list_html}</ul></article>"
+            "<article class=\"mini-card\"><div class=\"mini-title\">클래스별 지표</div>"
+            f"<ul class=\"server-fallback-list\">{per_class_list_html}</ul></article>"
+            "<article class=\"mini-card\"><div class=\"mini-title\">최근 작업 이력</div>"
+            f"<ul class=\"server-fallback-list\">{jobs_list_html}</ul></article>"
+            "</div>"
+            "<div class=\"server-fallback-grid\">"
+            "<article class=\"panel\"><div class=\"panel-head\"><div><h2 class=\"panel-title\">누적 데이터셋</h2><div class=\"panel-copy\">cumulative manifests 기준</div></div></div><div class=\"panel-body\">"
+            "<table class=\"table metric-table\"><thead><tr><th>split</th><th>total</th><th>labels</th></tr></thead>"
+            f"<tbody>{dataset_html}</tbody></table></div></article>"
+            "<article class=\"panel\"><div class=\"panel-head\"><div><h2 class=\"panel-title\">Epoch History</h2><div class=\"panel-copy\">최근 10 epoch</div></div></div><div class=\"panel-body\">"
+            "<table class=\"table metric-table\"><thead><tr><th>epoch</th><th>train loss</th><th>val loss</th><th>val acc</th><th>val f1</th></tr></thead>"
+            f"<tbody>{history_html}</tbody></table></div></article>"
+            "<article class=\"panel\"><div class=\"panel-head\"><div><h2 class=\"panel-title\">클래스별 지표</h2><div class=\"panel-copy\">최종 validation 결과</div></div></div><div class=\"panel-body\">"
+            "<table class=\"table metric-table\"><thead><tr><th>label</th><th>precision</th><th>recall</th><th>f1</th><th>support</th></tr></thead>"
+            f"<tbody>{per_class_html}</tbody></table></div></article>"
+            "<article class=\"panel\"><div class=\"panel-head\"><div><h2 class=\"panel-title\">최근 작업 이력</h2><div class=\"panel-copy\">launcher history 기준</div></div></div><div class=\"panel-body\">"
+            "<table class=\"table metric-table\"><thead><tr><th>filekey</th><th>state</th><th>prepared</th><th>finished</th></tr></thead>"
+            f"<tbody>{jobs_fallback_html}</tbody></table></div></article>"
+            "</div>"
+            "</section>"
+        )
+
+    def serialize_initial_overview(overview: dict | None) -> str:
+        return json.dumps(overview or {}, ensure_ascii=False).replace("</", "<\\/")
+
+    def render_dashboard(initial_overview: dict | None = None) -> str:
+        template = """<!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Training Dashboard</title>
-  <script>
+  <script id="dashboardAppSource" type="text/plain">
+    window.__dashboardBootErrors = [];
+    window.addEventListener('error', function (event) {
+      try {
+        var message = 'unknown error';
+        if (event && typeof event.message === 'string' && event.message) {
+          message = event.message;
+        } else if (event && event.error !== undefined && event.error !== null) {
+          message = String(event.error);
+        }
+        window.__dashboardBootErrors.push(message);
+        var banner = document.getElementById('bootErrorBanner');
+        if (banner) {
+          banner.textContent = '브라우저 스크립트 오류: ' + message;
+          banner.style.display = 'block';
+        }
+      } catch (error) {}
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+      try {
+        var reason = event && event.reason !== undefined ? event.reason : null;
+        var message = 'unknown rejection';
+        if (reason && typeof reason.message === 'string' && reason.message) {
+          message = reason.message;
+        } else if (reason !== undefined && reason !== null) {
+          message = String(reason);
+        }
+        window.__dashboardBootErrors.push(message);
+        var banner = document.getElementById('bootErrorBanner');
+        if (banner) {
+          banner.textContent = '브라우저 스크립트 오류: ' + message;
+          banner.style.display = 'block';
+        }
+      } catch (error) {}
+    });
     (function () {
       try {
         const params = new URLSearchParams(window.location.search);
@@ -1059,6 +1465,48 @@ def create_app(config_path: Path) -> FastAPI:
       max-width: 1560px;
       margin: 0 auto;
       padding: 30px 30px 40px;
+    }
+    .server-fallback-data {
+      margin-bottom: 24px;
+    }
+    .server-fallback-summary {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .server-fallback-list {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 10px;
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .server-fallback-list li {
+      margin: 0;
+    }
+    .server-fallback-copy {
+      margin-top: 4px;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .server-fallback-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .metric-table {
+      width: 100%;
+      table-layout: fixed;
+    }
+    .metric-table th,
+    .metric-table td {
+      word-break: break-word;
+    }
+    html.dashboard-hydrated .server-fallback-data {
+      display: none;
     }
     .hero {
       position: relative;
@@ -1677,6 +2125,12 @@ def create_app(config_path: Path) -> FastAPI:
       .hero,
       .control-panel,
       .main-grid {
+        grid-template-columns: 1fr;
+      }
+      .server-fallback-grid {
+        grid-template-columns: 1fr;
+      }
+      .server-fallback-summary {
         grid-template-columns: 1fr;
       }
       .grid {
@@ -2466,6 +2920,9 @@ def create_app(config_path: Path) -> FastAPI:
 </head>
 <body>
   <div class="wrap">
+    <div id="bootErrorBanner" style="display:none;margin-bottom:18px;padding:14px 16px;border-radius:16px;background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.18);color:#991b1b;font-size:13px;line-height:1.7;"></div>
+    __SERVER_SNAPSHOT__
+    <script id="initialOverviewData" type="application/json">__INITIAL_OVERVIEW_JSON__</script>
     <section class="hero">
       <div class="hero-copy">
         <div class="eyebrow">Training Queue</div>
@@ -3142,11 +3599,11 @@ def create_app(config_path: Path) -> FastAPI:
 
     function escapeHtml(value) {
       return String(value ?? '')
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
     function setText(id, value) {
@@ -3161,6 +3618,14 @@ def create_app(config_path: Path) -> FastAPI:
       const element = getElement(id);
       if (element) {
         element.innerHTML = value;
+      }
+      return element;
+    }
+
+    function setWidth(id, value) {
+      const element = getElement(id);
+      if (element) {
+        element.style.width = value;
       }
       return element;
     }
@@ -3243,6 +3708,35 @@ def create_app(config_path: Path) -> FastAPI:
       forceStopButton.textContent = '지금 중단';
     }
 
+    function safeLocalStorageGet(key) {
+      try {
+        return window.localStorage.getItem(key);
+      } catch (error) {
+        console.warn(`localStorage get failed for ${key}`, error);
+        return null;
+      }
+    }
+
+    function safeLocalStorageSet(key, value) {
+      try {
+        window.localStorage.setItem(key, value);
+        return true;
+      } catch (error) {
+        console.warn(`localStorage set failed for ${key}`, error);
+        return false;
+      }
+    }
+
+    function safeLocalStorageRemove(key) {
+      try {
+        window.localStorage.removeItem(key);
+        return true;
+      } catch (error) {
+        console.warn(`localStorage remove failed for ${key}`, error);
+        return false;
+      }
+    }
+
     function loadSavedApiKey() {
       if (viewerMode) {
         return;
@@ -3251,7 +3745,7 @@ def create_app(config_path: Path) -> FastAPI:
       if (!input) {
         return;
       }
-      const saved = window.localStorage.getItem('training_dashboard_aihub_api_key');
+      const saved = safeLocalStorageGet('training_dashboard_aihub_api_key');
       if (saved) {
         input.value = saved;
       }
@@ -3267,9 +3761,9 @@ def create_app(config_path: Path) -> FastAPI:
       }
       const value = input.value.trim();
       if (value) {
-        window.localStorage.setItem('training_dashboard_aihub_api_key', value);
+        safeLocalStorageSet('training_dashboard_aihub_api_key', value);
       } else {
-        window.localStorage.removeItem('training_dashboard_aihub_api_key');
+        safeLocalStorageRemove('training_dashboard_aihub_api_key');
       }
       return value;
     }
@@ -3282,7 +3776,7 @@ def create_app(config_path: Path) -> FastAPI:
       if (!input) {
         return;
       }
-      const saved = window.localStorage.getItem('training_dashboard_aihub_datasetkey');
+      const saved = safeLocalStorageGet('training_dashboard_aihub_datasetkey');
       if (saved) {
         input.value = saved;
       }
@@ -3298,9 +3792,9 @@ def create_app(config_path: Path) -> FastAPI:
       }
       const value = input.value.trim();
       if (value) {
-        window.localStorage.setItem('training_dashboard_aihub_datasetkey', value);
+        safeLocalStorageSet('training_dashboard_aihub_datasetkey', value);
       } else {
-        window.localStorage.removeItem('training_dashboard_aihub_datasetkey');
+        safeLocalStorageRemove('training_dashboard_aihub_datasetkey');
       }
       return value;
     }
@@ -4211,30 +4705,42 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
-    async function refresh() {
-      if (document.hidden) {
-        return;
-      }
-      let data;
+    function runRenderStep(label, errors, fn) {
       try {
-        const response = await fetch('/api/overview');
-        if (!response.ok) {
-          let detail = `대시보드 상태를 불러오지 못했습니다. (${response.status})`;
-          try {
-            const errorPayload = await response.json();
-            detail = errorPayload?.detail || errorPayload?.message || detail;
-          } catch (parseError) {
-            // ignore response parse error
+        fn();
+      } catch (error) {
+        console.error(`dashboard render failed: ${label}`, error, latestOverview);
+        errors.push(`${label}: ${error?.message || String(error)}`);
+      }
+    }
+
+    async function refresh() {
+      let data;
+      if (pendingInitialOverview) {
+        data = pendingInitialOverview;
+        pendingInitialOverview = null;
+      } else {
+        try {
+          const response = await fetch('/api/overview', { cache: 'no-store' });
+          if (!response.ok) {
+            let detail = `대시보드 상태를 불러오지 못했습니다. (${response.status})`;
+            try {
+              const errorPayload = await response.json();
+              detail = errorPayload?.detail || errorPayload?.message || detail;
+            } catch (parseError) {
+              // ignore response parse error
+            }
+            setLaunchMessage(detail, true);
+            return;
           }
-          setLaunchMessage(detail, true);
+          data = await response.json();
+        } catch (error) {
+          setLaunchMessage(error?.message || '대시보드 상태 요청에 실패했습니다.', true);
           return;
         }
-        data = await response.json();
-      } catch (error) {
-        setLaunchMessage(error?.message || '대시보드 상태 요청에 실패했습니다.', true);
-        return;
       }
       if (
+        lastRenderSucceeded &&
         latestOverview &&
         latestOverview.overview_revision &&
         data.overview_revision &&
@@ -4258,120 +4764,172 @@ def create_app(config_path: Path) -> FastAPI:
       const stageTimings = pipeline?.stage_timings ? { by_stage: pipeline.stage_timings } : { by_stage: {} };
       const totalDurationSeconds = pipeline?.total_duration_seconds ?? null;
 
-      const stateEl = document.getElementById('pipelineState');
-      const displayState = launcher.state || pipeline.state || 'unknown';
-      stateEl.textContent = formatLauncherState(displayState);
-      stateEl.className = `status-pill ${toneClass(displayState)}`;
+      const renderErrors = [];
 
-      const datasetKey = data.aihub?.datasetkey ?? '-';
-      setText('datasetKeyChip', datasetKey);
-      const datasetKeyInput = document.getElementById('datasetKeyInput');
-      if (datasetKeyInput && datasetKey !== '-' && !datasetKeyInput.value.trim()) {
-        datasetKeyInput.value = datasetKey;
-      }
-      setText('workspaceChip', data.workspace_name || '-');
-      setText('launcherState', formatLauncherState(launcher.state || 'idle'));
-      setText('currentFilekey', formatJob(launcher.current_job));
-      setText(
-        'currentDatasetkey',
-        launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
-      );
-      setText('pendingFilekeys', formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey)));
-      setText('completedJobs', formatCompletedJobs(launcher.completed_jobs || []));
-      setText('autoStartState', launcher.auto_start_enabled === false ? '꺼짐' : '켜짐');
-      setText('launcherLogPath', launcher.log_path || '-');
-      setLaunchMessage(launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.', launcher.state === 'error');
-      updateControlButtons(launcher);
-      renderQueuedJobs(launcher.pending_jobs || []);
+      runRenderStep('overview summary', renderErrors, () => {
+        const stateEl = document.getElementById('pipelineState');
+        const displayState = launcher.state || pipeline.state || 'unknown';
+        if (stateEl) {
+          stateEl.textContent = formatLauncherState(displayState);
+          stateEl.className = `status-pill ${toneClass(displayState)}`;
+        }
 
-      document.getElementById('currentStage').textContent = pipeline.stage || '-';
-      document.getElementById('currentMessage').textContent = pipeline.message || '-';
-      document.getElementById('etaText').textContent = eta.label || '-';
-      document.getElementById('etaMeta').textContent =
-        eta.seconds_remaining !== null && eta.seconds_remaining !== undefined
-          ? `현재 filekey 기준 예상 남은 시간`
-          : '진행률이 쌓이면 계산합니다.';
+        const datasetKey = data.aihub?.datasetkey ?? '-';
+        setText('datasetKeyChip', datasetKey);
+        const datasetKeyInput = document.getElementById('datasetKeyInput');
+        if (datasetKeyInput && datasetKey !== '-' && !datasetKeyInput.value.trim()) {
+          datasetKeyInput.value = datasetKey;
+        }
+        setText('workspaceChip', data.workspace_name || '-');
+        setText('launcherState', formatLauncherState(launcher.state || 'idle'));
+        setText('currentFilekey', formatJob(launcher.current_job));
+        setText(
+          'currentDatasetkey',
+          launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
+        );
+        setText('pendingFilekeys', formatFilekeys((launcher.pending_jobs || []).map((job) => job.filekey)));
+        setText('completedJobs', formatCompletedJobs(launcher.completed_jobs || []));
+        setText('autoStartState', launcher.auto_start_enabled === false ? '꺼짐' : '켜짐');
+        setText('launcherLogPath', launcher.log_path || '-');
+        updateControlButtons(launcher);
+        renderQueuedJobs(launcher.pending_jobs || []);
+      });
 
-      document.getElementById('epochProgress').textContent =
-        `${progress.epochs_completed ?? 0} / ${progress.epochs_total ?? 0}`;
-      document.getElementById('bestF1').textContent =
-        `best macro F1: ${progress.best_val_macro_f1 ?? '-'}`;
+      runRenderStep('pipeline status', renderErrors, () => {
+        setText('currentStage', pipeline.stage || '-');
+        setText('currentMessage', pipeline.message || '-');
+        setText('etaText', eta.label || '-');
+        setText(
+          'etaMeta',
+          eta.seconds_remaining !== null && eta.seconds_remaining !== undefined
+            ? '현재 filekey 기준 예상 남은 시간'
+            : '진행률이 쌓이면 계산합니다.'
+        );
+        setText('epochProgress', `${progress.epochs_completed ?? 0} / ${progress.epochs_total ?? 0}`);
+        setText('bestF1', `best macro F1: ${progress.best_val_macro_f1 ?? '-'}`);
+      });
 
-      const rawTotal = data.dataset?.raw?.total ?? 0;
-      const preparedTotal =
-        (data.dataset?.prepared_train?.total ?? 0) +
-        (data.dataset?.prepared_val?.total ?? 0) +
-        (data.dataset?.prepared_test?.total ?? 0);
-      document.getElementById('datasetTotals').textContent = `${rawTotal} / ${preparedTotal}`;
-      document.getElementById('datasetSummary').textContent = 'raw videos / prepared pose samples';
+      runRenderStep('dataset and gpu summary', renderErrors, () => {
+        const rawTotal = data.dataset?.raw?.total ?? 0;
+        const preparedTotal =
+          (data.dataset?.prepared_train?.total ?? 0) +
+          (data.dataset?.prepared_val?.total ?? 0) +
+          (data.dataset?.prepared_test?.total ?? 0);
+        setText('datasetTotals', `${rawTotal} / ${preparedTotal}`);
+        setText('datasetSummary', 'raw videos / prepared pose samples');
+        setText('artifactState', data.artifacts?.has_model ? 'ready' : 'pending');
+        setText('workspaceDir', data.workspace_dir || '-');
+        setText('gpuUsageText', formatGpuUsage(gpu));
+        setText('gpuUsageMeta', formatGpuMeta(gpu));
+        setText('gpuVramText', formatGpuVram(gpu));
+        setText('gpuVramMeta', formatGpuVramMeta(gpu));
+        setText('queueProgressText', `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`);
+        setText(
+          'queueProgressMeta',
+          `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`
+        );
+        setWidth(
+          'queueProgressFill',
+          `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`
+        );
+        renderIssueVideos(skipReport, cumulativeSkipReport);
+      });
 
-      document.getElementById('artifactState').textContent = data.artifacts?.has_model ? 'ready' : 'pending';
-      document.getElementById('workspaceDir').textContent = data.workspace_dir || '-';
-      document.getElementById('gpuUsageText').textContent = formatGpuUsage(gpu);
-      document.getElementById('gpuUsageMeta').textContent = formatGpuMeta(gpu);
-      document.getElementById('gpuVramText').textContent = formatGpuVram(gpu);
-      document.getElementById('gpuVramMeta').textContent = formatGpuVramMeta(gpu);
-      document.getElementById('queueProgressText').textContent =
-        `${queueProgress.completed ?? 0} / ${queueProgress.total ?? 0}`;
-      document.getElementById('queueProgressMeta').textContent =
-        `완료 ${queueProgress.completed ?? 0} / 실패 ${queueProgress.failed ?? 0} / 대기 ${queueProgress.pending ?? 0}`;
-      document.getElementById('queueProgressFill').style.width =
-        `${Math.max(0, Math.min(100, Math.round((queueProgress.ratio ?? 0) * 100)))}%`;
-      renderIssueVideos(skipReport, cumulativeSkipReport);
+      runRenderStep('latest training snapshot', renderErrors, () => {
+        if (progress.latest) {
+          setText('latestEpoch', `Epoch ${progress.latest.epoch}`);
+          setText(
+            'latestMetrics',
+            `train loss ${progress.latest.train_loss} / val acc ${progress.latest.val_accuracy} / val f1 ${progress.latest.val_macro_f1}`
+          );
+          setText('latestLoss', `train ${progress.latest.train_loss} / val ${progress.latest.val_loss}`);
+          setText('latestLearningRate', `lr ${progress.latest.learning_rate ?? '-'}`);
+        } else {
+          setText('latestEpoch', '-');
+          setText('latestMetrics', '-');
+          setText('latestLoss', '-');
+          setText('latestLearningRate', '-');
+        }
+      });
 
-      if (progress.latest) {
-        document.getElementById('latestEpoch').textContent = `Epoch ${progress.latest.epoch}`;
-        document.getElementById('latestMetrics').textContent =
-          `train loss ${progress.latest.train_loss} / val acc ${progress.latest.val_accuracy} / val f1 ${progress.latest.val_macro_f1}`;
-        document.getElementById('latestLoss').textContent =
-          `train ${progress.latest.train_loss} / val ${progress.latest.val_loss}`;
-        document.getElementById('latestLearningRate').textContent =
-          `lr ${progress.latest.learning_rate ?? '-'}`;
+      runRenderStep('training device summary', renderErrors, () => {
+        setText('resumeState', progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습');
+        setText('sampleCounts', `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`);
+        setText('gpuDeviceText', formatGpuDevice(gpu));
+        setText('gpuMemoryText', formatGpuMemory(gpu));
+        setText('trainingDeviceText', formatTrainingDevice(progress, gpu));
+        setText('trainingDeviceMeta', formatTrainingDeviceMeta(progress));
+        setText('stageTimingValue', formatStageTimingValue(stageTimings));
+        setText('stageTimingCopy', formatStageTimingMeta(stageTimings, totalDurationSeconds));
+        setText('currentStageTimingText', formatStageTimingValue(stageTimings));
+        setText(
+          'currentStageTimingMeta',
+          formatActiveStageElapsed(pipeline) || formatStageTimingMeta(stageTimings, totalDurationSeconds)
+        );
+        setText('updatedAt', pipeline.updated_at || progress.updated_at || '-');
+        setText('configPath', launcher.runtime_config_path || data.config_path || '-');
+      });
+
+      runRenderStep('charts and dataset tables', renderErrors, () => {
+        renderChart(progress.history || []);
+        renderLossChart(progress.history || []);
+        renderMetricInsights(progress, metrics);
+        renderDatasetTable(data.dataset || {});
+        renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
+      });
+
+      runRenderStep('validation metrics', renderErrors, () => {
+        const metricLabels = progress.labels || metrics.labels || [];
+        const finalValidation = progress.final_validation || metrics.final_validation || {};
+        renderPerClassMetrics(
+          metricLabels,
+          finalValidation.per_class || [],
+          finalValidation.confusion_matrix || []
+        );
+        renderConfusionMatrix(metricLabels, finalValidation.confusion_matrix || []);
+      });
+
+      runRenderStep('logs and completed jobs', renderErrors, () => {
+        renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
+        renderLogPanels(logs, launcher);
+      });
+
+      lastRenderSucceeded = renderErrors.length === 0;
+      if (renderErrors.length) {
+        document.documentElement.classList.remove('dashboard-hydrated');
+        setLaunchMessage(`렌더링 오류: ${renderErrors[0]}`, true);
       } else {
-        document.getElementById('latestEpoch').textContent = '-';
-        document.getElementById('latestMetrics').textContent = '-';
-        document.getElementById('latestLoss').textContent = '-';
-        document.getElementById('latestLearningRate').textContent = '-';
+        document.documentElement.classList.add('dashboard-hydrated');
+        setLaunchMessage(
+          launcher.message || '여기에서 시작 결과와 최근 실행 메시지를 확인할 수 있습니다.',
+          launcher.state === 'error'
+        );
       }
-
-      document.getElementById('resumeState').textContent =
-        progress.resumed_from_checkpoint ? '이전 모델 이어학습' : '새 학습';
-      document.getElementById('sampleCounts').textContent =
-        `train ${progress.train_samples ?? 0} / val ${progress.val_samples ?? 0}`;
-      document.getElementById('gpuDeviceText').textContent = formatGpuDevice(gpu);
-      document.getElementById('gpuMemoryText').textContent = formatGpuMemory(gpu);
-      document.getElementById('trainingDeviceText').textContent = formatTrainingDevice(progress, gpu);
-      document.getElementById('trainingDeviceMeta').textContent = formatTrainingDeviceMeta(progress);
-      document.getElementById('stageTimingValue').textContent = formatStageTimingValue(stageTimings);
-      document.getElementById('stageTimingCopy').textContent = formatStageTimingMeta(stageTimings, totalDurationSeconds);
-      document.getElementById('currentStageTimingText').textContent = formatStageTimingValue(stageTimings);
-      document.getElementById('currentStageTimingMeta').textContent =
-        formatActiveStageElapsed(pipeline) || formatStageTimingMeta(stageTimings, totalDurationSeconds);
-
-      document.getElementById('updatedAt').textContent = pipeline.updated_at || progress.updated_at || '-';
-      document.getElementById('configPath').textContent = launcher.runtime_config_path || data.config_path || '-';
-
-      renderChart(progress.history || []);
-      renderLossChart(progress.history || []);
-      renderMetricInsights(progress, metrics);
-      renderDatasetTable(data.dataset || {});
-      renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
-      const metricLabels = progress.labels || metrics.labels || [];
-      const finalValidation = progress.final_validation || metrics.final_validation || {};
-      renderPerClassMetrics(
-        metricLabels,
-        finalValidation.per_class || [],
-        finalValidation.confusion_matrix || []
-      );
-      renderConfusionMatrix(metricLabels, finalValidation.confusion_matrix || []);
-      renderCompletedLogs(launcher.completed_jobs || [], queueProgress);
-      renderLogPanels(logs, launcher);
     }
 
     let latestOverview = null;
+    let lastRenderSucceeded = false;
+    let pendingInitialOverview = null;
+    try {
+      const initialOverviewNode = document.getElementById('initialOverviewData');
+      pendingInitialOverview = initialOverviewNode?.textContent
+        ? JSON.parse(initialOverviewNode.textContent)
+        : null;
+    } catch (error) {
+      console.error('failed to parse initial overview', error);
+      pendingInitialOverview = null;
+    }
 
-    loadSavedDatasetKey();
-    loadSavedApiKey();
+    try {
+      loadSavedDatasetKey();
+    } catch (error) {
+      console.error('loadSavedDatasetKey failed', error);
+    }
+    try {
+      loadSavedApiKey();
+    } catch (error) {
+      console.error('loadSavedApiKey failed', error);
+    }
     document.getElementById('datasetKeyInput').addEventListener('change', saveDatasetKey);
     document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
@@ -4389,48 +4947,98 @@ def create_app(config_path: Path) -> FastAPI:
     refresh();
     setInterval(refresh, 1000);
   </script>
+  <script>
+    (function () {
+      function setBootBanner(message) {
+        try {
+          var banner = document.getElementById('bootErrorBanner');
+          if (!banner) {
+            return;
+          }
+          banner.textContent = message;
+          banner.style.display = 'block';
+        } catch (error) {}
+      }
+
+      function supportsDashboardScript() {
+        try {
+          new Function("var probe = function (value) { return (value?.count ?? 0) + 1; }; return probe({ count: 1 });");
+          return true;
+        } catch (error) {
+          return false;
+        }
+      }
+
+      var sourceNode = document.getElementById('dashboardAppSource');
+      if (!sourceNode) {
+        return;
+      }
+
+      if (!supportsDashboardScript()) {
+        document.documentElement.classList.remove('dashboard-hydrated');
+        setBootBanner(
+          '브라우저 호환 모드로 서버 렌더링 결과만 표시합니다. 이 브라우저에서는 대시보드 상호작용 스크립트를 실행할 수 없습니다.'
+        );
+        return;
+      }
+
+      try {
+        var runtimeScript = document.createElement('script');
+        runtimeScript.type = 'text/javascript';
+        runtimeScript.text = sourceNode.text || sourceNode.textContent || '';
+        document.body.appendChild(runtimeScript);
+      } catch (error) {
+        document.documentElement.classList.remove('dashboard-hydrated');
+        setBootBanner(
+          '브라우저 스크립트 오류: ' + (error && error.message ? error.message : String(error || 'unknown error'))
+        );
+      }
+    })();
+  </script>
 </body>
 </html>"""
-
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard() -> str:
-        return render_dashboard()
-
-    @app.get("/api/overview")
-    def overview(lite: bool = False) -> dict:
-        return build_overview(
-            paths,
-            config_path,
-            config=config,
-            launcher_status=get_launcher_status(),
-            lite=lite,
+        return (
+            template
+            .replace(
+                "__SERVER_SNAPSHOT__",
+                build_server_snapshot_html(initial_overview) + build_server_fallback_sections_html(initial_overview),
+            )
+            .replace("__INITIAL_OVERVIEW_JSON__", serialize_initial_overview(initial_overview))
         )
 
-    @app.get("/api/live-ping")
-    def live_ping() -> dict:
-        launcher = get_launcher_status()
-        return {
-            "ok": True,
-            "state": launcher.get("state"),
-            "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
-        }
+    def build_dashboard_redirect(message: str, level: str = "good") -> RedirectResponse:
+        query = urlencode({"notice": message, "notice_level": level})
+        return RedirectResponse(url=f"/?{query}", status_code=303, headers=NO_CACHE_HEADERS)
 
-    @app.post("/api/start")
-    async def start_training(request: Request) -> dict:
+    async def read_form_payload(request: Request) -> dict:
+        body_text = (await request.body()).decode("utf-8", errors="replace")
+        parsed = parse_qs(body_text, keep_blank_values=True)
+        payload: dict[str, object] = {}
+        for key, values in parsed.items():
+            if len(values) == 1:
+                payload[key] = values[0]
+            else:
+                payload[key] = values
+        return payload
+
+    def start_training_request(payload: dict) -> dict:
         if str(config.get("dataset_source", "")).strip().lower() != "aihub_shell":
             raise HTTPException(
                 status_code=400,
                 detail="이 대시보드에서 직접 filekey 실행은 dataset_source가 aihub_shell일 때만 지원합니다.",
             )
 
-        payload = await request.json()
         try:
             filekeys = parse_filekeys(payload.get("filekeys", ""))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         datasetkey = str(payload.get("datasetkey", "")).strip()
         api_key = str(payload.get("api_key", "")).strip()
-        resume_only = bool(payload.get("resume_only", False))
+        resume_only_raw = payload.get("resume_only", False)
+        resume_only = (
+            resume_only_raw is True
+            or str(resume_only_raw).strip().lower() in {"1", "true", "on", "yes"}
+        )
         if not filekeys and not resume_only:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
@@ -4510,8 +5118,7 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
-    @app.post("/api/pause")
-    def pause_after_current() -> dict:
+    def pause_after_current_request() -> dict:
         with state_lock:
             update_process_state()
             current_job = launcher_state.get("current_job")
@@ -4534,10 +5141,7 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
-    @app.post("/api/remove-queued-job")
-    async def remove_queued_job(request: Request) -> dict:
-        payload = await request.json()
-        job_id = str(payload.get("job_id", "")).strip()
+    def remove_queued_job_request(job_id: str) -> dict:
         if not job_id:
             raise HTTPException(status_code=400, detail="삭제할 job_id가 필요합니다.")
 
@@ -4578,8 +5182,7 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
-    @app.post("/api/force-stop")
-    def force_stop_current_job() -> dict:
+    def force_stop_current_job_request() -> dict:
         with state_lock:
             update_process_state()
             active_process = launcher_state.get("process")
@@ -4594,7 +5197,12 @@ def create_app(config_path: Path) -> FastAPI:
             current_job["finished_at"] = current_timestamp()
             current_job["exit_code"] = active_process.returncode if active_process.returncode is not None else -1
             current_job["state"] = "aborted"
+            current_job["message"] = (
+                f"filekey {current_job.get('filekey')} 작업을 강제 중단했습니다. "
+                "같은 작업을 대기열 맨 앞으로 다시 넣었고, 시작 버튼을 눌러야 재개됩니다."
+            )
             current_job["result_summary"] = collect_result_summary(paths)
+            current_job = enrich_completed_job(current_job)
 
             completed_jobs = launcher_state.setdefault("completed_jobs", [])
             if isinstance(completed_jobs, list):
@@ -4642,8 +5250,7 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
-    @app.post("/api/reset")
-    def reset_training_data() -> dict:
+    def reset_training_data_request() -> dict:
         with state_lock:
             update_process_state()
             active_process = launcher_state.get("process")
@@ -4662,7 +5269,174 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(notice: str | None = None, notice_level: str = "info") -> HTMLResponse:
+        initial_overview = build_overview(
+            paths,
+            config_path,
+            config=config,
+            launcher_status=get_launcher_status(),
+        )
+        default_datasetkey = str(
+            (initial_overview.get("aihub") or {}).get("datasetkey")
+            or config.get("aihub_shell", {}).get("datasetkey", "")
+            or ""
+        ).strip()
+        html = render_dashboard_page(
+            initial_overview,
+            config_path=str(config_path),
+            default_datasetkey=default_datasetkey,
+            controls_enabled=str(config.get("dataset_source", "")).strip().lower() == "aihub_shell",
+            notice=notice,
+            notice_level=notice_level,
+            refresh_seconds=15,
+        )
+        return HTMLResponse(html, headers=NO_CACHE_HEADERS)
+
+    @app.get("/api/overview")
+    def overview(lite: bool = False) -> JSONResponse:
+        return JSONResponse(
+            build_overview(
+                paths,
+                config_path,
+                config=config,
+                launcher_status=get_launcher_status(),
+                lite=lite,
+            ),
+            headers=NO_CACHE_HEADERS,
+        )
+
+    @app.get("/api/live-ping")
+    def live_ping() -> JSONResponse:
+        launcher = get_launcher_status()
+        return JSONResponse(
+            {
+                "ok": True,
+                "state": launcher.get("state"),
+                "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+            },
+            headers=NO_CACHE_HEADERS,
+        )
+
+    @app.post("/api/start")
+    async def start_training(request: Request) -> dict:
+        payload = await request.json()
+        return start_training_request(payload)
+
+    @app.post("/api/pause")
+    def pause_after_current() -> dict:
+        return pause_after_current_request()
+
+    @app.post("/api/remove-queued-job")
+    async def remove_queued_job(request: Request) -> dict:
+        payload = await request.json()
+        return remove_queued_job_request(str(payload.get("job_id", "")).strip())
+
+    @app.post("/api/force-stop")
+    def force_stop_current_job() -> dict:
+        return force_stop_current_job_request()
+
+    @app.post("/api/reset")
+    def reset_training_data() -> dict:
+        return reset_training_data_request()
+
+    @app.post("/actions/start")
+    async def start_training_action(request: Request) -> RedirectResponse:
+        payload = await read_form_payload(request)
+        try:
+            result = start_training_request(payload)
+            return build_dashboard_redirect(str(result.get("message") or "작업을 시작했습니다."), "good")
+        except HTTPException as exc:
+            return build_dashboard_redirect(str(exc.detail), "danger")
+
+    @app.post("/actions/pause")
+    def pause_after_current_action() -> RedirectResponse:
+        try:
+            result = pause_after_current_request()
+            return build_dashboard_redirect(str(result.get("message") or "자동 시작을 멈췄습니다."), "warn")
+        except HTTPException as exc:
+            return build_dashboard_redirect(str(exc.detail), "danger")
+
+    @app.post("/actions/remove-queued")
+    async def remove_queued_job_action(request: Request) -> RedirectResponse:
+        payload = await read_form_payload(request)
+        try:
+            result = remove_queued_job_request(str(payload.get("job_id", "")).strip())
+            return build_dashboard_redirect(str(result.get("message") or "대기열에서 제거했습니다."), "good")
+        except HTTPException as exc:
+            return build_dashboard_redirect(str(exc.detail), "danger")
+
+    @app.post("/actions/force-stop")
+    def force_stop_current_job_action() -> RedirectResponse:
+        try:
+            result = force_stop_current_job_request()
+            return build_dashboard_redirect(str(result.get("message") or "현재 작업을 중단했습니다."), "warn")
+        except HTTPException as exc:
+            return build_dashboard_redirect(str(exc.detail), "danger")
+
+    @app.post("/actions/reset")
+    def reset_training_data_action() -> RedirectResponse:
+        try:
+            result = reset_training_data_request()
+            return build_dashboard_redirect(str(result.get("message") or "워크스페이스를 초기화했습니다."), "warn")
+        except HTTPException as exc:
+            return build_dashboard_redirect(str(exc.detail), "danger")
+
     return app
+
+
+def build_overview_file_diagnostics(paths: dict) -> dict:
+    return {
+        "pipeline_status": build_path_diagnostic(paths["pipeline_status"]),
+        "training_progress": build_path_diagnostic(paths["training_progress"]),
+        "metrics": build_path_diagnostic(paths["artifacts_dir"] / "metrics.json"),
+        "labels": build_path_diagnostic(paths["artifacts_dir"] / "labels.json"),
+        "launcher_history": build_path_diagnostic(paths["workspace_dir"] / "launcher_history.json"),
+        "current_raw_manifest": build_path_diagnostic(paths["current_raw_manifest"]),
+        "current_prepared_train": build_path_diagnostic(paths["current_prepared_train"]),
+        "current_prepared_val": build_path_diagnostic(paths["current_prepared_val"]),
+        "current_prepared_test": build_path_diagnostic(paths["current_prepared_test"]),
+    }
+
+
+def build_overview_diagnostics(
+    *,
+    paths: dict,
+    pipeline_diagnostics: dict,
+    training_progress: dict,
+    metrics: dict,
+    dataset_summary: dict,
+    current_dataset_summary: dict,
+    completed_jobs: list[dict],
+) -> dict:
+    warnings = list(pipeline_diagnostics.get("warnings") or [])
+    if dataset_summary:
+        prepared_total = sum(
+            int((dataset_summary.get(key) or {}).get("total", 0) or 0)
+            for key in ("prepared_train", "prepared_val", "prepared_test")
+        )
+        current_prepared_total = sum(
+            int((current_dataset_summary.get(key) or {}).get("total", 0) or 0)
+            for key in ("prepared_train", "prepared_val", "prepared_test")
+        )
+        if prepared_total > 0 and current_prepared_total == 0:
+            warnings.append(
+                "current_* manifest는 비어 있지만 cumulative prepared 데이터는 남아 있습니다. "
+                "완료 후 정리(cleanup_raw_after_job)된 정상 상태일 수 있습니다."
+            )
+    if not (training_progress.get("history") or metrics.get("history")):
+        warnings.append("history가 비어 있어 epoch 추이를 표시할 수 없습니다.")
+    if completed_jobs and not any(
+        str(job.get("state") or "").strip().lower() in {"completed", "completed_warning"}
+        for job in completed_jobs
+        if isinstance(job, dict)
+    ):
+        warnings.append("완료 이력에는 성공 작업이 없고 중단/실패 작업만 있습니다.")
+    return {
+        "warnings": warnings,
+        "pipeline": pipeline_diagnostics,
+        "files": build_overview_file_diagnostics(paths),
+    }
 
 
 def build_overview(
@@ -4682,7 +5456,7 @@ def build_overview(
             return cached_value
 
     gpu_status = query_gpu_status()
-    pipeline_status = read_json(paths["pipeline_status"])
+    raw_pipeline_status = read_json(paths["pipeline_status"]) or {}
     target_labels = get_target_labels(config)
     training_progress = normalize_metric_payload(
         read_json(paths["training_progress"]),
@@ -4710,8 +5484,29 @@ def build_overview(
             paths["workspace_dir"] / "job_logs",
             paths["workspace_dir"] / "runtime_configs",
         )
+    completed_jobs = sort_jobs_by_recency(completed_jobs if isinstance(completed_jobs, list) else [])
     pending_jobs = launcher_status.get("pending_jobs", []) if isinstance(launcher_status, dict) else []
     current_job = launcher_status.get("current_job") if isinstance(launcher_status, dict) else None
+    pipeline_status, pipeline_diagnostics = build_effective_pipeline_status(
+        raw_pipeline_status,
+        training_progress=training_progress,
+        completed_jobs=completed_jobs,
+        workspace_dir=paths["workspace_dir"],
+    )
+    effective_launcher_status = dict(launcher_status) if isinstance(launcher_status, dict) else {}
+    restored_launcher = build_restored_launcher_summary(
+        completed_jobs,
+        pipeline_status=pipeline_status,
+        training_progress=training_progress,
+    )
+    if not effective_launcher_status.get("state"):
+        effective_launcher_status["state"] = restored_launcher.get("state")
+    if not effective_launcher_status.get("message"):
+        effective_launcher_status["message"] = restored_launcher.get("message")
+    if not effective_launcher_status.get("log_path") and restored_launcher.get("log_path"):
+        effective_launcher_status["log_path"] = restored_launcher.get("log_path")
+    if effective_launcher_status.get("last_exit_code") is None and restored_launcher.get("last_exit_code") is not None:
+        effective_launcher_status["last_exit_code"] = restored_launcher.get("last_exit_code")
     latest_completed_job = next(
         (
             job for job in completed_jobs
@@ -4736,7 +5531,7 @@ def build_overview(
     for job in completed_jobs:
         if not isinstance(job, dict):
             continue
-        enriched_job = dict(job)
+        enriched_job = enrich_completed_job(job)
         if not lite:
             enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
         enriched_completed_jobs.append(enriched_job)
@@ -4750,8 +5545,8 @@ def build_overview(
     active_count = 1 if current_job else 0
     total_count = completed_count + failed_count + pending_count + active_count
     progress_ratio = ((completed_count + failed_count) / total_count) if total_count > 0 else 0.0
-    current_job_progress = build_current_job_progress(pipeline_status, training_progress, launcher_status)
-    eta = estimate_eta(current_job_progress, launcher_status)
+    current_job_progress = build_current_job_progress(pipeline_status, training_progress, effective_launcher_status)
+    eta = estimate_eta(current_job_progress, effective_launcher_status)
     dataset_summary = (
         {
             "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
@@ -4794,6 +5589,15 @@ def build_overview(
             target_labels,
             dataset_summary["prepared_val"].get("by_label"),
         )
+    diagnostics = build_overview_diagnostics(
+        paths=paths,
+        pipeline_diagnostics=pipeline_diagnostics,
+        training_progress=training_progress,
+        metrics=metrics,
+        dataset_summary=dataset_summary,
+        current_dataset_summary=current_dataset_summary,
+        completed_jobs=enriched_completed_jobs,
+    )
 
     overview = {
         "overview_revision": overview_revision,
@@ -4811,7 +5615,7 @@ def build_overview(
         "pipeline_status": pipeline_status,
         "training_progress": training_progress,
         "launcher": {
-            **launcher_status,
+            **effective_launcher_status,
             "completed_jobs": enriched_completed_jobs[: (8 if lite else 30)],
         },
         "aihub": {
@@ -4864,6 +5668,7 @@ def build_overview(
             "has_metrics": (paths["artifacts_dir"] / "metrics.json").exists(),
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
+        "diagnostics": diagnostics,
         "skip_report": current_skip_report,
         "cumulative_skip_report": cumulative_skip_report if not lite else {},
         "metrics": metrics if not lite else {},
