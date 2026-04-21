@@ -1,7 +1,27 @@
 {
-  "stage": "error",
-  "state": "error",
-  "message": "YOLO에 GPU 장치를 요청했지만 현재 PyTorch가 CUDA를 사용할 수 없습니다.\n- 요청한 장치: cuda:0\n- torch.cuda.is_available(): False\n- torch.cuda.device_count(): 0\n현재 Windows 파이썬 환경에 CUDA 지원 PyTorch가 설치되지 않았을 가능성이 큽니다.",
-  "workspace_dir": "/Users/jung-uiseok/Desktop/detectWarning/training_data/action_pipeline_aihub",
-  "updated_at": "2026-04-14T01:05:11.866572+09:00"
+  "stage": "prepare",
+  "state": "running",
+  "message": "train split에서 pose 시퀀스를 추출하는 중입니다.",
+  "workspace_dir": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub",
+  "updated_at": "2026-04-22T00:47:50.034603+09:00",
+  "pipeline_started_at": "2026-04-22T00:33:34.582574+09:00",
+  "stage_started_at": "2026-04-22T00:41:00.428054+09:00",
+  "stage_timings": {
+    "download": {
+      "started_at": "2026-04-22T00:33:34.582574+09:00",
+      "finished_at": "2026-04-22T00:41:00.427054+09:00",
+      "duration_seconds": 445.84448
+    }
+  },
+  "total_duration_seconds": null,
+  "stage_progress": 0.6426,
+  "processed_items": 10,
+  "total_items": 27,
+  "current_split": "train",
+  "split_index": 10,
+  "split_total": 18,
+  "current_video": "704-3_cam02_kidnap02_place02_night_spring.mp4",
+  "kept_items": 3,
+  "skipped_items": 6,
+  "prefetch_workers": 2
 }

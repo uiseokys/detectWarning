@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -52,7 +52,7 @@ from reporting import (
     summarize_manifest,
 )
 from training_config import resolve_pages_sync_config
-from training_dashboard_view import render_dashboard_page
+from training_dashboard_view import render_dashboard_live_fragments, render_dashboard_page
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
@@ -65,6 +65,63 @@ NO_CACHE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+NOTICE_COOKIE_NAME = "dw_dashboard_notice"
+NOTICE_LEVEL_COOKIE_NAME = "dw_dashboard_notice_level"
+NOTICE_COOKIE_MAX_AGE_SECONDS = 30
+LIVE_URL_ENV_NAME = "DETECTWARNING_LIVE_URL"
+LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
+PUBLIC_VIEWER_HOST_SUFFIXES = (".trycloudflare.com", ".workers.dev")
+
+
+def wants_json_response(request: Request | None) -> bool:
+    if request is None:
+        return False
+    if request.headers.get("x-dashboard-async") == "1":
+        return True
+    accept = str(request.headers.get("accept") or "").lower()
+    return "application/json" in accept
+
+
+def normalize_hostname(value: str | None) -> str:
+    return str(value or "").strip().strip("[]").lower()
+
+
+def get_live_url_hostname() -> str:
+    raw_value = str(os.environ.get(LIVE_URL_ENV_NAME) or "").strip()
+    if not raw_value:
+        return ""
+    try:
+        return normalize_hostname(urlparse(raw_value).hostname)
+    except Exception:
+        return ""
+
+
+def is_viewer_request(request: Request | None) -> bool:
+    if request is None:
+        return False
+    try:
+        viewer_flag = str(request.query_params.get("viewer") or "").strip().lower()
+        if viewer_flag in {"1", "true", "yes", "on"}:
+            return True
+    except Exception:
+        pass
+
+    host = normalize_hostname(getattr(request.url, "hostname", None))
+    if not host or host in LOCAL_DASHBOARD_HOSTS:
+        return False
+    if any(host.endswith(suffix) for suffix in PUBLIC_VIEWER_HOST_SUFFIXES):
+        return True
+
+    live_host = get_live_url_hostname()
+    return bool(live_host and host == live_host)
+
+
+def ensure_dashboard_control_access(request: Request | None) -> None:
+    if is_viewer_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="공유 viewer에서는 작업 제어를 할 수 없습니다. 로컬 대시보드에서 실행해 주세요.",
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -459,6 +516,36 @@ def estimate_eta(current_job_progress: dict | None, launcher_status: dict | None
         "seconds_remaining": remaining_seconds,
         "label": format_duration(remaining_seconds),
     }
+
+
+def overview_has_live_activity(overview: dict | None) -> bool:
+    overview = overview or {}
+    launcher = overview.get("launcher") or {}
+    pipeline = overview.get("pipeline_status") or {}
+    queue_progress = overview.get("queue_progress") or {}
+    current_job_progress = overview.get("current_job_progress") or {}
+
+    active_states = {"starting", "queued", "running", "prepare", "download", "train"}
+    launcher_state = str(launcher.get("state") or "").strip().lower()
+    pipeline_state = str(pipeline.get("state") or "").strip().lower()
+    if launcher_state in active_states or pipeline_state in active_states:
+        return True
+
+    current_job = launcher.get("current_job")
+    if isinstance(current_job, dict) and any(current_job.get(key) for key in ("filekey", "datasetkey", "log_path")):
+        return True
+
+    try:
+        if int(queue_progress.get("active") or 0) > 0 or int(queue_progress.get("pending") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        ratio = float(current_job_progress.get("ratio") or 0.0)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    return 0.0 < ratio < 1.0
 
 
 def format_duration(seconds: int | float | None) -> str:
@@ -5007,13 +5094,70 @@ def create_app(config_path: Path) -> FastAPI:
         )
 
     def build_dashboard_redirect(message: str, level: str = "good") -> RedirectResponse:
-        query = urlencode({"notice": message, "notice_level": level})
-        return RedirectResponse(url=f"/?{query}", status_code=303, headers=NO_CACHE_HEADERS)
+        response = RedirectResponse(url="/", status_code=303, headers=NO_CACHE_HEADERS)
+        response.set_cookie(
+            NOTICE_COOKIE_NAME,
+            quote(str(message), safe=""),
+            max_age=NOTICE_COOKIE_MAX_AGE_SECONDS,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        response.set_cookie(
+            NOTICE_LEVEL_COOKIE_NAME,
+            str(level or "info"),
+            max_age=NOTICE_COOKIE_MAX_AGE_SECONDS,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    def build_dashboard_action_response(
+        request: Request | None,
+        *,
+        message: str,
+        level: str,
+        ok: bool = True,
+        status_code: int = 200,
+        payload: dict | None = None,
+    ):
+        if wants_json_response(request):
+            body = {
+                "ok": bool(ok),
+                "message": str(message),
+                "level": str(level or "info"),
+            }
+            if isinstance(payload, dict):
+                body.update(payload)
+            return JSONResponse(body, status_code=status_code, headers=NO_CACHE_HEADERS)
+        return build_dashboard_redirect(str(message), str(level or "info"))
 
     async def read_form_payload(request: Request) -> dict:
+        payload: dict[str, object] = {}
+
+        try:
+            form = await request.form()
+        except Exception:
+            form = None
+
+        if form is not None:
+            for key, value in form.multi_items():
+                if hasattr(value, "filename"):
+                    continue
+                if key in payload:
+                    existing = payload[key]
+                    if isinstance(existing, list):
+                        existing.append(value)
+                    else:
+                        payload[key] = [existing, value]
+                else:
+                    payload[key] = value
+            if payload:
+                return payload
+
         body_text = (await request.body()).decode("utf-8", errors="replace")
         parsed = parse_qs(body_text, keep_blank_values=True)
-        payload: dict[str, object] = {}
         for key, values in parsed.items():
             if len(values) == 1:
                 payload[key] = values[0]
@@ -5270,20 +5414,32 @@ def create_app(config_path: Path) -> FastAPI:
         }
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(notice: str | None = None, notice_level: str = "info") -> HTMLResponse:
+    def dashboard(request: Request, notice: str | None = None, notice_level: str = "info") -> HTMLResponse:
+        cookie_notice = request.cookies.get(NOTICE_COOKIE_NAME)
+        cookie_notice_level = request.cookies.get(NOTICE_LEVEL_COOKIE_NAME)
+        effective_notice = notice
+        effective_notice_level = notice_level
+        if not effective_notice and cookie_notice:
+            try:
+                effective_notice = unquote(cookie_notice)
+            except Exception:
+                effective_notice = cookie_notice
+            effective_notice_level = cookie_notice_level or notice_level or "info"
+
+        viewer_mode = is_viewer_request(request)
         initial_overview = build_overview(
             paths,
             config_path,
             config=config,
             launcher_status=get_launcher_status(),
         )
-        if notice:
+        if effective_notice:
             launcher_payload = initial_overview.setdefault("launcher", {})
             if isinstance(launcher_payload, dict):
-                launcher_payload["message"] = notice
-                if notice_level == "danger":
+                launcher_payload["message"] = effective_notice
+                if effective_notice_level == "danger":
                     launcher_payload["state"] = "error"
-                elif notice_level == "warn":
+                elif effective_notice_level == "warn":
                     launcher_payload["state"] = launcher_payload.get("state") or "warning"
         html = render_dashboard_page(
             initial_overview,
@@ -5295,12 +5451,25 @@ def create_app(config_path: Path) -> FastAPI:
                     or ""
                 )
             ),
-            controls_enabled=str(config.get("dataset_source") or "").strip().lower() == "aihub_shell",
-            notice=notice,
-            notice_level=notice_level,
+            controls_enabled=(
+                str(config.get("dataset_source") or "").strip().lower() == "aihub_shell"
+                and not viewer_mode
+            ),
+            controls_notice=(
+                "공유 viewer에서는 작업 제어가 비활성화되어 있습니다. "
+                "시작/중지/초기화는 로컬 대시보드에서만 할 수 있습니다."
+                if viewer_mode
+                else None
+            ),
+            notice=effective_notice,
+            notice_level=effective_notice_level,
             refresh_seconds=0,
         )
-        return HTMLResponse(html, headers=NO_CACHE_HEADERS)
+        response = HTMLResponse(html, headers=NO_CACHE_HEADERS)
+        if cookie_notice or cookie_notice_level:
+            response.delete_cookie(NOTICE_COOKIE_NAME, path="/")
+            response.delete_cookie(NOTICE_LEVEL_COOKIE_NAME, path="/")
+        return response
 
     @app.get("/api/overview")
     def overview(lite: bool = False) -> JSONResponse:
@@ -5312,6 +5481,26 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_status=get_launcher_status(),
                 lite=lite,
             ),
+            headers=NO_CACHE_HEADERS,
+        )
+
+    @app.get("/api/live-fragments")
+    def live_fragments() -> JSONResponse:
+        overview_payload = build_overview(
+            paths,
+            config_path,
+            config=config,
+            launcher_status=get_launcher_status(),
+        )
+        active = overview_has_live_activity(overview_payload)
+        return JSONResponse(
+            {
+                "ok": True,
+                "overview_revision": overview_payload.get("overview_revision"),
+                "active": active,
+                "poll_interval_ms": 1200 if active else 8000,
+                "fragments": render_dashboard_live_fragments(overview_payload),
+            },
             headers=NO_CACHE_HEADERS,
         )
 
@@ -5329,67 +5518,127 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/api/start")
     async def start_training(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         payload = await request.json()
         return start_training_request(payload)
 
     @app.post("/api/pause")
-    def pause_after_current() -> dict:
+    def pause_after_current(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return pause_after_current_request()
 
     @app.post("/api/remove-queued-job")
     async def remove_queued_job(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         payload = await request.json()
         return remove_queued_job_request(str(payload.get("job_id", "")).strip())
 
     @app.post("/api/force-stop")
-    def force_stop_current_job() -> dict:
+    def force_stop_current_job(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return force_stop_current_job_request()
 
     @app.post("/api/reset")
-    def reset_training_data() -> dict:
+    def reset_training_data(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return reset_training_data_request()
 
     @app.post("/actions/start")
-    async def start_training_action(request: Request) -> RedirectResponse:
+    async def start_training_action(request: Request):
+        ensure_dashboard_control_access(request)
         payload = await read_form_payload(request)
         try:
             result = start_training_request(payload)
-            return build_dashboard_redirect(str(result.get("message") or "작업을 시작했습니다."), "good")
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "작업을 시작했습니다."),
+                level="good",
+            )
         except HTTPException as exc:
-            return build_dashboard_redirect(str(exc.detail), "danger")
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
 
     @app.post("/actions/pause")
-    def pause_after_current_action() -> RedirectResponse:
+    def pause_after_current_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = pause_after_current_request()
-            return build_dashboard_redirect(str(result.get("message") or "자동 시작을 멈췄습니다."), "warn")
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "자동 시작을 멈췄습니다."),
+                level="warn",
+            )
         except HTTPException as exc:
-            return build_dashboard_redirect(str(exc.detail), "danger")
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
 
     @app.post("/actions/remove-queued")
-    async def remove_queued_job_action(request: Request) -> RedirectResponse:
+    async def remove_queued_job_action(request: Request):
+        ensure_dashboard_control_access(request)
         payload = await read_form_payload(request)
         try:
             result = remove_queued_job_request(str(payload.get("job_id", "")).strip())
-            return build_dashboard_redirect(str(result.get("message") or "대기열에서 제거했습니다."), "good")
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "대기열에서 제거했습니다."),
+                level="good",
+            )
         except HTTPException as exc:
-            return build_dashboard_redirect(str(exc.detail), "danger")
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
 
     @app.post("/actions/force-stop")
-    def force_stop_current_job_action() -> RedirectResponse:
+    def force_stop_current_job_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = force_stop_current_job_request()
-            return build_dashboard_redirect(str(result.get("message") or "현재 작업을 중단했습니다."), "warn")
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "현재 작업을 중단했습니다."),
+                level="warn",
+            )
         except HTTPException as exc:
-            return build_dashboard_redirect(str(exc.detail), "danger")
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
 
     @app.post("/actions/reset")
-    def reset_training_data_action() -> RedirectResponse:
+    def reset_training_data_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = reset_training_data_request()
-            return build_dashboard_redirect(str(result.get("message") or "워크스페이스를 초기화했습니다."), "warn")
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "워크스페이스를 초기화했습니다."),
+                level="warn",
+            )
         except HTTPException as exc:
-            return build_dashboard_redirect(str(exc.detail), "danger")
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
 
     return app
 
@@ -5523,9 +5772,28 @@ def build_overview(
         ),
         None,
     )
+    log_tail_cache: dict[str, str] = {}
+    log_preview_cache: dict[str, str] = {}
+
+    def get_cached_log_tail(path_value) -> str:
+        if lite or not path_value:
+            return ""
+        cache_key = str(path_value)
+        if cache_key not in log_tail_cache:
+            log_tail_cache[cache_key] = read_log_tail(path_value)
+        return log_tail_cache[cache_key]
+
+    def get_cached_log_preview(path_value) -> str:
+        if lite or not path_value:
+            return ""
+        cache_key = str(path_value)
+        if cache_key not in log_preview_cache:
+            log_preview_cache[cache_key] = read_log_preview(path_value)
+        return log_preview_cache[cache_key]
+
     current_log_source = current_job if isinstance(current_job, dict) else latest_completed_job
     current_log_path = current_log_source.get("log_path") if isinstance(current_log_source, dict) else None
-    current_log_tail = read_log_tail(current_log_path) if not lite else ""
+    current_log_tail = get_cached_log_tail(current_log_path)
 
     latest_error_job = next(
         (
@@ -5535,14 +5803,14 @@ def build_overview(
         None,
     )
     latest_error_log_path = latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None
-    latest_error_log_tail = read_log_tail(latest_error_log_path) if not lite else ""
+    latest_error_log_tail = get_cached_log_tail(latest_error_log_path)
     enriched_completed_jobs = []
     for job in completed_jobs:
         if not isinstance(job, dict):
             continue
         enriched_job = enrich_completed_job(job)
         if not lite:
-            enriched_job["log_preview"] = read_log_preview(enriched_job.get("log_path"))
+            enriched_job["log_preview"] = get_cached_log_preview(enriched_job.get("log_path"))
         enriched_completed_jobs.append(enriched_job)
 
     completed_count = len([
@@ -5656,10 +5924,8 @@ def build_overview(
                 "filekey": latest_completed_job.get("filekey") if isinstance(latest_completed_job, dict) else None,
                 "datasetkey": latest_completed_job.get("datasetkey") if isinstance(latest_completed_job, dict) else None,
                 "path": latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
-                "tail": (
-                    read_log_tail(latest_completed_job.get("log_path"))
-                    if (not lite and isinstance(latest_completed_job, dict))
-                    else ""
+                "tail": get_cached_log_tail(
+                    latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None
                 ),
             },
             "latest_error": {

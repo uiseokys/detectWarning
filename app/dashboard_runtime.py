@@ -17,6 +17,15 @@ PAGES_PUSH_QUEUE: queue.Queue[dict] = queue.Queue()
 PAGES_PUSH_WORKER_LOCK = threading.Lock()
 PAGES_PUSH_WORKER_STARTED = False
 PAGES_PUSH_DEBOUNCE_SECONDS = 1.2
+RESULT_SUMMARY_MANIFEST_KEYS = (
+    ("raw_total", "raw_manifest"),
+    ("train_total", "split_train"),
+    ("val_total", "split_val"),
+    ("test_total", "split_test"),
+    ("prepared_train_total", "prepared_train"),
+    ("prepared_val_total", "prepared_val"),
+    ("prepared_test_total", "prepared_test"),
+)
 
 
 def current_timestamp() -> str:
@@ -148,14 +157,12 @@ def collect_result_summary(paths: dict) -> dict:
     training_progress = read_json(paths["training_progress"]) or {}
     current_skip_report = read_json(paths["current_skip_report"]) or {}
     current_skip_summary = current_skip_report.get("summary", {}) if isinstance(current_skip_report, dict) else {}
+    manifest_totals = {
+        result_key: summarize_manifest(paths[path_key], label_field="target_label").get("total", 0)
+        for result_key, path_key in RESULT_SUMMARY_MANIFEST_KEYS
+    }
     return {
-        "raw_total": summarize_manifest(paths["raw_manifest"], label_field="target_label").get("total", 0),
-        "train_total": summarize_manifest(paths["split_train"], label_field="target_label").get("total", 0),
-        "val_total": summarize_manifest(paths["split_val"], label_field="target_label").get("total", 0),
-        "test_total": summarize_manifest(paths["split_test"], label_field="target_label").get("total", 0),
-        "prepared_train_total": summarize_manifest(paths["prepared_train"], label_field="target_label").get("total", 0),
-        "prepared_val_total": summarize_manifest(paths["prepared_val"], label_field="target_label").get("total", 0),
-        "prepared_test_total": summarize_manifest(paths["prepared_test"], label_field="target_label").get("total", 0),
+        **manifest_totals,
         "broken_count": int(current_skip_summary.get("broken_count", 0) or 0),
         "skipped_count": int(current_skip_summary.get("skipped_count", 0) or 0),
         "total_issues": int(current_skip_summary.get("total_issues", 0) or 0),

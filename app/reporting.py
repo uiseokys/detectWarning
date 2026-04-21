@@ -10,6 +10,7 @@ from pathlib import Path
 STATE_SCHEMA_VERSION = 1
 MANIFEST_SUMMARY_CACHE: dict[tuple[str, str], dict] = {}
 MANIFEST_SUMMARY_CACHE_LOCK = threading.Lock()
+MANIFEST_SUMMARY_CACHE_MAX_ENTRIES = 64
 DEFAULT_IMBALANCE_WARN_MIN_SAMPLES = 8
 DEFAULT_IMBALANCE_WARN_RATIO = 5.0
 
@@ -339,6 +340,11 @@ def summarize_manifest(path: Path, label_field: str) -> dict:
                 "signature": signature,
                 "value": summary,
             }
+            while len(MANIFEST_SUMMARY_CACHE) > MANIFEST_SUMMARY_CACHE_MAX_ENTRIES:
+                oldest_key = next(iter(MANIFEST_SUMMARY_CACHE))
+                if oldest_key == cache_key and len(MANIFEST_SUMMARY_CACHE) == 1:
+                    break
+                MANIFEST_SUMMARY_CACHE.pop(oldest_key, None)
     return dict(summary)
 
 
