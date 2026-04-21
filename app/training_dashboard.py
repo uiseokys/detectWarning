@@ -5298,7 +5298,7 @@ def create_app(config_path: Path) -> FastAPI:
             controls_enabled=str(config.get("dataset_source") or "").strip().lower() == "aihub_shell",
             notice=notice,
             notice_level=notice_level,
-            refresh_seconds=15,
+            refresh_seconds=0,
         )
         return HTMLResponse(html, headers=NO_CACHE_HEADERS)
 

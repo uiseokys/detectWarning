@@ -1820,7 +1820,7 @@ def render_dashboard_page(
     controls_enabled: bool = True,
     notice: str | None = None,
     notice_level: str = "info",
-    refresh_seconds: int = 15,
+    refresh_seconds: int = 0,
 ) -> str:
     overview = overview or {}
     pipeline = overview.get("pipeline_status") or {}
