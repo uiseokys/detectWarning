@@ -258,13 +258,23 @@ def _render_diagnostics_details(diagnostics: dict) -> str:
     )
 
 
-def _render_actions_panel(default_datasetkey: str, controls_enabled: bool) -> str:
+def _render_actions_panel(
+    default_datasetkey: str,
+    controls_enabled: bool,
+    controls_notice: str | None = None,
+) -> str:
     if not controls_enabled:
+        notice = controls_notice or "이 설정에서는 브라우저에서 직접 실행을 지원하지 않습니다."
+        detail = (
+            "공유 링크에서는 진행 상황만 확인할 수 있습니다."
+            if controls_notice
+            else "dataset_source가 <code>aihub_shell</code>일 때만 filekey 큐 제어를 사용할 수 있습니다."
+        )
         return (
             "<section class=\"panel sidebar-panel\">"
-            "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>이 설정에서는 브라우저에서 직접 실행을 지원하지 않습니다.</p></div></div>"
+            f"<div class=\"panel-head\"><div><h2>작업 제어</h2><p>{_text(notice)}</p></div></div>"
             "<div class=\"panel-body\">"
-            "<p class=\"muted-block\">dataset_source가 <code>aihub_shell</code>일 때만 filekey 큐 제어를 사용할 수 있습니다.</p>"
+            f"<p class=\"muted-block\">{detail}</p>"
             "</div>"
             "</section>"
         )
@@ -2350,6 +2360,7 @@ def render_dashboard_page(
     config_path: str,
     default_datasetkey: str = "",
     controls_enabled: bool = True,
+    controls_notice: str | None = None,
     notice: str | None = None,
     notice_level: str = "info",
     refresh_seconds: int = 0,
@@ -2521,7 +2532,7 @@ def render_dashboard_page(
 
     <div class="layout">
       <aside class="sidebar">
-        {_render_actions_panel(default_datasetkey, controls_enabled)}
+        {_render_actions_panel(default_datasetkey, controls_enabled, controls_notice)}
         {_render_queue_panel(launcher, current_job_progress, queue_progress)}
         {_render_system_panel(overview, config_path, artifacts, gpu, progress, queue_progress)}
       </aside>

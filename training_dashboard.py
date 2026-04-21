@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -68,6 +68,9 @@ NO_CACHE_HEADERS = {
 NOTICE_COOKIE_NAME = "dw_dashboard_notice"
 NOTICE_LEVEL_COOKIE_NAME = "dw_dashboard_notice_level"
 NOTICE_COOKIE_MAX_AGE_SECONDS = 30
+LIVE_URL_ENV_NAME = "DETECTWARNING_LIVE_URL"
+LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
+PUBLIC_VIEWER_HOST_SUFFIXES = (".trycloudflare.com", ".workers.dev")
 
 
 def wants_json_response(request: Request | None) -> bool:
@@ -77,6 +80,48 @@ def wants_json_response(request: Request | None) -> bool:
         return True
     accept = str(request.headers.get("accept") or "").lower()
     return "application/json" in accept
+
+
+def normalize_hostname(value: str | None) -> str:
+    return str(value or "").strip().strip("[]").lower()
+
+
+def get_live_url_hostname() -> str:
+    raw_value = str(os.environ.get(LIVE_URL_ENV_NAME) or "").strip()
+    if not raw_value:
+        return ""
+    try:
+        return normalize_hostname(urlparse(raw_value).hostname)
+    except Exception:
+        return ""
+
+
+def is_viewer_request(request: Request | None) -> bool:
+    if request is None:
+        return False
+    try:
+        viewer_flag = str(request.query_params.get("viewer") or "").strip().lower()
+        if viewer_flag in {"1", "true", "yes", "on"}:
+            return True
+    except Exception:
+        pass
+
+    host = normalize_hostname(getattr(request.url, "hostname", None))
+    if not host or host in LOCAL_DASHBOARD_HOSTS:
+        return False
+    if any(host.endswith(suffix) for suffix in PUBLIC_VIEWER_HOST_SUFFIXES):
+        return True
+
+    live_host = get_live_url_hostname()
+    return bool(live_host and host == live_host)
+
+
+def ensure_dashboard_control_access(request: Request | None) -> None:
+    if is_viewer_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="공유 viewer에서는 작업 제어를 할 수 없습니다. 로컬 대시보드에서 실행해 주세요.",
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -5381,6 +5426,7 @@ def create_app(config_path: Path) -> FastAPI:
                 effective_notice = cookie_notice
             effective_notice_level = cookie_notice_level or notice_level or "info"
 
+        viewer_mode = is_viewer_request(request)
         initial_overview = build_overview(
             paths,
             config_path,
@@ -5405,7 +5451,16 @@ def create_app(config_path: Path) -> FastAPI:
                     or ""
                 )
             ),
-            controls_enabled=str(config.get("dataset_source") or "").strip().lower() == "aihub_shell",
+            controls_enabled=(
+                str(config.get("dataset_source") or "").strip().lower() == "aihub_shell"
+                and not viewer_mode
+            ),
+            controls_notice=(
+                "공유 viewer에서는 작업 제어가 비활성화되어 있습니다. "
+                "시작/중지/초기화는 로컬 대시보드에서만 할 수 있습니다."
+                if viewer_mode
+                else None
+            ),
             notice=effective_notice,
             notice_level=effective_notice_level,
             refresh_seconds=0,
@@ -5463,28 +5518,34 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/api/start")
     async def start_training(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         payload = await request.json()
         return start_training_request(payload)
 
     @app.post("/api/pause")
-    def pause_after_current() -> dict:
+    def pause_after_current(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return pause_after_current_request()
 
     @app.post("/api/remove-queued-job")
     async def remove_queued_job(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         payload = await request.json()
         return remove_queued_job_request(str(payload.get("job_id", "")).strip())
 
     @app.post("/api/force-stop")
-    def force_stop_current_job() -> dict:
+    def force_stop_current_job(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return force_stop_current_job_request()
 
     @app.post("/api/reset")
-    def reset_training_data() -> dict:
+    def reset_training_data(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
         return reset_training_data_request()
 
     @app.post("/actions/start")
     async def start_training_action(request: Request):
+        ensure_dashboard_control_access(request)
         payload = await read_form_payload(request)
         try:
             result = start_training_request(payload)
@@ -5504,6 +5565,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/actions/pause")
     def pause_after_current_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = pause_after_current_request()
             return build_dashboard_action_response(
@@ -5522,6 +5584,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/actions/remove-queued")
     async def remove_queued_job_action(request: Request):
+        ensure_dashboard_control_access(request)
         payload = await read_form_payload(request)
         try:
             result = remove_queued_job_request(str(payload.get("job_id", "")).strip())
@@ -5541,6 +5604,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/actions/force-stop")
     def force_stop_current_job_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = force_stop_current_job_request()
             return build_dashboard_action_response(
@@ -5559,6 +5623,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.post("/actions/reset")
     def reset_training_data_action(request: Request):
+        ensure_dashboard_control_access(request)
         try:
             result = reset_training_data_request()
             return build_dashboard_action_response(
