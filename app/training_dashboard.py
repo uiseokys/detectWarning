@@ -51,7 +51,6 @@ from reporting import (
     sort_jobs_by_recency,
     summarize_manifest,
 )
-from training_dashboard_view import render_dashboard_page
 from training_config import resolve_pages_sync_config
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
@@ -5277,20 +5276,15 @@ def create_app(config_path: Path) -> FastAPI:
             config=config,
             launcher_status=get_launcher_status(),
         )
-        default_datasetkey = str(
-            (initial_overview.get("aihub") or {}).get("datasetkey")
-            or config.get("aihub_shell", {}).get("datasetkey", "")
-            or ""
-        ).strip()
-        html = render_dashboard_page(
-            initial_overview,
-            config_path=str(config_path),
-            default_datasetkey=default_datasetkey,
-            controls_enabled=str(config.get("dataset_source", "")).strip().lower() == "aihub_shell",
-            notice=notice,
-            notice_level=notice_level,
-            refresh_seconds=15,
-        )
+        if notice:
+            launcher_payload = initial_overview.setdefault("launcher", {})
+            if isinstance(launcher_payload, dict):
+                launcher_payload["message"] = notice
+                if notice_level == "danger":
+                    launcher_payload["state"] = "error"
+                elif notice_level == "warn":
+                    launcher_payload["state"] = launcher_payload.get("state") or "warning"
+        html = render_dashboard(initial_overview)
         return HTMLResponse(html, headers=NO_CACHE_HEADERS)
 
     @app.get("/api/overview")
