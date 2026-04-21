@@ -5089,9 +5089,30 @@ def create_app(config_path: Path) -> FastAPI:
         return build_dashboard_redirect(str(message), str(level or "info"))
 
     async def read_form_payload(request: Request) -> dict:
+        payload: dict[str, object] = {}
+
+        try:
+            form = await request.form()
+        except Exception:
+            form = None
+
+        if form is not None:
+            for key, value in form.multi_items():
+                if hasattr(value, "filename"):
+                    continue
+                if key in payload:
+                    existing = payload[key]
+                    if isinstance(existing, list):
+                        existing.append(value)
+                    else:
+                        payload[key] = [existing, value]
+                else:
+                    payload[key] = value
+            if payload:
+                return payload
+
         body_text = (await request.body()).decode("utf-8", errors="replace")
         parsed = parse_qs(body_text, keep_blank_values=True)
-        payload: dict[str, object] = {}
         for key, values in parsed.items():
             if len(values) == 1:
                 payload[key] = values[0]
