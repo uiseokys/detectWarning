@@ -680,12 +680,18 @@ def _render_live_refresh_script() -> str:
     }
     setFormPending(form, true);
     try {
+      var formData = new FormData(form);
+      var encodedBody = new URLSearchParams();
+      formData.forEach(function (value, key) {
+        encodedBody.append(key, value);
+      });
       var response = await fetch(form.action, {
         method: String(form.method || 'POST').toUpperCase(),
-        body: new FormData(form),
+        body: encodedBody,
         cache: 'no-store',
         headers: {
           'Accept': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
           'X-Dashboard-Async': '1'
         }
       });
