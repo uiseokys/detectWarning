@@ -157,6 +157,38 @@ def _render_summary_cards(cards: list[tuple[str, str, str, str]]) -> str:
     return "".join(parts)
 
 
+def _build_summary_card_items(
+    *,
+    overview: dict,
+    pipeline: dict,
+    launcher: dict,
+    progress: dict,
+    queue_progress: dict,
+    current_job_progress: dict,
+    eta: dict,
+    gpu: dict,
+    raw_total: int,
+    prepared_total: int,
+) -> list[tuple[str, str, str, str]]:
+    latest = progress.get("latest") or {}
+    return [
+        (_state_tone(pipeline.get("state")), "파이프라인", _state_label(pipeline.get("state")), _text(pipeline.get("message"))),
+        (_state_tone(launcher.get("state")), "런처", _state_label(launcher.get("state")), _text(launcher.get("message"))),
+        ("accent", "최고 F1", _float_text(progress.get("best_val_macro_f1")), f"최고 epoch {_text(progress.get('best_epoch'))}"),
+        ("accent", "최근 epoch", _text(latest.get("epoch")), f"정확도 {_float_text(latest.get('val_accuracy'))} / F1 {_float_text(latest.get('val_macro_f1'))}"),
+        ("neutral", "데이터셋", f"원본 {raw_total} / 전처리 {prepared_total}", f"workspace {_text(overview.get('workspace_name'))}"),
+        ("neutral", "대기열", f"{_int_text(queue_progress.get('completed'))} / {_int_text(queue_progress.get('total'))}", f"대기 {_int_text(queue_progress.get('pending'))} / 실행 {_int_text(queue_progress.get('active'))}"),
+        ("warn", "현재 작업", _text(current_job_progress.get("label")), f"{_int_text(current_job_progress.get('percent'))}% / 예상 {_text(eta.get('label'))}"),
+        ("accent", "GPU", _text(gpu.get("summary")), _text(gpu.get("detail"))),
+    ]
+
+
+def _render_summary_grid(cards: list[tuple[str, str, str, str]], *, element_id: str | None = None) -> str:
+    panel_id = element_id or "queue-panel"
+    id_attr = f" id=\"{_text(panel_id, '')}\""
+    return f"<section{id_attr} class=\"summary-grid\">{_render_summary_cards(cards)}</section>"
+
+
 def _render_banner(message: str, tone: str, title: str) -> str:
     return (
         f"<section class=\"banner banner-{_text(tone, 'neutral')}\">"
@@ -241,12 +273,12 @@ def _render_actions_panel(default_datasetkey: str, controls_enabled: bool) -> st
         "<section class=\"panel sidebar-panel\">"
         "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>스크립트 없이도 동작하는 기본 입력 폼입니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
-        "<form method=\"post\" action=\"/actions/start\" class=\"stack-form\">"
+        "<form method=\"post\" action=\"/actions/start\" class=\"stack-form\" id=\"start-job-form\">"
         "<label class=\"field-label\">datasetkey"
-        f"<input type=\"text\" name=\"datasetkey\" value=\"{_text(default_datasetkey, '')}\" placeholder=\"예: 171\" />"
+        f"<input type=\"text\" id=\"datasetkey-input\" name=\"datasetkey\" value=\"{_text(default_datasetkey, '')}\" placeholder=\"예: 171\" data-persist-key=\"dashboard.datasetkey\" />"
         "</label>"
         "<label class=\"field-label\">AIHub API 키"
-        "<input type=\"password\" name=\"api_key\" value=\"\" placeholder=\"필요할 때만 입력\" />"
+        "<input type=\"password\" id=\"api-key-input\" name=\"api_key\" value=\"\" placeholder=\"필요할 때만 입력\" data-persist-key=\"dashboard.api_key\" />"
         "</label>"
         "<label class=\"field-label\">filekeys"
         "<textarea name=\"filekeys\" rows=\"7\" placeholder=\"예:&#10;49841&#10;49842&#10;49843\"></textarea>"
@@ -264,7 +296,51 @@ def _render_actions_panel(default_datasetkey: str, controls_enabled: bool) -> st
     )
 
 
-def _render_queue_panel(launcher: dict, current_job_progress: dict) -> str:
+def _render_hero_kpis(
+    *,
+    updated_at: str,
+    progress: dict,
+    skip_report: dict,
+    continual_state: dict,
+    element_id: str | None = None,
+) -> str:
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
+    return (
+        f"<div{id_attr} class=\"hero-kpis\">"
+        f"<div class=\"hero-kpi\"><span>최종 갱신</span><strong>{_text(updated_at)}</strong></div>"
+        f"<div class=\"hero-kpi\"><span>학습 / 검증 샘플</span><strong>{_int_text(progress.get('train_samples'))} / {_int_text(progress.get('val_samples'))}</strong></div>"
+        f"<div class=\"hero-kpi\"><span>현재 스킵</span><strong>{_int_text((skip_report.get('summary') or {}).get('total_issues'))}</strong></div>"
+        f"<div class=\"hero-kpi\"><span>누적 전처리 샘플</span><strong>{_int_text(continual_state.get('prepared_train_total'))} / {_int_text(continual_state.get('prepared_val_total'))} / {_int_text(continual_state.get('prepared_test_total'))}</strong></div>"
+        "</div>"
+    )
+
+
+def _render_hero_status_card(
+    *,
+    pipeline: dict,
+    launcher: dict,
+    gpu: dict,
+    latest_loss: str,
+    element_id: str | None = None,
+) -> str:
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
+    return (
+        f"<aside{id_attr} class=\"status-card\">"
+        f"<div class=\"status-badge {_state_tone(pipeline.get('state'))}\">{_state_label(pipeline.get('state'))}</div>"
+        "<div class=\"status-main\">"
+        f"<strong>{_text(pipeline.get('message'))}</strong>"
+        "현재 파이프라인의 상태를 가장 먼저 보여줍니다. 아래 카드는 성능, 큐, 데이터셋 상태를 빠르게 훑어볼 수 있도록 배치했습니다."
+        "</div>"
+        "<div class=\"mini-stack\">"
+        f"<div class=\"mini-row\"><span>최신 검증 loss</span><strong>{_text(latest_loss)}</strong></div>"
+        f"<div class=\"mini-row\"><span>런처 상태</span><strong>{_state_label(launcher.get('state'))} / {_text(launcher.get('message'))}</strong></div>"
+        f"<div class=\"mini-row\"><span>GPU 상세</span><strong>{_text(gpu.get('detail'))}</strong></div>"
+        "</div>"
+        "</aside>"
+    )
+
+
+def _render_queue_panel(launcher: dict, current_job_progress: dict, *, element_id: str | None = None) -> str:
     pending_jobs = launcher.get("pending_jobs") or []
     current_job = launcher.get("current_job") or {}
     queue_items = []
@@ -284,9 +360,10 @@ def _render_queue_panel(launcher: dict, current_job_progress: dict) -> str:
             "</li>"
         )
     queue_html = "".join(queue_items) or "<li class=\"queue-empty\">대기 중인 작업이 없습니다.</li>"
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
 
     return (
-        "<section class=\"panel sidebar-panel\">"
+        f"<section{id_attr} class=\"panel sidebar-panel\">"
         "<div class=\"panel-head\"><div><h2>현재 작업과 대기열</h2><p>지금 상태와 다음 실행 대상을 빠르게 확인합니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
         "<div class=\"key-metric-grid\">"
@@ -354,6 +431,11 @@ def _render_logs(logs: dict) -> str:
     return "".join(sections)
 
 
+def _render_logs_stack(logs: dict, *, element_id: str | None = None) -> str:
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
+    return f"<div{id_attr} class=\"log-stack\">{_render_logs(logs)}</div>"
+
+
 @lru_cache(maxsize=1)
 def _render_section_nav() -> str:
     return (
@@ -361,6 +443,272 @@ def _render_section_nav() -> str:
         + "".join(f"<a href=\"#{_text(anchor)}\">{_text(label)}</a>" for anchor, label in SECTION_NAV_ITEMS)
         + "</nav>"
     )
+
+
+@lru_cache(maxsize=1)
+def _render_live_refresh_script() -> str:
+    return """
+<script>
+(function () {
+  if (!window.fetch) {
+    return;
+  }
+
+  var timer = null;
+  var inflight = false;
+  var delayMs = 1200;
+  var disposed = false;
+  var noticeTimer = null;
+
+  function safeStorage() {
+    try {
+      if (!window.localStorage) {
+        return null;
+      }
+      var probeKey = '__dw_dashboard_probe__';
+      window.localStorage.setItem(probeKey, '1');
+      window.localStorage.removeItem(probeKey);
+      return window.localStorage;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function bindPersistedInputs() {
+    var storage = safeStorage();
+    if (!storage) {
+      return;
+    }
+    var inputs = document.querySelectorAll('[data-persist-key]');
+    if (!inputs || !inputs.length) {
+      return;
+    }
+    inputs.forEach(function (input) {
+      var key = input.getAttribute('data-persist-key');
+      if (!key) {
+        return;
+      }
+      try {
+        var saved = storage.getItem(key);
+        if (saved !== null && saved !== '' && !input.value) {
+          input.value = saved;
+        }
+      } catch (error) {
+        return;
+      }
+
+      var persist = function () {
+        try {
+          if (input.value) {
+            storage.setItem(key, input.value);
+          } else {
+            storage.removeItem(key);
+          }
+        } catch (error) {
+          return;
+        }
+      };
+
+      input.addEventListener('input', persist);
+      input.addEventListener('change', persist);
+    });
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function resolveNoticeTone(level) {
+    var normalized = String(level || '').toLowerCase();
+    if (normalized === 'good' || normalized === 'success') {
+      return 'good';
+    }
+    if (normalized === 'warn' || normalized === 'warning') {
+      return 'warn';
+    }
+    if (normalized === 'danger' || normalized === 'error') {
+      return 'danger';
+    }
+    if (normalized === 'accent' || normalized === 'running' || normalized === 'queued') {
+      return 'accent';
+    }
+    return 'neutral';
+  }
+
+  function showActionNotice(message, level) {
+    var region = document.getElementById('action-notice-region');
+    if (!region) {
+      return;
+    }
+    if (!message) {
+      region.innerHTML = '';
+      return;
+    }
+    var tone = resolveNoticeTone(level);
+    var title = tone === 'danger' ? '오류' : '작업 결과';
+    region.innerHTML =
+      '<section class="banner banner-' + tone + '">' +
+      '<div class="banner-title">' + escapeHtml(title) + '</div>' +
+      '<div class="banner-copy">' + escapeHtml(message) + '</div>' +
+      '</section>';
+    if (noticeTimer) {
+      window.clearTimeout(noticeTimer);
+    }
+    noticeTimer = window.setTimeout(function () {
+      region.innerHTML = '';
+      noticeTimer = null;
+    }, 7000);
+  }
+
+  function replaceRegion(id, html) {
+    if (!html) {
+      return;
+    }
+    var current = document.getElementById(id);
+    if (!current) {
+      return;
+    }
+    current.outerHTML = html;
+  }
+
+  function nextDelay() {
+    return document.hidden ? Math.max(delayMs, 10000) : delayMs;
+  }
+
+  function schedule(ms) {
+    if (disposed) {
+      return;
+    }
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+    timer = window.setTimeout(poll, ms);
+  }
+
+  function requestRefreshSoon(ms) {
+    schedule(typeof ms === 'number' ? ms : 250);
+  }
+
+  async function poll() {
+    if (disposed) {
+      return;
+    }
+    if (inflight) {
+      schedule(nextDelay());
+      return;
+    }
+    inflight = true;
+    try {
+      var response = await fetch('/api/live-fragments', { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error('status ' + response.status);
+      }
+      var payload = await response.json();
+      if (payload && payload.fragments) {
+        replaceRegion('hero-kpis', payload.fragments.hero_kpis);
+        replaceRegion('hero-status-card', payload.fragments.hero_status);
+        replaceRegion('summary-grid', payload.fragments.summary_cards);
+        replaceRegion('queue-panel', payload.fragments.queue_panel);
+        replaceRegion('logs-stack', payload.fragments.logs);
+      }
+      if (payload && payload.poll_interval_ms) {
+        delayMs = payload.poll_interval_ms;
+      } else if (payload && payload.active === false) {
+        delayMs = 8000;
+      } else {
+        delayMs = 1200;
+      }
+    } catch (error) {
+      delayMs = Math.min(Math.max(delayMs * 2, 3000), 20000);
+    } finally {
+      inflight = false;
+      schedule(nextDelay());
+    }
+  }
+
+  function setFormPending(form, pending) {
+    if (!form) {
+      return;
+    }
+    form.dataset.pending = pending ? '1' : '0';
+    var controls = form.querySelectorAll('button, input[type="submit"]');
+    controls.forEach(function (control) {
+      control.disabled = !!pending;
+    });
+  }
+
+  async function submitActionForm(form) {
+    if (!form || form.dataset.pending === '1') {
+      return;
+    }
+    setFormPending(form, true);
+    try {
+      var response = await fetch(form.action, {
+        method: String(form.method || 'POST').toUpperCase(),
+        body: new FormData(form),
+        cache: 'no-store',
+        headers: {
+          'Accept': 'application/json',
+          'X-Dashboard-Async': '1'
+        }
+      });
+
+      var payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+
+      if (!response.ok || !payload || payload.ok === false) {
+        showActionNotice((payload && payload.message) || '요청 처리 중 오류가 발생했습니다.', 'danger');
+        requestRefreshSoon(300);
+        return;
+      }
+
+      showActionNotice(payload.message || '요청을 처리했습니다.', payload.level || 'good');
+      requestRefreshSoon(150);
+    } catch (error) {
+      showActionNotice('네트워크 오류로 요청을 처리하지 못했습니다.', 'danger');
+    } finally {
+      setFormPending(form, false);
+    }
+  }
+
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    var action = form.getAttribute('action') || '';
+    if (action.indexOf('/actions/') !== 0) {
+      return;
+    }
+    event.preventDefault();
+    submitActionForm(form);
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    schedule(document.hidden ? Math.max(delayMs, 10000) : 800);
+  });
+
+  window.addEventListener('beforeunload', function () {
+    disposed = true;
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+  });
+
+  bindPersistedInputs();
+  schedule(1200);
+}());
+</script>
+"""
 
 
 def _prepared_total_from_job(job: dict) -> int:
@@ -1812,6 +2160,62 @@ def _styles() -> str:
 """
 
 
+def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
+    overview = overview or {}
+    pipeline = overview.get("pipeline_status") or {}
+    progress = overview.get("training_progress") or {}
+    launcher = overview.get("launcher") or {}
+    queue_progress = overview.get("queue_progress") or {}
+    current_job_progress = overview.get("current_job_progress") or {}
+    eta = overview.get("eta") or {}
+    gpu = overview.get("gpu") or {}
+    dataset = overview.get("dataset") or {}
+    logs = overview.get("logs") or {}
+    continual_state = overview.get("continual_state") or {}
+    skip_report = overview.get("skip_report") or {}
+
+    raw_total = int(((dataset.get("raw") or {}).get("total") or 0))
+    prepared_total = sum(
+        int(((dataset.get(key) or {}).get("total") or 0))
+        for key in ("prepared_train", "prepared_val", "prepared_test")
+    )
+    updated_at = progress.get("updated_at") or pipeline.get("updated_at") or "-"
+    latest = progress.get("latest") or {}
+    latest_loss = _float_text(latest.get("val_loss"))
+    summary_cards = _build_summary_card_items(
+        overview=overview,
+        pipeline=pipeline,
+        launcher=launcher,
+        progress=progress,
+        queue_progress=queue_progress,
+        current_job_progress=current_job_progress,
+        eta=eta,
+        gpu=gpu,
+        raw_total=raw_total,
+        prepared_total=prepared_total,
+    )
+
+    return {
+        "hero_kpis": _render_hero_kpis(
+            updated_at=updated_at,
+            progress=progress,
+            skip_report=skip_report,
+            continual_state=continual_state,
+            element_id="hero-kpis",
+        ),
+        "hero_status": _render_hero_status_card(
+            pipeline=pipeline,
+            launcher=launcher,
+            gpu=gpu,
+            latest_loss=latest_loss,
+            element_id="hero-status-card",
+        ),
+        "summary_cards": _render_summary_grid(summary_cards, element_id="summary-grid"),
+        "queue_panel": _render_queue_panel(launcher, current_job_progress, element_id="queue-panel"),
+        "logs": _render_logs_stack(logs, element_id="logs-stack"),
+    }
+
+
 def render_dashboard_page(
     overview: dict,
     *,
@@ -1884,6 +2288,34 @@ def render_dashboard_page(
         f"<div class=\"hero-kpi\"><span>누적 스킵</span><strong>{_int_text((skip_report.get('summary') or {}).get('total_issues'))}</strong></div>"
         f"<div class=\"hero-kpi\"><span>누적 전처리 샘플</span><strong>{_int_text(continual_state.get('prepared_train_total'))} / {_int_text(continual_state.get('prepared_val_total'))} / {_int_text(continual_state.get('prepared_test_total'))}</strong></div>"
         "</div>"
+    )
+
+    summary_card_items = _build_summary_card_items(
+        overview=overview,
+        pipeline=pipeline,
+        launcher=launcher,
+        progress=progress,
+        queue_progress=queue_progress,
+        current_job_progress=current_job_progress,
+        eta=eta,
+        gpu=gpu,
+        raw_total=raw_total,
+        prepared_total=prepared_total,
+    )
+    summary_cards = _render_summary_cards(summary_card_items)
+    hero_kpis = _render_hero_kpis(
+        updated_at=updated_at,
+        progress=progress,
+        skip_report=skip_report,
+        continual_state=continual_state,
+        element_id="hero-kpis",
+    )
+    hero_status_card = _render_hero_status_card(
+        pipeline=pipeline,
+        launcher=launcher,
+        gpu=gpu,
+        latest_loss=latest_loss,
+        element_id="hero-status-card",
     )
 
     dataset_rows = _build_dataset_rows(dataset)
@@ -1962,7 +2394,7 @@ def render_dashboard_page(
         </div>
         {hero_kpis}
       </div>
-      <aside class="status-card">
+      <aside class="status-card" id="hero-status-card">
         <div class="status-badge {_state_tone(pipeline.get('state'))}">{_state_label(pipeline.get('state'))}</div>
         <div class="status-main">
           <strong>{_text(pipeline.get('message'))}</strong>
@@ -1976,6 +2408,7 @@ def render_dashboard_page(
       </aside>
     </section>
 
+    <div id="action-notice-region"></div>
     {banners_html}
 
     {_render_section_nav()}
@@ -1988,7 +2421,7 @@ def render_dashboard_page(
       </aside>
 
       <main class="content">
-        <section class="summary-grid">
+        <section class="summary-grid" id="summary-grid">
           {summary_cards}
         </section>
 
@@ -2081,7 +2514,7 @@ def render_dashboard_page(
         <section class="panel" id="logs">
           <div class="panel-head"><div><h2>로그</h2><p>필요한 로그만 열어 볼 수 있게 접이식으로 정리했습니다.</p></div></div>
           <div class="panel-body">
-            <div class="log-stack">
+            <div class="log-stack" id="logs-stack">
               {_render_logs(logs)}
             </div>
           </div>
@@ -2091,6 +2524,7 @@ def render_dashboard_page(
       </main>
     </div>
   </div>
+  {_render_live_refresh_script()}
 </body>
 </html>
 """
