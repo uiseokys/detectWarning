@@ -1,27 +1,18 @@
 {
-  "stage": "prepare",
-  "state": "running",
-  "message": "train split에서 pose 시퀀스를 추출하는 중입니다.",
+  "stage": "error",
+  "state": "error",
+  "message": "다운로드 후 학습용 영상 파일을 찾지 못했습니다.\n확인할 것:\n1. 입력한 filekey가 실제 승인된 분할 파일인지\n2. AIHub에서 해당 데이터셋 다운로드 승인이 완료되었는지\n3. 분할 압축 파일이 .zip.part* 형태로 정상 저장되었는지\n4. label_mapping의 한글 라벨명이 압축 해제 폴더명과 일치하는지",
   "workspace_dir": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub",
-  "updated_at": "2026-04-22T00:47:50.034603+09:00",
-  "pipeline_started_at": "2026-04-22T00:33:34.582574+09:00",
-  "stage_started_at": "2026-04-22T00:41:00.428054+09:00",
+  "updated_at": "2026-04-22T12:23:28.093216+09:00",
+  "pipeline_started_at": "2026-04-22T12:11:11.594780+09:00",
+  "stage_started_at": "2026-04-22T12:11:11.594780+09:00",
   "stage_timings": {
-    "download": {
-      "started_at": "2026-04-22T00:33:34.582574+09:00",
-      "finished_at": "2026-04-22T00:41:00.427054+09:00",
-      "duration_seconds": 445.84448
+    "total": {
+      "started_at": "2026-04-22T12:11:11.594780+09:00",
+      "finished_at": "2026-04-22T12:23:28.093216+09:00",
+      "duration_seconds": 736.498436
     }
   },
-  "total_duration_seconds": null,
-  "stage_progress": 0.6426,
-  "processed_items": 10,
-  "total_items": 27,
-  "current_split": "train",
-  "split_index": 10,
-  "split_total": 18,
-  "current_video": "704-3_cam02_kidnap02_place02_night_spring.mp4",
-  "kept_items": 3,
-  "skipped_items": 6,
-  "prefetch_workers": 2
+  "total_duration_seconds": 736.498436,
+  "stage_progress": 1.0
 }

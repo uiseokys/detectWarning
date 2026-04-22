@@ -462,7 +462,7 @@ def _render_logs(logs: dict) -> str:
         body = _text(payload.get("tail"), "표시할 로그가 없습니다.")
         open_attr = " open" if opened else ""
         sections.append(
-            f"<details class=\"log-card\"{open_attr}>"
+            f"<details class=\"log-card\" data-log-key=\"{_text(key)}\"{open_attr}>"
             f"<summary>{_text(title)}</summary>"
             "<div class=\"detail-body\">"
             f"<div class=\"muted-block\">filekey {_text(payload.get('filekey'))} / datasetkey {_text(payload.get('datasetkey'))}</div>"
@@ -618,6 +618,46 @@ def _render_live_refresh_script() -> str:
     current.outerHTML = html;
   }
 
+  function captureDetailOpenState(root) {
+    var state = {};
+    if (!root) {
+      return state;
+    }
+    root.querySelectorAll('details[data-log-key]').forEach(function (node) {
+      var key = node.getAttribute('data-log-key');
+      if (key) {
+        state[key] = !!node.open;
+      }
+    });
+    return state;
+  }
+
+  function restoreDetailOpenState(root, state) {
+    if (!root || !state) {
+      return;
+    }
+    root.querySelectorAll('details[data-log-key]').forEach(function (node) {
+      var key = node.getAttribute('data-log-key');
+      if (key && Object.prototype.hasOwnProperty.call(state, key)) {
+        node.open = !!state[key];
+      }
+    });
+  }
+
+  function replaceLogRegion(id, html) {
+    if (!html) {
+      return;
+    }
+    var current = document.getElementById(id);
+    if (!current) {
+      return;
+    }
+    var openState = captureDetailOpenState(current);
+    current.outerHTML = html;
+    var replaced = document.getElementById(id);
+    restoreDetailOpenState(replaced, openState);
+  }
+
   function nextDelay() {
     return document.hidden ? Math.max(delayMs, 10000) : delayMs;
   }
@@ -656,7 +696,7 @@ def _render_live_refresh_script() -> str:
         replaceRegion('hero-status-card', payload.fragments.hero_status);
         replaceRegion('summary-grid', payload.fragments.summary_cards);
         replaceRegion('queue-panel', payload.fragments.queue_panel);
-        replaceRegion('logs-stack', payload.fragments.logs);
+        replaceLogRegion('logs-stack', payload.fragments.logs);
       }
       if (payload && payload.poll_interval_ms) {
         delayMs = payload.poll_interval_ms;

@@ -44,6 +44,22 @@ ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 SIZE_TOKEN_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMGTP]i?B?|B)$", re.IGNORECASE)
 DOWNLOAD_STATUS_MIN_INTERVAL_SECONDS = 2.0
 DOWNLOAD_STATUS_MIN_BYTES_DELTA = 128 * 1024 * 1024
+AIHUB_FILE_TREE_REQUEST_TIMEOUT_SECONDS = 60
+AIHUB_FILE_TREE_MAX_RETRIES = 3
+AIHUB_FILE_TREE_RETRY_BACKOFF_SECONDS = 1.5
+AIHUB_FILE_TREE_HEADERS = {
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "User-Agent": "detectWarning/1.0 (+https://api.aihub.or.kr)",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+AIHUB_FILE_TREE_CATEGORY_PATTERN = re.compile(
+    r"[├└]\s*─?\s*(?P<index>\d{2})\.(?P<label>[^()|\r\n]+?)\((?P<alias>[A-Za-z0-9_ -]+)\)"
+)
+AIHUB_FILE_TREE_FILE_PATTERN = re.compile(
+    r"(?P<name>[A-Za-z0-9_.-]+\.zip)\s*\|\s*[^|]+\|\s*(?P<filekey>\d{4,})\b",
+    re.IGNORECASE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -724,6 +740,7 @@ def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
 
 def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[DownloadedItem]:
     shell_config = config.get("aihub_shell", {})
+    dataset_config = config.get("dataset", {})
     shell_path = resolve_aihub_shell_path(shell_config)
     api_key = resolve_aihub_api_key(shell_config)
     mode = str(shell_config.get("mode", "d")).strip()
@@ -735,7 +752,13 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
 
     command = build_aihub_shell_command(shell_path, api_key, mode=mode)
     if datasetkey is not None and filekey:
-        validate_aihub_filekeys(shell_path, api_key, datasetkey=datasetkey, requested_filekeys=filekey)
+        validate_aihub_filekeys(
+            shell_path,
+            api_key,
+            datasetkey=datasetkey,
+            requested_filekeys=filekey,
+            excluded_source_labels=dataset_config.get("excluded_source_labels", []),
+        )
     if datasetkey is not None:
         command.extend(["-datasetkey", str(datasetkey)])
     if datapackagekey is not None:
@@ -940,13 +963,24 @@ def resolve_windows_bash() -> str | None:
     return None
 
 
-def validate_aihub_filekeys(shell_path: str, api_key: str, *, datasetkey, requested_filekeys) -> None:
+def validate_aihub_filekeys(
+    shell_path: str,
+    api_key: str,
+    *,
+    datasetkey,
+    requested_filekeys,
+    excluded_source_labels=None,
+) -> None:
     requested = normalize_requested_filekeys(requested_filekeys)
     if not requested:
         return
 
     try:
-        payload = fetch_aihub_file_tree(datasetkey=datasetkey)
+        payload = fetch_aihub_file_tree(
+            datasetkey=datasetkey,
+            shell_path=shell_path,
+            api_key=api_key,
+        )
     except Exception as exc:
         print(f"[aihubshell] filekey 목록 검증을 건너뜁니다: {exc}")
         return
@@ -959,7 +993,39 @@ def validate_aihub_filekeys(shell_path: str, api_key: str, *, datasetkey, reques
     available_keys = {entry["filekey"] for entry in available_entries}
     missing = [filekey for filekey in requested if filekey not in available_keys]
     if not missing:
-        return
+        excluded_requested = find_requested_aihub_entries(
+            requested,
+            available_entries,
+            source_labels=excluded_source_labels or [],
+        )
+        if not excluded_requested:
+            return
+
+        excluded_keys = ", ".join(entry["filekey"] for entry in excluded_requested)
+        excluded_labels = ", ".join(
+            sorted(
+                {
+                    entry.get("source_label")
+                    or entry.get("source_alias")
+                    or entry.get("name")
+                    or "-"
+                    for entry in excluded_requested
+                }
+            )
+        )
+        excluded_examples = "\n".join(
+            f"- {entry['filekey']}: {entry.get('name', '-')}"
+            for entry in excluded_requested[:10]
+        )
+        raise RuntimeError(
+            "입력한 filekey는 현재 학습 대상에서 제외한 클래스입니다.\n"
+            f"- datasetkey: {datasetkey}\n"
+            f"- 제외한 클래스: {excluded_labels}\n"
+            f"- 제외 filekey: {excluded_keys}\n"
+            "현재 설정은 주취행동(drunken)과 투기(dump)를 학습에서 제외하도록 되어 있습니다.\n"
+            "아래 filekey를 확인해 주세요:\n"
+            f"{excluded_examples}"
+        )
 
     examples = ", ".join(entry["filekey"] for entry in available_entries[:10])
     matched_names = "\n".join(
@@ -991,20 +1057,124 @@ def normalize_requested_filekeys(requested_filekeys) -> list[str]:
     return normalized
 
 
-def fetch_aihub_file_tree(*, datasetkey) -> dict | list:
-    filetree_url = f"https://api.aihub.or.kr/info/{datasetkey}.do"
-    response = requests.get(filetree_url, timeout=60)
-    response.raise_for_status()
-    merged_output = response.text.strip()
-    payload_text = extract_json_payload(merged_output)
-    if not payload_text:
-        raise RuntimeError(
-            "AIHub 파일 목록 조회 결과를 해석하지 못했습니다.\n"
-            f"- datasetkey: {datasetkey}\n"
-            f"- raw output: {merged_output[:1000] if merged_output else '(empty)'}\n"
-            "AIHub 파일 목록 응답 형식이 예상과 다를 수 있습니다."
+def normalize_match_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9가-힣]+", "", str(text or "").lower())
+
+
+def match_source_label_text(text: str, source_labels) -> str:
+    raw_text = str(text or "")
+    raw_text_lower = raw_text.lower()
+    normalized_text = normalize_match_text(raw_text_lower)
+    for source_label in source_labels or []:
+        source_text = str(source_label).strip()
+        if not source_text:
+            continue
+        source_text_lower = source_text.lower()
+        normalized_source = normalize_match_text(source_text_lower)
+        if (
+            source_text in raw_text
+            or source_text_lower in raw_text_lower
+            or (normalized_source and normalized_source in normalized_text)
+        ):
+            return source_text
+    return ""
+
+
+def find_requested_aihub_entries(requested_filekeys: list[str], available_entries: list[dict], *, source_labels) -> list[dict]:
+    requested_set = {str(filekey).strip() for filekey in requested_filekeys if str(filekey).strip()}
+    matched: list[dict] = []
+    for entry in available_entries:
+        if entry.get("filekey") not in requested_set:
+            continue
+        entry_text = " ".join(
+            str(entry.get(key) or "")
+            for key in ("source_label", "source_alias", "name")
         )
-    return json.loads(payload_text)
+        if match_source_label_text(entry_text, source_labels):
+            matched.append(entry)
+    return matched
+
+
+def fetch_aihub_file_tree(*, datasetkey, shell_path: str | None = None, api_key: str | None = None) -> dict | list:
+    filetree_url = f"https://api.aihub.or.kr/info/{datasetkey}.do"
+    errors: list[str] = []
+
+    with requests.Session() as session:
+        session.trust_env = False
+        for attempt in range(1, AIHUB_FILE_TREE_MAX_RETRIES + 1):
+            try:
+                response = session.get(
+                    filetree_url,
+                    headers=AIHUB_FILE_TREE_HEADERS,
+                    timeout=AIHUB_FILE_TREE_REQUEST_TIMEOUT_SECONDS,
+                )
+                merged_output = response.text.strip()
+                payload_text = extract_json_payload(merged_output)
+                if payload_text:
+                    return json.loads(payload_text)
+
+                listing_entries = parse_aihub_file_tree_listing(merged_output)
+                if listing_entries:
+                    return listing_entries
+
+                response.raise_for_status()
+                raise RuntimeError(
+                    "AIHub 파일 목록 조회 결과를 해석하지 못했습니다.\n"
+                    f"- datasetkey: {datasetkey}\n"
+                    f"- raw output: {merged_output[:1000] if merged_output else '(empty)'}\n"
+                    "AIHub 파일 목록 응답 형식이 예상과 다를 수 있습니다."
+                )
+            except Exception as exc:
+                errors.append(f"HTTP attempt {attempt}: {exc}")
+                if attempt < AIHUB_FILE_TREE_MAX_RETRIES:
+                    time.sleep(AIHUB_FILE_TREE_RETRY_BACKOFF_SECONDS * attempt)
+
+    if shell_path:
+        try:
+            merged_output = fetch_aihub_file_tree_via_shell(
+                shell_path=shell_path,
+                api_key=str(api_key or ""),
+                datasetkey=datasetkey,
+            )
+            payload_text = extract_json_payload(merged_output)
+            if payload_text:
+                return json.loads(payload_text)
+            listing_entries = parse_aihub_file_tree_listing(merged_output)
+            if listing_entries:
+                return listing_entries
+            errors.append(
+                "shell fallback: AIHub shell 출력에서 파일 목록 JSON을 찾지 못했습니다."
+            )
+        except Exception as exc:
+            errors.append(f"shell fallback: {exc}")
+
+    raise RuntimeError(
+        "AIHub 파일 목록 조회에 실패했습니다.\n"
+        f"- datasetkey: {datasetkey}\n"
+        + "\n".join(f"- {message}" for message in errors)
+    )
+
+
+def fetch_aihub_file_tree_via_shell(*, shell_path: str, api_key: str, datasetkey) -> str:
+    command = build_aihub_shell_command(shell_path, api_key, mode="l")
+    command.extend(["-datasetkey", str(datasetkey)])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=AIHUB_FILE_TREE_REQUEST_TIMEOUT_SECONDS,
+        check=False,
+    )
+    merged_output = "\n".join(
+        part for part in (result.stdout.strip(), result.stderr.strip()) if part
+    ).strip()
+    if result.returncode != 0 and not merged_output:
+        raise RuntimeError(
+            f"AIHub shell 파일 목록 조회가 실패했습니다. exit code={result.returncode}"
+        )
+    return merged_output
 
 
 def extract_json_payload(text: str) -> str:
@@ -1019,6 +1189,44 @@ def extract_json_payload(text: str) -> str:
     return max(candidates, key=len)
 
 
+def parse_aihub_file_tree_listing(text: str) -> list[dict]:
+    entries: list[dict] = []
+    current_label = ""
+    current_alias = ""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        category_match = AIHUB_FILE_TREE_CATEGORY_PATTERN.search(line)
+        if category_match and ".zip" not in line.lower():
+            current_label = category_match.group("label").strip()
+            current_alias = category_match.group("alias").strip()
+            continue
+
+        file_match = AIHUB_FILE_TREE_FILE_PATTERN.search(line)
+        if not file_match:
+            continue
+
+        file_name = file_match.group("name").strip()
+        filekey = file_match.group("filekey").strip()
+        display_name = file_name
+        if current_label:
+            display_name = f"{current_label} / {file_name}"
+        elif current_alias:
+            display_name = f"{current_alias} / {file_name}"
+
+        entries.append(
+            {
+                "filekey": filekey,
+                "fileName": file_name,
+                "name": display_name,
+                "sourceLabel": current_label,
+                "sourceAlias": current_alias,
+            }
+        )
+    return entries
+
+
 def collect_aihub_file_entries(payload) -> list[dict]:
     entries: list[dict] = []
 
@@ -1030,19 +1238,33 @@ def collect_aihub_file_entries(payload) -> list[dict]:
                     filekey = str(node[key]).strip()
                     break
             if filekey:
-                entries.append(
-                    {
-                        "filekey": filekey,
-                        "name": str(
-                            node.get("fileNm")
-                            or node.get("fileName")
-                            or node.get("filePath")
-                            or node.get("path")
-                            or node.get("name")
-                            or ""
-                        ).strip(),
-                    }
-                )
+                entry = {
+                    "filekey": filekey,
+                    "name": str(
+                        node.get("fileNm")
+                        or node.get("name")
+                        or node.get("fileName")
+                        or node.get("filePath")
+                        or node.get("path")
+                        or ""
+                    ).strip(),
+                }
+                source_label = str(
+                    node.get("sourceLabel")
+                    or node.get("source_label")
+                    or node.get("label")
+                    or ""
+                ).strip()
+                source_alias = str(
+                    node.get("sourceAlias")
+                    or node.get("source_alias")
+                    or ""
+                ).strip()
+                if source_label:
+                    entry["source_label"] = source_label
+                if source_alias:
+                    entry["source_alias"] = source_alias
+                entries.append(entry)
             for value in node.values():
                 walk(value)
         elif isinstance(node, list):
@@ -1068,6 +1290,7 @@ def scan_local_video_dataset(
     import_dir = source_root or paths["import_dir"]
     raw_dir = paths["raw_dir"]
     label_mapping = dataset_config.get("label_mapping", {})
+    excluded_source_labels = dataset_config.get("excluded_source_labels", [])
     extensions = tuple(
         ext.lower()
         for ext in dataset_config.get("video_extensions", [".mp4", ".avi", ".mov", ".mkv", ".wmv"])
@@ -1075,7 +1298,9 @@ def scan_local_video_dataset(
 
     scanned: list[DownloadedItem] = []
     unlabeled_examples: list[str] = []
+    excluded_examples: list[str] = []
     candidate_video_count = 0
+    excluded_video_count = 0
     for video_path in sorted(indexed_files or list_indexed_files(import_dir)):
         if video_path.suffix.lower() not in extensions:
             continue
@@ -1083,6 +1308,12 @@ def scan_local_video_dataset(
 
         source_label, target_label = infer_label_from_path(video_path, label_mapping)
         if not target_label:
+            excluded_label = match_source_label_text(str(video_path), excluded_source_labels)
+            if excluded_label:
+                excluded_video_count += 1
+                if len(excluded_examples) < 12:
+                    excluded_examples.append(f"{video_path} [{excluded_label}]")
+                continue
             if len(unlabeled_examples) < 12:
                 unlabeled_examples.append(str(video_path))
             continue
@@ -1106,7 +1337,15 @@ def scan_local_video_dataset(
                 },
             )
         )
-    if candidate_video_count and not scanned:
+    if excluded_video_count:
+        print(f"[scan] excluded videos by config: {excluded_video_count}")
+        if excluded_examples:
+            print("[scan] excluded examples:")
+            for sample_path in excluded_examples:
+                print(f"  - {sample_path}")
+    if candidate_video_count and not scanned and not unlabeled_examples and excluded_video_count:
+        print("[scan] 모든 후보 영상이 excluded_source_labels에 해당해 학습 대상에서 제외되었습니다.")
+    elif candidate_video_count and not scanned:
         print("[scan] 영상 파일은 찾았지만 label_mapping과 경로가 맞지 않아 학습 데이터로 분류되지 않았습니다.")
         print(f"[scan] candidate videos: {candidate_video_count}")
         if unlabeled_examples:
@@ -1995,20 +2234,10 @@ def resolve_aihub_api_key(shell_config: dict) -> str:
 
 def infer_label_from_path(video_path: Path, label_mapping: dict) -> tuple[str, str | None]:
     relative_text = str(video_path).replace("\\", "/")
-    relative_text_lower = relative_text.lower()
-    normalized_path = re.sub(r"[^a-z0-9가-힣]+", "", relative_text_lower)
     for source_label, target_label in label_mapping.items():
-        source_text = str(source_label).strip()
-        if not source_text:
-            continue
-        source_text_lower = source_text.lower()
-        normalized_source = re.sub(r"[^a-z0-9가-힣]+", "", source_text_lower)
-        if (
-            source_text in relative_text
-            or source_text_lower in relative_text_lower
-            or (normalized_source and normalized_source in normalized_path)
-        ):
-            return str(source_label), str(target_label)
+        matched_source = match_source_label_text(relative_text, [source_label])
+        if matched_source:
+            return matched_source, str(target_label)
     return "", None
 
 
