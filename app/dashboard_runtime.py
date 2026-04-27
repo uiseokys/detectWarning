@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import queue
 import re
 import subprocess
@@ -9,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from reporting import enrich_completed_job, read_json, summarize_manifest
+from reporting import enrich_completed_job, read_json, summarize_manifest, write_json_atomic
 from update_pages_site import build_latest_result_payload, build_live_status_payload, write_json
 
 
@@ -138,8 +137,7 @@ def write_dashboard_status(paths: dict, *, stage: str, state: str, message: str,
         "updated_at": current_timestamp(),
         **extra,
     }
-    with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(paths["pipeline_status"], payload)
 
 
 def persist_launcher_history(launcher_history_path: Path, launcher_state: dict) -> None:
@@ -148,8 +146,7 @@ def persist_launcher_history(launcher_history_path: Path, launcher_state: dict) 
         "updated_at": current_timestamp(),
         "completed_jobs": [snapshot_job(job) for job in completed_jobs] if isinstance(completed_jobs, list) else [],
     }
-    with launcher_history_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(launcher_history_path, payload)
 
 
 def collect_result_summary(paths: dict) -> dict:

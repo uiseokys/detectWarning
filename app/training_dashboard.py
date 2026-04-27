@@ -43,6 +43,7 @@ from reporting import (
     STATE_SCHEMA_VERSION,
     analyze_class_balance,
     build_effective_pipeline_status,
+    build_file_signature,
     build_path_diagnostic,
     build_restored_launcher_summary,
     enrich_completed_job,
@@ -50,6 +51,7 @@ from reporting import (
     read_json,
     sort_jobs_by_recency,
     summarize_manifest,
+    write_json_atomic,
 )
 from training_config import resolve_pages_sync_config
 from training_dashboard_view import render_dashboard_live_fragments, render_dashboard_page
@@ -71,6 +73,24 @@ NOTICE_COOKIE_MAX_AGE_SECONDS = 30
 LIVE_URL_ENV_NAME = "DETECTWARNING_LIVE_URL"
 LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
 PUBLIC_VIEWER_HOST_SUFFIXES = (".trycloudflare.com", ".workers.dev")
+OVERVIEW_DATASET_MANIFEST_SPECS = (
+    ("raw", "raw_manifest"),
+    ("train", "split_train"),
+    ("val", "split_val"),
+    ("test", "split_test"),
+    ("prepared_train", "prepared_train"),
+    ("prepared_val", "prepared_val"),
+    ("prepared_test", "prepared_test"),
+)
+OVERVIEW_CURRENT_DATASET_MANIFEST_SPECS = (
+    ("raw", "current_raw_manifest"),
+    ("train", "current_split_train"),
+    ("val", "current_split_val"),
+    ("test", "current_split_test"),
+    ("prepared_train", "current_prepared_train"),
+    ("prepared_val", "current_prepared_val"),
+    ("prepared_test", "current_prepared_test"),
+)
 
 
 def wants_json_response(request: Request | None) -> bool:
@@ -299,13 +319,7 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         paths["current_prepared_test"],
         paths["workspace_dir"] / "launcher_history.json",
     ]
-    file_signature = []
-    for path in watched:
-        if not path.exists():
-            file_signature.append((str(path), None, None))
-            continue
-        stat = path.stat()
-        file_signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+    file_signature = [build_file_signature(path) for path in watched]
 
     current_job = launcher_status.get("current_job") or {}
     recent_completed_jobs = [
@@ -329,11 +343,7 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         if not candidate:
             continue
         path = Path(str(candidate))
-        if path.exists():
-            stat = path.stat()
-            dynamic_log_paths.append((str(path), stat.st_mtime_ns, stat.st_size))
-        else:
-            dynamic_log_paths.append((str(path), None, None))
+        dynamic_log_paths.append(build_file_signature(path))
     launcher_signature = (
         launcher_status.get("state"),
         tuple(
@@ -559,6 +569,17 @@ def format_duration(seconds: int | float | None) -> str:
     if minutes > 0:
         return f"{minutes}분 {secs}초"
     return f"{secs}초"
+
+
+def build_manifest_summary_group(paths: dict, manifest_specs: tuple[tuple[str, str], ...]) -> dict[str, dict]:
+    summary: dict[str, dict] = {}
+    for key, path_key in manifest_specs:
+        path = paths.get(path_key)
+        if isinstance(path, Path):
+            summary[key] = summarize_manifest(path, label_field="target_label")
+        else:
+            summary[key] = {"total": 0, "by_label": {}}
+    return summary
 
 
 def workspace_has_saved_state(workspace_dir: Path | None) -> bool:
@@ -947,8 +968,7 @@ def create_app(config_path: Path) -> FastAPI:
             runtime_shell["api_key_env"] = ""
 
         runtime_config_path = runtime_config_dir / f"{job['job_id']}.json"
-        with runtime_config_path.open("w", encoding="utf-8") as handle:
-            json.dump(runtime_config, handle, ensure_ascii=False, indent=2)
+        write_json_atomic(runtime_config_path, runtime_config)
 
         log_path = job_logs_dir / f"{job['job_id']}.log"
         startup_message = (
@@ -5485,7 +5505,7 @@ def create_app(config_path: Path) -> FastAPI:
         )
 
     @app.get("/api/live-fragments")
-    def live_fragments() -> JSONResponse:
+    def live_fragments(request: Request) -> JSONResponse:
         overview_payload = build_overview(
             paths,
             config_path,
@@ -5493,10 +5513,23 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_status=get_launcher_status(),
         )
         active = overview_has_live_activity(overview_payload)
+        overview_revision = overview_payload.get("overview_revision")
+        client_revision = str(request.query_params.get("revision") or "").strip()
+        if client_revision and overview_revision and client_revision == overview_revision:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "overview_revision": overview_revision,
+                    "active": active,
+                    "poll_interval_ms": 1200 if active else 8000,
+                    "fragments": {},
+                },
+                headers=NO_CACHE_HEADERS,
+            )
         return JSONResponse(
             {
                 "ok": True,
-                "overview_revision": overview_payload.get("overview_revision"),
+                "overview_revision": overview_revision,
                 "active": active,
                 "poll_interval_ms": 1200 if active else 8000,
                 "fragments": render_dashboard_live_fragments(overview_payload),
@@ -5825,27 +5858,11 @@ def build_overview(
     current_job_progress = build_current_job_progress(pipeline_status, training_progress, effective_launcher_status)
     eta = estimate_eta(current_job_progress, effective_launcher_status)
     dataset_summary = (
-        {
-            "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
-            "train": summarize_manifest(paths["split_train"], label_field="target_label"),
-            "val": summarize_manifest(paths["split_val"], label_field="target_label"),
-            "test": summarize_manifest(paths["split_test"], label_field="target_label"),
-            "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
-            "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
-            "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
-        }
+        build_manifest_summary_group(paths, OVERVIEW_DATASET_MANIFEST_SPECS)
         if not lite
         else {}
     )
-    current_dataset_summary = {
-        "raw": summarize_manifest(paths["current_raw_manifest"], label_field="target_label"),
-        "train": summarize_manifest(paths["current_split_train"], label_field="target_label"),
-        "val": summarize_manifest(paths["current_split_val"], label_field="target_label"),
-        "test": summarize_manifest(paths["current_split_test"], label_field="target_label"),
-        "prepared_train": summarize_manifest(paths["current_prepared_train"], label_field="target_label"),
-        "prepared_val": summarize_manifest(paths["current_prepared_val"], label_field="target_label"),
-        "prepared_test": summarize_manifest(paths["current_prepared_test"], label_field="target_label"),
-    }
+    current_dataset_summary = build_manifest_summary_group(paths, OVERVIEW_CURRENT_DATASET_MANIFEST_SPECS)
     if "train_distribution" not in training_progress and dataset_summary:
         training_progress["train_distribution"] = analyze_class_balance(
             target_labels,

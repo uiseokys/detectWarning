@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import inspect
+import uuid
 from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -15,7 +16,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from reporting import analyze_class_balance
+from reporting import analyze_class_balance, write_json_atomic
+
+
+DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE = "pin_memory_device" in inspect.signature(DataLoader).parameters
 
 
 @dataclass
@@ -482,7 +486,8 @@ def train_action_classifier(
             best_val_f1 = val_metrics["macro_f1"]
             best_epoch = epoch
             epochs_without_improvement = 0
-            torch.save(
+            _save_torch_checkpoint_atomic(
+                best_model_path,
                 {
                     "model_state_dict": base_model.state_dict(),
                     "labels": labels,
@@ -492,7 +497,6 @@ def train_action_classifier(
                     "num_layers": num_layers,
                     "dropout": dropout,
                 },
-                best_model_path,
             )
         else:
             epochs_without_improvement += 1
@@ -520,6 +524,7 @@ def train_action_classifier(
                     "compile_backend": compiled_backend,
                     "batch_size": resolved_batch_size,
                     "eval_batch_size": resolved_eval_batch_size,
+                    "dataset_cache_size": effective_cache_size,
                     "num_workers": resolved_num_workers,
                     "pin_memory": use_pin_memory,
                     "pin_memory_device": resolved_pin_memory_device,
@@ -548,8 +553,7 @@ def train_action_classifier(
             print(f"[train] early stopping triggered: {stop_reason}")
             break
 
-    with labels_path.open("w", encoding="utf-8") as handle:
-        json.dump({"labels": labels}, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(labels_path, {"labels": labels})
 
     if best_model_path.exists():
         best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=True)
@@ -566,42 +570,42 @@ def train_action_classifier(
         use_amp=use_amp,
         amp_dtype=resolved_amp_dtype,
     )
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "history": history,
-                "final_validation": final_metrics,
-                "labels": labels,
-                "best_epoch": best_epoch,
-                "resumed_from_checkpoint": resumed_from_checkpoint,
-                "resume_mode": resume_mode,
-                "amp_enabled": use_amp,
-                "amp_dtype": resolved_amp_dtype_label,
-                "compile_enabled": compiled_model,
-                "compile_backend": compiled_backend,
-                "batch_size": resolved_batch_size,
-                "eval_batch_size": resolved_eval_batch_size,
-                "num_workers": resolved_num_workers,
-                "pin_memory": use_pin_memory,
-                "pin_memory_device": resolved_pin_memory_device,
-                "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
-                "persistent_workers": use_persistent_workers,
-                "train_distribution": train_distribution,
-                "val_distribution": val_distribution,
-                "stopped_early": stopped_early,
-                "stop_reason": stop_reason,
-                "early_stopping": {
-                    "enabled": effective_patience > 0,
-                    "patience": effective_patience,
-                    "min_delta": effective_min_delta,
-                    "metric": "val_macro_f1",
-                    "epochs_without_improvement": epochs_without_improvement,
-                },
+    write_json_atomic(
+        metrics_path,
+        {
+            "history": history,
+            "final_validation": final_metrics,
+            "labels": labels,
+            "best_epoch": best_epoch,
+            "resumed_from_checkpoint": resumed_from_checkpoint,
+            "resume_mode": resume_mode,
+            "train_samples": train_sample_count,
+            "val_samples": val_sample_count,
+            "amp_enabled": use_amp,
+            "amp_dtype": resolved_amp_dtype_label,
+            "compile_enabled": compiled_model,
+            "compile_backend": compiled_backend,
+            "batch_size": resolved_batch_size,
+            "eval_batch_size": resolved_eval_batch_size,
+            "dataset_cache_size": effective_cache_size,
+            "num_workers": resolved_num_workers,
+            "pin_memory": use_pin_memory,
+            "pin_memory_device": resolved_pin_memory_device,
+            "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
+            "persistent_workers": use_persistent_workers,
+            "train_distribution": train_distribution,
+            "val_distribution": val_distribution,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
+            "early_stopping": {
+                "enabled": effective_patience > 0,
+                "patience": effective_patience,
+                "min_delta": effective_min_delta,
+                "metric": "val_macro_f1",
+                "epochs_without_improvement": epochs_without_improvement,
             },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
+        },
+    )
 
     if progress_path is not None:
         _write_progress(
@@ -627,6 +631,7 @@ def train_action_classifier(
                 "compile_backend": compiled_backend,
                 "batch_size": resolved_batch_size,
                 "eval_batch_size": resolved_eval_batch_size,
+                "dataset_cache_size": effective_cache_size,
                 "num_workers": resolved_num_workers,
                 "pin_memory": use_pin_memory,
                 "pin_memory_device": resolved_pin_memory_device,
@@ -836,7 +841,7 @@ def _build_dataloader(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
-    if pin_memory and pin_memory_device and "pin_memory_device" in inspect.signature(DataLoader).parameters:
+    if pin_memory and pin_memory_device and DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE:
         kwargs["pin_memory_device"] = pin_memory_device
     if num_workers > 0:
         kwargs["prefetch_factor"] = prefetch_factor
@@ -979,10 +984,22 @@ def _autocast_context(*, device: str, enabled: bool, amp_dtype: torch.dtype | No
 
 
 def _write_progress(progress_path: Path, payload: dict) -> None:
-    progress_path.parent.mkdir(parents=True, exist_ok=True)
     content = {
         **payload,
         "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
     }
-    with progress_path.open("w", encoding="utf-8") as handle:
-        json.dump(content, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(progress_path, content)
+
+
+def _save_torch_checkpoint_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        torch.save(payload, temp_path)
+        temp_path.replace(path)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass

@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 import zipfile
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -24,6 +25,7 @@ import requests
 from action_model import train_action_classifier
 from detector import FaceDetector, PersonDetector
 from pipeline_prepare import extract_pose_sequence_from_payload, load_video_sequence_payload
+from reporting import write_json_atomic
 from training_config import load_action_training_config
 
 
@@ -322,8 +324,7 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
         "total_duration_seconds": extra.pop("total_duration_seconds", existing.get("total_duration_seconds")),
         **extra,
     }
-    with paths["pipeline_status"].open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(paths["pipeline_status"], payload)
     print(format_pipeline_status_log(payload))
 
 
@@ -413,8 +414,7 @@ def read_json_file(path: Path) -> dict | None:
 
 def write_skip_reports(paths: dict, report: dict) -> None:
     report["updated_at"] = datetime.now(timezone.utc).astimezone().isoformat()
-    with paths["current_skip_report"].open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(paths["current_skip_report"], report)
 
     cumulative = read_json_file(paths["cumulative_skip_report"]) or create_skip_report()
     cumulative_issues = cumulative.setdefault("issues", [])
@@ -435,8 +435,7 @@ def write_skip_reports(paths: dict, report: dict) -> None:
         "broken_count": sum(1 for issue in cumulative_issues if issue.get("category") == "broken"),
         "skipped_count": sum(1 for issue in cumulative_issues if issue.get("category") != "broken"),
     }
-    with paths["cumulative_skip_report"].open("w", encoding="utf-8") as handle:
-        json.dump(cumulative, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(paths["cumulative_skip_report"], cumulative)
 
 
 def format_pipeline_status_log(payload: dict) -> str:
@@ -685,54 +684,43 @@ def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
     items = fetch_api_items(session, api_config)
     downloaded: list[DownloadedItem] = []
 
-    with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
-        for item in items:
-            source_label = str(extract_field(item, api_config["fields"]["label"])).strip()
-            target_label = label_mapping.get(source_label)
-            if not target_label:
-                continue
+    for item in items:
+        source_label = str(extract_field(item, api_config["fields"]["label"])).strip()
+        target_label = label_mapping.get(source_label)
+        if not target_label:
+            continue
 
-            if max_items_per_class > 0 and per_class_counts[target_label] >= max_items_per_class:
-                continue
+        if max_items_per_class > 0 and per_class_counts[target_label] >= max_items_per_class:
+            continue
 
-            download_url = build_download_url(item, api_config)
-            if not download_url:
-                continue
+        download_url = build_download_url(item, api_config)
+        if not download_url:
+            continue
 
-            item_id = str(extract_field(item, api_config["fields"]["id"]))
-            filename = build_filename(item, api_config, download_url, item_id)
-            safe_target_label = slugify(target_label)
-            target_dir = paths["raw_dir"] / safe_target_label
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / filename
+        item_id = str(extract_field(item, api_config["fields"]["id"]))
+        filename = build_filename(item, api_config, download_url, item_id)
+        safe_target_label = slugify(target_label)
+        target_dir = paths["raw_dir"] / safe_target_label
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / filename
 
-            download_to_file(session, download_url, target_path, timeout=float(api_config.get("timeout_seconds", 60.0)))
+        download_to_file(session, download_url, target_path, timeout=float(api_config.get("timeout_seconds", 60.0)))
 
-            downloaded_item = DownloadedItem(
-                item_id=item_id,
-                source_label=source_label,
-                target_label=target_label,
-                video_path=target_path.resolve(),
-                download_url=download_url,
-                metadata=item,
-            )
-            downloaded.append(downloaded_item)
-            per_class_counts[target_label] += 1
+        downloaded_item = DownloadedItem(
+            item_id=item_id,
+            source_label=source_label,
+            target_label=target_label,
+            video_path=target_path.resolve(),
+            download_url=download_url,
+            metadata=item,
+        )
+        downloaded.append(downloaded_item)
+        per_class_counts[target_label] += 1
 
-            manifest_handle.write(
-                json.dumps(
-                    {
-                        "item_id": downloaded_item.item_id,
-                        "source_label": downloaded_item.source_label,
-                        "target_label": downloaded_item.target_label,
-                        "video_path": str(downloaded_item.video_path),
-                        "download_url": downloaded_item.download_url,
-                        "metadata": downloaded_item.metadata,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+    if not downloaded:
+        raise RuntimeError("다운로드된 학습 가능 영상이 없습니다. label_mapping과 API 응답 필드를 확인해 주세요.")
+
+    write_downloaded_items_manifest(raw_manifest_path, downloaded)
 
     print(f"[download] saved {len(downloaded)} items -> {raw_manifest_path}")
     return downloaded
@@ -827,22 +815,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
             "4. label_mapping의 한글 라벨명이 압축 해제 폴더명과 일치하는지"
         )
 
-    with raw_manifest_path.open("w", encoding="utf-8") as manifest_handle:
-        for item in downloaded:
-            manifest_handle.write(
-                json.dumps(
-                    {
-                        "item_id": item.item_id,
-                        "source_label": item.source_label,
-                        "target_label": item.target_label,
-                        "video_path": str(item.video_path),
-                        "download_url": item.download_url,
-                        "metadata": item.metadata,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+    write_downloaded_items_manifest(raw_manifest_path, downloaded)
 
     print(f"[download] aihubshell imported {len(downloaded)} videos -> {raw_manifest_path}")
     return downloaded
@@ -1061,16 +1034,41 @@ def normalize_match_text(text: str) -> str:
     return re.sub(r"[^a-z0-9가-힣]+", "", str(text or "").lower())
 
 
-def match_source_label_text(text: str, source_labels) -> str:
-    raw_text = str(text or "")
-    raw_text_lower = raw_text.lower()
-    normalized_text = normalize_match_text(raw_text_lower)
+def build_source_label_matchers(source_labels) -> list[tuple[str, str, str]]:
+    matchers: list[tuple[str, str, str]] = []
     for source_label in source_labels or []:
         source_text = str(source_label).strip()
         if not source_text:
             continue
         source_text_lower = source_text.lower()
-        normalized_source = normalize_match_text(source_text_lower)
+        matchers.append((source_text, source_text_lower, normalize_match_text(source_text_lower)))
+    return matchers
+
+
+def build_label_mapping_matchers(label_mapping: dict) -> list[tuple[str, str, str, str]]:
+    matchers: list[tuple[str, str, str, str]] = []
+    for source_label, target_label in label_mapping.items():
+        source_text = str(source_label).strip()
+        if not source_text:
+            continue
+        source_text_lower = source_text.lower()
+        matchers.append(
+            (
+                source_text,
+                str(target_label),
+                source_text_lower,
+                normalize_match_text(source_text_lower),
+            )
+        )
+    return matchers
+
+
+def match_source_label_text(text: str, source_labels=None, *, matchers=None) -> str:
+    raw_text = str(text or "")
+    raw_text_lower = raw_text.lower()
+    normalized_text = normalize_match_text(raw_text_lower)
+    active_matchers = matchers if matchers is not None else build_source_label_matchers(source_labels or [])
+    for source_text, source_text_lower, normalized_source in active_matchers:
         if (
             source_text in raw_text
             or source_text_lower in raw_text_lower
@@ -1291,6 +1289,8 @@ def scan_local_video_dataset(
     raw_dir = paths["raw_dir"]
     label_mapping = dataset_config.get("label_mapping", {})
     excluded_source_labels = dataset_config.get("excluded_source_labels", [])
+    label_matchers = build_label_mapping_matchers(label_mapping)
+    excluded_matchers = build_source_label_matchers(excluded_source_labels)
     extensions = tuple(
         ext.lower()
         for ext in dataset_config.get("video_extensions", [".mp4", ".avi", ".mov", ".mkv", ".wmv"])
@@ -1306,9 +1306,13 @@ def scan_local_video_dataset(
             continue
         candidate_video_count += 1
 
-        source_label, target_label = infer_label_from_path(video_path, label_mapping)
+        source_label, target_label = infer_label_from_path(
+            video_path,
+            label_mapping,
+            label_matchers=label_matchers,
+        )
         if not target_label:
-            excluded_label = match_source_label_text(str(video_path), excluded_source_labels)
+            excluded_label = match_source_label_text(str(video_path), matchers=excluded_matchers)
             if excluded_label:
                 excluded_video_count += 1
                 if len(excluded_examples) < 12:
@@ -1406,7 +1410,24 @@ def extract_archives(import_dir: Path, extracted_dir: Path, *, zip_files: list[P
     return extracted_dir if extracted_any else import_dir
 
 
+def downloaded_item_to_manifest_entry(item: DownloadedItem) -> dict:
+    return {
+        "item_id": item.item_id,
+        "source_label": item.source_label,
+        "target_label": item.target_label,
+        "video_path": str(item.video_path),
+        "download_url": item.download_url,
+        "metadata": item.metadata,
+    }
+
+
+def write_downloaded_items_manifest(path: Path, items: list[DownloadedItem]) -> None:
+    write_jsonl_entries(path, [downloaded_item_to_manifest_entry(item) for item in items])
+
+
 def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -> dict[str, Path]:
+    if not downloaded:
+        raise RuntimeError("split을 만들 학습 영상이 없습니다. download 단계의 라벨 매핑과 원본 데이터를 확인해 주세요.")
     split_config = config.get("split", {})
     train_ratio = float(split_config.get("train_ratio", 0.7))
     val_ratio = float(split_config.get("val_ratio", 0.15))
@@ -1429,36 +1450,24 @@ def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -
         split_items["val"].extend(items[train_end:val_end])
         split_items["test"].extend(items[val_end:])
 
+    if not split_items["val"] and len(split_items["train"]) > 1:
+        moved = split_items["train"].pop()
+        split_items["val"].append(moved)
+        print("[split] validation 샘플이 없어 train에서 1개를 val로 이동했습니다.")
+
+    if not split_items["train"] or not split_items["val"]:
+        raise RuntimeError(
+            "학습/검증 split을 만들 샘플이 부족합니다. 최소 2개 이상의 학습 가능 영상을 준비해 주세요."
+        )
+
     split_paths = {
         "train": paths["current_split_train"],
         "val": paths["current_split_val"],
         "test": paths["current_split_test"],
     }
     for split_name, target_path in split_paths.items():
-        with target_path.open("w", encoding="utf-8") as handle:
-            for item in split_items[split_name]:
-                handle.write(
-                    json.dumps(
-                        {
-                            "item_id": item.item_id,
-                            "source_label": item.source_label,
-                            "target_label": item.target_label,
-                            "video_path": str(item.video_path),
-                            "download_url": item.download_url,
-                            "metadata": item.metadata,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+        write_downloaded_items_manifest(target_path, split_items[split_name])
         print(f"[split] {split_name}: {len(split_items[split_name])} -> {target_path}")
-
-    if not split_items["val"] and split_items["train"]:
-        moved = split_items["train"].pop()
-        split_items["val"].append(moved)
-        _rewrite_split_manifest(split_paths["train"], split_items["train"])
-        _rewrite_split_manifest(split_paths["val"], split_items["val"])
-        print("[split] validation 샘플이 없어 train에서 1개를 val로 이동했습니다.")
 
     return split_paths
 
@@ -1475,25 +1484,6 @@ def load_existing_current_split_manifests(paths: dict) -> dict[str, Path]:
     return split_paths
 
 
-def _rewrite_split_manifest(path: Path, items: list[DownloadedItem]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for item in items:
-            handle.write(
-                json.dumps(
-                    {
-                        "item_id": item.item_id,
-                        "source_label": item.source_label,
-                        "target_label": item.target_label,
-                        "video_path": str(item.video_path),
-                        "download_url": item.download_url,
-                        "metadata": item.metadata,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
-
 def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, Path]) -> dict[str, Path]:
     preprocess_config = config.get("preprocess", {})
     device = str(preprocess_config.get("device", "cuda:0"))
@@ -1508,6 +1498,9 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
 
     target_labels = get_target_labels(config)
     label_to_idx = {label: index for index, label in enumerate(target_labels)}
+    sequence_length = max(int(preprocess_config.get("sequence_length", 48)), 1)
+    max_frames_to_scan = max(int(preprocess_config.get("max_frames_to_scan", 160)), sequence_length)
+    detector_batch_size = max(int(preprocess_config.get("detector_batch_size", 8)), 1)
     min_frames_with_person = int(preprocess_config.get("min_frames_with_person", 4))
 
     prepared_paths = {
@@ -1520,17 +1513,14 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     overall_total = 0
     skip_report = create_skip_report()
     for split_name, manifest_path in split_manifests.items():
-        rows: list[dict] = []
-        with manifest_path.open("r", encoding="utf-8") as source_handle:
-            for line in source_handle:
-                line = line.strip()
-                if not line:
-                    continue
-                rows.append(json.loads(line))
+        rows = read_jsonl_entries(manifest_path)
         manifest_rows[split_name] = rows
         overall_total += len(rows)
+    if overall_total <= 0:
+        raise RuntimeError("prepare할 split manifest 항목이 없습니다. download/split 단계를 먼저 확인해 주세요.")
 
     processed_total = 0
+    kept_by_split: dict[str, int] = {}
 
     for split_name, manifest_path in split_manifests.items():
         target_manifest_path = prepared_paths[split_name]
@@ -1548,8 +1538,8 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
             return payload_executor.submit(
                 load_video_sequence_payload,
                 video_path=Path(sample_row["video_path"]),
-                sequence_length=int(preprocess_config.get("sequence_length", 48)),
-                max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                sequence_length=sequence_length,
+                max_frames_to_scan=max_frames_to_scan,
             )
 
         if payload_executor is not None:
@@ -1610,15 +1600,15 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         else:
                             payload = load_video_sequence_payload(
                                 video_path=video_path,
-                                sequence_length=int(preprocess_config.get("sequence_length", 48)),
-                                max_frames_to_scan=int(preprocess_config.get("max_frames_to_scan", 160)),
+                                sequence_length=sequence_length,
+                                max_frames_to_scan=max_frames_to_scan,
                             )
 
                         sequence = extract_pose_sequence_from_payload(
                             payload=payload,
                             person_detector=person_detector,
                             face_detector=face_detector,
-                            detector_batch_size=int(preprocess_config.get("detector_batch_size", 8)),
+                            detector_batch_size=detector_batch_size,
                         )
                     except Exception as exc:
                         skipped += 1
@@ -1691,6 +1681,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                 skipped_videos=skip_report.get("summary", {}).get("skipped_count", 0),
             )
         print(f"[prepare] {split_name}: {kept} samples ({skipped} skipped) -> {target_manifest_path}")
+        kept_by_split[split_name] = kept
 
     write_skip_reports(paths, skip_report)
     summary = skip_report.get("summary", {})
@@ -1699,6 +1690,11 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         f"broken={summary.get('broken_count', 0)}, "
         f"skipped={summary.get('skipped_count', 0)}"
     )
+
+    if kept_by_split.get("train", 0) <= 0 or kept_by_split.get("val", 0) <= 0:
+        raise RuntimeError(
+            "전처리 후 학습/검증 샘플이 부족합니다. min_frames_with_person, 라벨 매핑, 원본 영상을 확인해 주세요."
+        )
 
     return prepared_paths
 
@@ -1793,21 +1789,18 @@ def update_cumulative_manifests(
         extra_fields=job_meta,
     )
 
-    with paths["continual_state"].open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "updated_at": job_meta["job_added_at"],
-                "datasetkey": job_meta["job_datasetkey"],
-                "filekeys": job_meta["job_filekey"],
-                "raw_total": count_manifest_lines(paths["raw_manifest"]),
-                "prepared_train_total": count_manifest_lines(paths["prepared_train"]),
-                "prepared_val_total": count_manifest_lines(paths["prepared_val"]),
-                "prepared_test_total": count_manifest_lines(paths["prepared_test"]),
-            },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
+    write_json_atomic(
+        paths["continual_state"],
+        {
+            "updated_at": job_meta["job_added_at"],
+            "datasetkey": job_meta["job_datasetkey"],
+            "filekeys": job_meta["job_filekey"],
+            "raw_total": count_manifest_lines(paths["raw_manifest"]),
+            "prepared_train_total": count_manifest_lines(paths["prepared_train"]),
+            "prepared_val_total": count_manifest_lines(paths["prepared_val"]),
+            "prepared_test_total": count_manifest_lines(paths["prepared_test"]),
+        },
+    )
 
     print(
         "[continual] cumulative prepared samples "
@@ -1907,12 +1900,21 @@ def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: d
 def iter_jsonl_entries(path: Path):
     if not path.exists():
         return
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"[manifest] malformed JSONL skipped: {path}:{line_number}")
+                    continue
+                if isinstance(payload, dict):
+                    yield payload
+    except OSError as exc:
+        print(f"[manifest] manifest read skipped: {path} ({exc})")
 
 
 def read_jsonl_entries(path: Path) -> list[dict]:
@@ -1921,9 +1923,18 @@ def read_jsonl_entries(path: Path) -> list[dict]:
 
 def write_jsonl_entries(path: Path, entries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for entry in entries:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        temp_path.replace(path)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def append_jsonl_entries(path: Path, entries: list[dict]) -> None:
@@ -1956,8 +1967,11 @@ def build_manifest_unique_key(entry: dict) -> str:
 def count_manifest_lines(path: Path) -> int:
     if not path.exists():
         return 0
-    with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
 
 
 def build_active_manifest_state(
@@ -1989,7 +2003,13 @@ def build_manifest_signature(path: Path) -> dict:
             "path": str(path),
             "exists": False,
         }
-    stat = path.stat()
+    try:
+        stat = path.stat()
+    except OSError:
+        return {
+            "path": str(path),
+            "exists": False,
+        }
     return {
         "path": str(path),
         "exists": True,
@@ -2015,17 +2035,13 @@ def active_manifests_are_current(*, state_path: Path, active_paths: dict[str, Pa
 
 
 def write_active_manifest_state(state_path: Path, desired_state: dict) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                **desired_state,
-                "materialized_at": datetime.now(timezone.utc).astimezone().isoformat(),
-            },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
+    write_json_atomic(
+        state_path,
+        {
+            **desired_state,
+            "materialized_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        },
+    )
 
 
 def cleanup_transient_job_data(paths: dict) -> None:
@@ -2232,12 +2248,23 @@ def resolve_aihub_api_key(shell_config: dict) -> str:
     )
 
 
-def infer_label_from_path(video_path: Path, label_mapping: dict) -> tuple[str, str | None]:
+def infer_label_from_path(
+    video_path: Path,
+    label_mapping: dict,
+    *,
+    label_matchers: list[tuple[str, str, str, str]] | None = None,
+) -> tuple[str, str | None]:
     relative_text = str(video_path).replace("\\", "/")
-    for source_label, target_label in label_mapping.items():
-        matched_source = match_source_label_text(relative_text, [source_label])
-        if matched_source:
-            return matched_source, str(target_label)
+    active_matchers = label_matchers if label_matchers is not None else build_label_mapping_matchers(label_mapping)
+    raw_text_lower = relative_text.lower()
+    normalized_text = normalize_match_text(raw_text_lower)
+    for source_text, target_label, source_text_lower, normalized_source in active_matchers:
+        if (
+            source_text in relative_text
+            or source_text_lower in raw_text_lower
+            or (normalized_source and normalized_source in normalized_text)
+        ):
+            return source_text, target_label
     return "", None
 
 

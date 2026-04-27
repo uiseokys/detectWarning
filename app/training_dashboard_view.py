@@ -426,9 +426,12 @@ def _render_system_panel(
     gpu: dict,
     progress: dict,
     queue_progress: dict,
+    *,
+    element_id: str | None = None,
 ) -> str:
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
     return (
-        "<section class=\"panel sidebar-panel\">"
+        f"<section{id_attr} class=\"panel sidebar-panel\">"
         "<div class=\"panel-head\"><div><h2>시스템 요약</h2><p>경로, 장치, 아티팩트 상태를 한 눈에 봅니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
         "<div class=\"key-metric-grid\">"
@@ -449,6 +452,125 @@ def _render_system_panel(
         "</div>"
         "</section>"
     )
+
+
+def _render_main_live_sections(
+    *,
+    summary_cards: str,
+    performance_chart_html: str,
+    loss_chart_html: str,
+    distribution_chart_html: str,
+    progress: dict,
+    latest: dict,
+    raw_total: int,
+    prepared_total: int,
+    train_distribution: dict,
+    val_distribution: dict,
+    skip_report: dict,
+    cumulative_skip_report: dict,
+    dataset_rows: list[dict[str, str]],
+    current_dataset_rows: list[dict[str, str]],
+    history_rows: list[dict[str, str]],
+    per_class_rows: list[dict[str, str]],
+    confusion_matrix_html: str,
+    recent_job_rows: list[dict[str, str]],
+    issue_rows: list[dict[str, str]],
+    element_id: str | None = None,
+) -> str:
+    id_attr = f" id=\"{_text(element_id, '')}\"" if element_id else ""
+    return f"""
+        <div{id_attr}>
+          <section class="summary-grid" id="summary-grid">
+            {summary_cards}
+          </section>
+
+          <section class="chart-grid" id="training-charts">
+            {performance_chart_html}
+            {loss_chart_html}
+            {distribution_chart_html}
+          </section>
+
+          <section class="panel" id="training">
+            <div class="panel-head"><div><h2>학습 개요</h2><p>지금 확인해야 할 핵심 학습 정보를 먼저 모았습니다.</p></div></div>
+            <div class="panel-body">
+              <div class="content-row">
+                <div class="mini-panel">
+                  <h3>학습 상태</h3>
+                  <div class="key-metric-grid">
+                    <div><span>epochs</span><strong>{_int_text(progress.get('epochs_completed'))} / {_int_text(progress.get('epochs_total'))}</strong></div>
+                    <div><span>최고 epoch</span><strong>{_text(progress.get('best_epoch'))}</strong></div>
+                    <div><span>최고 macro F1</span><strong>{_float_text(progress.get('best_val_macro_f1'))}</strong></div>
+                    <div><span>최근 epoch</span><strong>{_text(latest.get('epoch'))}</strong></div>
+                    <div><span>최근 정확도</span><strong>{_float_text(latest.get('val_accuracy'))}</strong></div>
+                    <div><span>최근 F1</span><strong>{_float_text(latest.get('val_macro_f1'))}</strong></div>
+                  </div>
+                </div>
+                <div class="mini-panel">
+                  <h3>데이터 / 분포</h3>
+                  <div class="key-metric-grid">
+                    <div><span>원본 / 전처리</span><strong>{raw_total} / {prepared_total}</strong></div>
+                    <div><span>학습 / 검증 샘플</span><strong>{_int_text(progress.get('train_samples'))} / {_int_text(progress.get('val_samples'))}</strong></div>
+                    <div><span>학습 분포</span><strong>{_text(train_distribution.get('severity'))}</strong></div>
+                    <div><span>검증 분포</span><strong>{_text(val_distribution.get('severity'))}</strong></div>
+                    <div><span>현재 스킵</span><strong>{_int_text((skip_report.get('summary') or {}).get('total_issues'))}</strong></div>
+                    <div><span>누적 스킵</span><strong>{_int_text((cumulative_skip_report.get('summary') or {}).get('total_issues'))}</strong></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="content-row" id="dataset">
+            <article class="panel">
+              <div class="panel-head"><div><h2>누적 데이터셋</h2><p>cumulative manifests 기준입니다.</p></div></div>
+              <div class="panel-body">
+                {_render_table(["split", "total", "labels"], dataset_rows, "누적 데이터셋이 없습니다.")}
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><h2>현재 작업 데이터셋</h2><p>current manifests 기준입니다.</p></div></div>
+              <div class="panel-body">
+                {_render_table(["split", "total", "labels"], current_dataset_rows, "현재 작업 데이터셋이 없습니다.")}
+              </div>
+            </article>
+          </section>
+
+          <section class="panel" id="epoch-history">
+            <div class="panel-head"><div><h2>에폭 기록</h2><p>최근 20개 epoch를 빠르게 훑을 수 있게 정리했습니다.</p></div></div>
+            <div class="panel-body">
+              {_render_table(["epoch", "train_loss", "val_loss", "val_accuracy", "val_macro_f1", "learning_rate"], history_rows, "학습 history가 없습니다.")}
+            </div>
+          </section>
+
+          <section class="content-row" id="validation">
+            <article class="panel panel-span-full">
+              <div class="panel-head"><div><h2>클래스별 지표</h2><p>최종 검증 결과를 클래스별로 바로 읽을 수 있게 정리했습니다.</p></div></div>
+              <div class="panel-body">
+                {_render_table(["label", "precision", "recall", "f1", "support"], per_class_rows, "클래스별 지표가 없습니다.")}
+              </div>
+            </article>
+          </section>
+
+          <section class="chart-grid" id="validation-matrix">
+            {confusion_matrix_html}
+          </section>
+
+          <section class="content-row" id="jobs">
+            <article class="panel">
+              <div class="panel-head"><div><h2>최근 작업 이력</h2><p>최근 완료 또는 중단된 작업을 위에서부터 보여줍니다.</p></div></div>
+              <div class="panel-body">
+                {_render_table(["filekey", "datasetkey", "state", "prepared", "finished", "message"], recent_job_rows, "최근 작업 이력이 없습니다.")}
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><h2>현재 스킵 이슈</h2><p>이번 작업에서 건너뛴 항목만 따로 모아 보여줍니다.</p></div></div>
+              <div class="panel-body">
+                {_render_table(["split", "video", "reason", "valid_frames", "confirmed_frames"], issue_rows, "표시할 현재 스킵 이슈가 없습니다.")}
+              </div>
+            </article>
+          </section>
+        </div>
+    """
 
 
 def _render_logs(logs: dict) -> str:
@@ -501,6 +623,7 @@ def _render_live_refresh_script() -> str:
   var delayMs = 1200;
   var disposed = false;
   var noticeTimer = null;
+  var lastOverviewRevision = document.documentElement.getAttribute('data-overview-revision') || null;
 
   function safeStorage() {
     try {
@@ -686,17 +809,41 @@ def _render_live_refresh_script() -> str:
     }
     inflight = true;
     try {
-      var response = await fetch('/api/live-fragments', { cache: 'no-store' });
+      var url = '/api/live-fragments';
+      if (lastOverviewRevision) {
+        url += '?revision=' + encodeURIComponent(lastOverviewRevision);
+      }
+      var response = await fetch(url, { cache: 'no-store' });
       if (!response.ok) {
         throw new Error('status ' + response.status);
       }
       var payload = await response.json();
       if (payload && payload.fragments) {
+        var nextRevision = payload.overview_revision || null;
+        if (nextRevision && lastOverviewRevision && nextRevision === lastOverviewRevision) {
+          if (payload && payload.poll_interval_ms) {
+            delayMs = payload.poll_interval_ms;
+          } else if (payload && payload.active === false) {
+            delayMs = 8000;
+          } else {
+            delayMs = 1200;
+          }
+          return;
+        }
         replaceRegion('hero-kpis', payload.fragments.hero_kpis);
         replaceRegion('hero-status-card', payload.fragments.hero_status);
-        replaceRegion('summary-grid', payload.fragments.summary_cards);
+        if (payload.fragments.main_live_sections) {
+          replaceRegion('main-live-sections', payload.fragments.main_live_sections);
+        } else {
+          replaceRegion('summary-grid', payload.fragments.summary_cards);
+        }
         replaceRegion('queue-panel', payload.fragments.queue_panel);
+        replaceRegion('system-panel', payload.fragments.system_panel);
         replaceLogRegion('logs-stack', payload.fragments.logs);
+        if (nextRevision) {
+          document.documentElement.setAttribute('data-overview-revision', nextRevision);
+        }
+        lastOverviewRevision = nextRevision;
       }
       if (payload && payload.poll_interval_ms) {
         delayMs = payload.poll_interval_ms;
@@ -2348,15 +2495,22 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     overview = overview or {}
     pipeline = overview.get("pipeline_status") or {}
     progress = overview.get("training_progress") or {}
+    metrics = overview.get("metrics") or {}
     launcher = overview.get("launcher") or {}
     queue_progress = overview.get("queue_progress") or {}
     current_job_progress = overview.get("current_job_progress") or {}
     eta = overview.get("eta") or {}
     gpu = overview.get("gpu") or {}
     dataset = overview.get("dataset") or {}
+    current_dataset = overview.get("current_dataset") or {}
     logs = overview.get("logs") or {}
     continual_state = overview.get("continual_state") or {}
+    artifacts = overview.get("artifacts") or {}
     skip_report = overview.get("skip_report") or {}
+    cumulative_skip_report = overview.get("cumulative_skip_report") or {}
+    labels = progress.get("labels") or metrics.get("labels") or []
+    final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
+    completed_jobs = launcher.get("completed_jobs") or []
 
     raw_total = int(((dataset.get("raw") or {}).get("total") or 0))
     prepared_total = sum(
@@ -2366,6 +2520,51 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     updated_at = progress.get("updated_at") or pipeline.get("updated_at") or "-"
     latest = progress.get("latest") or {}
     latest_loss = _float_text(latest.get("val_loss"))
+    dataset_rows = _build_dataset_rows(dataset)
+    current_dataset_rows = _build_dataset_rows(current_dataset)
+    history_bundle = _build_history_bundle(progress, metrics)
+    history_rows = history_bundle["rows"]
+    confusion = final_validation.get("confusion_matrix") or []
+    support_map = _build_support_map(confusion if isinstance(confusion, list) else None)
+    per_class_rows = _build_per_class_rows(final_validation, labels, support_map)
+    confusion_matrix_html = _render_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
+    recent_job_rows = _build_recent_job_rows(completed_jobs)
+    issue_rows = _build_issue_rows(skip_report.get("issues") or [])
+    train_distribution = progress.get("train_distribution") or metrics.get("train_distribution") or {}
+    val_distribution = progress.get("val_distribution") or metrics.get("val_distribution") or {}
+    epoch_labels = history_bundle["epoch_labels"]
+    val_accuracy_values = history_bundle["val_accuracy_values"]
+    val_f1_values = history_bundle["val_f1_values"]
+    train_loss_values = history_bundle["train_loss_values"]
+    val_loss_values = history_bundle["val_loss_values"]
+    distribution_entries = _build_distribution_entries(dataset, labels)
+    performance_chart_html = _render_line_chart(
+        "성능 추이",
+        "epoch별 검증 정확도와 macro F1을 바로 비교할 수 있습니다.",
+        epoch_labels,
+        [
+            ("검증 정확도", "#2563eb", val_accuracy_values),
+            ("검증 macro F1", "#059669", val_f1_values),
+        ],
+        fixed_min=0.0,
+        fixed_max=1.0,
+        decimals=3,
+    )
+    loss_chart_html = _render_line_chart(
+        "손실 추이",
+        "train / validation loss 변화를 함께 보면서 과적합 여부를 판단할 수 있습니다.",
+        epoch_labels,
+        [
+            ("학습 손실", "#2563eb", train_loss_values),
+            ("검증 손실", "#f97316", val_loss_values),
+        ],
+        decimals=4,
+    )
+    distribution_chart_html = _render_distribution_chart(
+        "학습 데이터 분포",
+        "전처리된 학습 세트 기준 클래스별 샘플 수입니다.",
+        distribution_entries,
+    )
     summary_cards = _build_summary_card_items(
         overview=overview,
         pipeline=pipeline,
@@ -2395,6 +2594,37 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
             element_id="hero-status-card",
         ),
         "summary_cards": _render_summary_grid(summary_cards, element_id="summary-grid"),
+        "system_panel": _render_system_panel(
+            overview,
+            overview.get("config_path") or "",
+            artifacts,
+            gpu,
+            progress,
+            queue_progress,
+            element_id="system-panel",
+        ),
+        "main_live_sections": _render_main_live_sections(
+            summary_cards=_render_summary_cards(summary_cards),
+            performance_chart_html=performance_chart_html,
+            loss_chart_html=loss_chart_html,
+            distribution_chart_html=distribution_chart_html,
+            progress=progress,
+            latest=latest,
+            raw_total=raw_total,
+            prepared_total=prepared_total,
+            train_distribution=train_distribution,
+            val_distribution=val_distribution,
+            skip_report=skip_report,
+            cumulative_skip_report=cumulative_skip_report,
+            dataset_rows=dataset_rows,
+            current_dataset_rows=current_dataset_rows,
+            history_rows=history_rows,
+            per_class_rows=per_class_rows,
+            confusion_matrix_html=confusion_matrix_html,
+            recent_job_rows=recent_job_rows,
+            issue_rows=issue_rows,
+            element_id="main-live-sections",
+        ),
         "queue_panel": _render_queue_panel(
             launcher,
             current_job_progress,
@@ -2538,9 +2768,31 @@ def render_dashboard_page(
         "전처리된 학습 세트 기준 클래스별 샘플 수입니다.",
         distribution_entries,
     )
+    main_live_sections_html = _render_main_live_sections(
+        summary_cards=summary_cards,
+        performance_chart_html=performance_chart_html,
+        loss_chart_html=loss_chart_html,
+        distribution_chart_html=distribution_chart_html,
+        progress=progress,
+        latest=latest,
+        raw_total=raw_total,
+        prepared_total=prepared_total,
+        train_distribution=train_distribution,
+        val_distribution=val_distribution,
+        skip_report=skip_report,
+        cumulative_skip_report=cumulative_skip_report,
+        dataset_rows=dataset_rows,
+        current_dataset_rows=current_dataset_rows,
+        history_rows=history_rows,
+        per_class_rows=per_class_rows,
+        confusion_matrix_html=confusion_matrix_html,
+        recent_job_rows=recent_job_rows,
+        issue_rows=issue_rows,
+        element_id="main-live-sections",
+    )
 
     return f"""<!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-overview-revision="{_text(overview.get('overview_revision'), '')}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2579,109 +2831,21 @@ def render_dashboard_page(
     <div id="action-notice-region"></div>
     {banners_html}
 
-    {_render_section_nav()}
+      {_render_section_nav()}
 
-    <div class="layout">
-      <aside class="sidebar">
-        {_render_actions_panel(default_datasetkey, controls_enabled, controls_notice)}
-        {_render_queue_panel(launcher, current_job_progress, queue_progress, element_id="queue-panel")}
-        {_render_system_panel(overview, config_path, artifacts, gpu, progress, queue_progress)}
-      </aside>
+      <div class="layout">
+        <aside class="sidebar">
+          {_render_actions_panel(default_datasetkey, controls_enabled, controls_notice)}
+          {_render_queue_panel(launcher, current_job_progress, queue_progress, element_id="queue-panel")}
+          {_render_system_panel(overview, config_path, artifacts, gpu, progress, queue_progress, element_id="system-panel")}
+        </aside>
 
-      <main class="content">
-        <section class="summary-grid" id="summary-grid">
-          {summary_cards}
-        </section>
+        <main class="content">
+          {main_live_sections_html}
 
-        <section class="chart-grid">
-          {performance_chart_html}
-          {loss_chart_html}
-          {distribution_chart_html}
-        </section>
-
-        <section class="panel" id="training">
-          <div class="panel-head"><div><h2>학습 개요</h2><p>지금 확인해야 할 핵심 학습 정보를 먼저 모았습니다.</p></div></div>
-          <div class="panel-body">
-            <div class="content-row">
-              <div class="mini-panel">
-                <h3>학습 상태</h3>
-                <div class="key-metric-grid">
-                  <div><span>epochs</span><strong>{_int_text(progress.get('epochs_completed'))} / {_int_text(progress.get('epochs_total'))}</strong></div>
-                  <div><span>최고 epoch</span><strong>{_text(progress.get('best_epoch'))}</strong></div>
-                  <div><span>최고 macro F1</span><strong>{_float_text(progress.get('best_val_macro_f1'))}</strong></div>
-                  <div><span>최근 epoch</span><strong>{_text(latest.get('epoch'))}</strong></div>
-                  <div><span>최근 정확도</span><strong>{_float_text(latest.get('val_accuracy'))}</strong></div>
-                  <div><span>최근 F1</span><strong>{_float_text(latest.get('val_macro_f1'))}</strong></div>
-                </div>
-              </div>
-              <div class="mini-panel">
-                <h3>데이터 / 분포</h3>
-                <div class="key-metric-grid">
-                  <div><span>원본 / 전처리</span><strong>{raw_total} / {prepared_total}</strong></div>
-                  <div><span>학습 / 검증 샘플</span><strong>{_int_text(progress.get('train_samples'))} / {_int_text(progress.get('val_samples'))}</strong></div>
-                  <div><span>학습 분포</span><strong>{_text(train_distribution.get('severity'))}</strong></div>
-                  <div><span>검증 분포</span><strong>{_text(val_distribution.get('severity'))}</strong></div>
-                  <div><span>현재 스킵</span><strong>{_int_text((skip_report.get('summary') or {}).get('total_issues'))}</strong></div>
-                  <div><span>누적 스킵</span><strong>{_int_text((cumulative_skip_report.get('summary') or {}).get('total_issues'))}</strong></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section class="content-row" id="dataset">
-          <article class="panel">
-            <div class="panel-head"><div><h2>누적 데이터셋</h2><p>cumulative manifests 기준입니다.</p></div></div>
+          <section class="panel" id="logs">
+            <div class="panel-head"><div><h2>로그</h2><p>필요한 로그만 열어 볼 수 있게 접이식으로 정리했습니다.</p></div></div>
             <div class="panel-body">
-              {_render_table(["split", "total", "labels"], dataset_rows, "누적 데이터셋이 없습니다.")}
-            </div>
-          </article>
-          <article class="panel">
-            <div class="panel-head"><div><h2>현재 작업 데이터셋</h2><p>current manifests 기준입니다.</p></div></div>
-            <div class="panel-body">
-              {_render_table(["split", "total", "labels"], current_dataset_rows, "현재 작업 데이터셋이 없습니다.")}
-            </div>
-          </article>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><div><h2>에폭 기록</h2><p>최근 20개 epoch를 빠르게 훑을 수 있게 정리했습니다.</p></div></div>
-          <div class="panel-body">
-            {_render_table(["epoch", "train_loss", "val_loss", "val_accuracy", "val_macro_f1", "learning_rate"], history_rows, "학습 history가 없습니다.")}
-          </div>
-        </section>
-
-        <section class="content-row" id="validation">
-          <article class="panel panel-span-full">
-            <div class="panel-head"><div><h2>클래스별 지표</h2><p>최종 검증 결과를 클래스별로 바로 읽을 수 있게 정리했습니다.</p></div></div>
-            <div class="panel-body">
-              {_render_table(["label", "precision", "recall", "f1", "support"], per_class_rows, "클래스별 지표가 없습니다.")}
-            </div>
-          </article>
-        </section>
-
-        <section class="chart-grid" id="validation-matrix">
-          {confusion_matrix_html}
-        </section>
-
-        <section class="content-row" id="jobs">
-          <article class="panel">
-            <div class="panel-head"><div><h2>최근 작업 이력</h2><p>최근 완료 또는 중단된 작업을 위에서부터 보여줍니다.</p></div></div>
-            <div class="panel-body">
-              {_render_table(["filekey", "datasetkey", "state", "prepared", "finished", "message"], recent_job_rows, "최근 작업 이력이 없습니다.")}
-            </div>
-          </article>
-          <article class="panel">
-            <div class="panel-head"><div><h2>현재 스킵 이슈</h2><p>이번 작업에서 건너뛴 항목만 따로 모아 보여줍니다.</p></div></div>
-            <div class="panel-body">
-              {_render_table(["split", "video", "reason", "valid_frames", "confirmed_frames"], issue_rows, "표시할 현재 스킵 이슈가 없습니다.")}
-            </div>
-          </article>
-        </section>
-
-        <section class="panel" id="logs">
-          <div class="panel-head"><div><h2>로그</h2><p>필요한 로그만 열어 볼 수 있게 접이식으로 정리했습니다.</p></div></div>
-          <div class="panel-body">
             <div class="log-stack" id="logs-stack">
               {_render_logs(logs)}
             </div>

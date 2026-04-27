@@ -82,6 +82,10 @@ DEFAULT_ACTION_TRAINING_CONFIG: dict = {
         "pin_memory": "auto",
         "prefetch_factor": 2,
         "persistent_workers": True,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.001,
+        "imbalance_warn_min_samples": 8,
+        "imbalance_warn_ratio": 5.0,
     },
     "continual_learning": {
         "enabled": True,

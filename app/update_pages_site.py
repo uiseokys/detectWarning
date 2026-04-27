@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from action_training_pipeline import get_target_labels, load_config, resolve_paths
@@ -22,6 +21,18 @@ from reporting import (
     sort_jobs_by_recency,
     summarize_stage_timings,
     summarize_manifest,
+    write_json_atomic,
+)
+
+
+RESULT_DATASET_MANIFEST_SPECS = (
+    ("raw", "raw_manifest"),
+    ("train", "split_train"),
+    ("val", "split_val"),
+    ("test", "split_test"),
+    ("prepared_train", "prepared_train"),
+    ("prepared_val", "prepared_val"),
+    ("prepared_test", "prepared_test"),
 )
 
 
@@ -171,13 +182,8 @@ def build_latest_result_payload(
     }
 
     dataset = {
-        "raw": summarize_manifest(paths["raw_manifest"], label_field="target_label"),
-        "train": summarize_manifest(paths["split_train"], label_field="target_label"),
-        "val": summarize_manifest(paths["split_val"], label_field="target_label"),
-        "test": summarize_manifest(paths["split_test"], label_field="target_label"),
-        "prepared_train": summarize_manifest(paths["prepared_train"], label_field="target_label"),
-        "prepared_val": summarize_manifest(paths["prepared_val"], label_field="target_label"),
-        "prepared_test": summarize_manifest(paths["prepared_test"], label_field="target_label"),
+        output_key: summarize_manifest(paths[path_key], label_field="target_label")
+        for output_key, path_key in RESULT_DATASET_MANIFEST_SPECS
     }
     train_total = dataset["prepared_train"]["total"]
     val_total = dataset["prepared_val"]["total"]
@@ -326,9 +332,7 @@ def build_live_status_payload(
 
 
 def write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    write_json_atomic(path, payload)
 
 
 if __name__ == "__main__":

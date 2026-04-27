@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
-def read_json(path: Path) -> dict | list | None:
+def read_json(path: Path | str | None) -> dict | list | None:
+    if not path:
+        return None
+    path = Path(path)
     if not path.exists():
         return None
     try:
@@ -27,6 +31,22 @@ def read_json(path: Path) -> dict | list | None:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def write_json_atomic(path: Path | str, payload: dict | list, *, indent: int | None = 2) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=indent)
+        temp_path.replace(path)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def parse_iso_datetime(value) -> datetime | None:
@@ -38,7 +58,8 @@ def parse_iso_datetime(value) -> datetime | None:
         return None
 
 
-def build_path_diagnostic(path: Path) -> dict:
+def build_path_diagnostic(path: Path | str) -> dict:
+    path = Path(path)
     payload = {
         "path": str(path),
         "exists": False,
@@ -58,6 +79,15 @@ def build_path_diagnostic(path: Path) -> dict:
         tz=timezone.utc,
     ).astimezone().isoformat()
     return payload
+
+
+def build_file_signature(path: Path | str) -> tuple[str, int | None, int | None]:
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def compute_job_duration_minutes(job: dict | None) -> float | None:
@@ -288,19 +318,36 @@ def build_effective_pipeline_status(
     return effective, diagnostics
 
 
-def summarize_manifest_total(path: Path) -> int:
-    if not path.exists():
+def summarize_manifest_total(path: Path | str | None) -> int:
+    if not path:
+        return 0
+    path = Path(path)
+    try:
+        exists = path.exists()
+    except OSError:
+        return 0
+    if not exists:
         return 0
     total = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                total += 1
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    total += 1
+    except OSError:
+        return 0
     return total
 
 
-def summarize_manifest(path: Path, label_field: str) -> dict:
-    if not path.exists():
+def summarize_manifest(path: Path | str | None, label_field: str) -> dict:
+    if not path:
+        return {"total": 0, "by_label": {}}
+    path = Path(path)
+    try:
+        exists = path.exists()
+    except OSError:
+        return {"total": 0, "by_label": {}}
+    if not exists:
         return {"total": 0, "by_label": {}}
 
     try:
@@ -586,31 +633,47 @@ def build_recent_jobs(launcher_history: dict, limit: int = 5) -> list[dict]:
 
 
 def get_latest_job(paths: dict) -> dict:
-    launcher_history = read_json(paths["workspace_dir"] / "launcher_history.json") or {}
+    workspace_dir_value = paths.get("workspace_dir")
+    if isinstance(workspace_dir_value, Path):
+        workspace_dir = workspace_dir_value
+    elif workspace_dir_value:
+        workspace_dir = Path(workspace_dir_value)
+    else:
+        workspace_dir = None
+    launcher_history_path = workspace_dir / "launcher_history.json" if workspace_dir is not None else None
+    launcher_history = read_json(launcher_history_path) or {}
     completed_jobs = launcher_history.get("completed_jobs") or []
     if not isinstance(completed_jobs, list) or not completed_jobs:
-        pipeline_status = read_json(paths["pipeline_status"]) or {}
-        training_progress = read_json(paths["training_progress"]) or {}
+        pipeline_status = read_json(paths.get("pipeline_status")) or {}
+        training_progress = read_json(paths.get("training_progress")) or {}
         effective_pipeline_status, _diagnostics = build_effective_pipeline_status(
             pipeline_status,
             training_progress=training_progress,
             completed_jobs=[],
-            workspace_dir=paths.get("workspace_dir"),
+            workspace_dir=workspace_dir,
         )
-        metrics_path = paths["artifacts_dir"] / "metrics.json"
-        model_path = paths["artifacts_dir"] / "best_action_model.pt"
-        has_recent_artifacts = metrics_path.exists() or model_path.exists()
+        artifacts_dir_value = paths.get("artifacts_dir")
+        if isinstance(artifacts_dir_value, Path):
+            artifacts_dir = artifacts_dir_value
+        elif artifacts_dir_value:
+            artifacts_dir = Path(artifacts_dir_value)
+        else:
+            artifacts_dir = None
+        metrics_path = artifacts_dir / "metrics.json" if artifacts_dir is not None else None
+        model_path = artifacts_dir / "best_action_model.pt" if artifacts_dir is not None else None
+        has_metrics = bool(metrics_path and metrics_path.exists())
+        has_model = bool(model_path and model_path.exists())
+        has_recent_artifacts = has_metrics or has_model
         fallback_finished_at = None
-        if metrics_path.exists():
-            fallback_finished_at = datetime.fromtimestamp(
-                metrics_path.stat().st_mtime,
-                tz=timezone.utc,
-            ).astimezone().isoformat()
-        elif model_path.exists():
-            fallback_finished_at = datetime.fromtimestamp(
-                model_path.stat().st_mtime,
-                tz=timezone.utc,
-            ).astimezone().isoformat()
+        artifact_path = metrics_path if has_metrics else model_path if has_model else None
+        if artifact_path is not None:
+            try:
+                fallback_finished_at = datetime.fromtimestamp(
+                    artifact_path.stat().st_mtime,
+                    tz=timezone.utc,
+                ).astimezone().isoformat()
+            except OSError:
+                fallback_finished_at = None
 
         if has_recent_artifacts:
             return {
