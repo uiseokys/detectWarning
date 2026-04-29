@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import platform
-import inspect
+import random
 import uuid
 from collections import OrderedDict
 from contextlib import nullcontext
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from reporting import analyze_class_balance, write_json_atomic
-
 
 DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE = "pin_memory_device" in inspect.signature(DataLoader).parameters
 
@@ -121,6 +123,40 @@ class TemporalPoseClassifier(nn.Module):
         return self.classifier(pooled)
 
 
+class FocalLoss(nn.Module):
+    def __init__(
+        self,
+        *,
+        weight: torch.Tensor | None = None,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if weight is None:
+            self.register_buffer("weight", None)
+        else:
+            self.register_buffer("weight", weight.detach().clone())
+        self.gamma = max(float(gamma), 0.0)
+        self.label_smoothing = max(0.0, min(float(label_smoothing), 0.999))
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(
+            logits,
+            target,
+            weight=self.weight,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        base_ce = F.cross_entropy(
+            logits,
+            target,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        pt = torch.exp(-base_ce).clamp(min=0.0, max=1.0)
+        return ((1.0 - pt) ** self.gamma) * ce_loss
+
+
 def _has_triton() -> bool:
     try:
         import triton  # noqa: F401
@@ -217,9 +253,18 @@ def train_action_classifier(
     batch_size: int = 16,
     eval_batch_size: int | None = None,
     learning_rate: float = 1e-3,
+    weight_decay: float = 1e-3,
     hidden_dim: int = 128,
     num_layers: int = 2,
     dropout: float = 0.2,
+    label_smoothing: float = 0.05,
+    loss_name: str = "cross_entropy",
+    focal_gamma: float = 2.0,
+    class_weight: bool | str = "balanced",
+    balanced_sampler: bool | str = "auto",
+    grad_clip_norm: float = 1.0,
+    seed: int | None = 42,
+    deterministic: bool = False,
     num_workers: int | str = 0,
     device: str = "cuda",
     amp: bool = True,
@@ -241,6 +286,10 @@ def train_action_classifier(
     labels_path = output_dir / "labels.json"
     metrics_path = output_dir / "metrics.json"
     best_model_path = output_dir / "best_action_model.pt"
+
+    effective_seed = _resolve_training_seed(seed)
+    if effective_seed is not None:
+        _set_training_seed(effective_seed, deterministic=deterministic)
 
     use_cuda = _uses_cuda(device)
     use_amp = bool(amp and use_cuda and torch.cuda.is_available())
@@ -267,27 +316,62 @@ def train_action_classifier(
     train_dataset = PoseSequenceDataset(train_manifest, cache_size=effective_cache_size)
     val_dataset = PoseSequenceDataset(val_manifest, cache_size=effective_cache_size)
 
-    _configure_training_acceleration(device=device, use_cuda=use_cuda)
+    label_mapping_payload = _build_label_mapping_payload(labels)
+    _validate_dataset_label_mapping(train_dataset.samples, labels, split_name="train")
+    _validate_dataset_label_mapping(val_dataset.samples, labels, split_name="val")
+    train_distribution = _summarize_class_distribution(
+        train_dataset.samples,
+        labels,
+        min_samples=imbalance_warn_min_samples,
+        ratio_warn=imbalance_warn_ratio,
+    )
+    val_distribution = _summarize_class_distribution(
+        val_dataset.samples,
+        labels,
+        min_samples=imbalance_warn_min_samples,
+        ratio_warn=imbalance_warn_ratio,
+    )
+    train_sample_count = len(train_dataset)
+    val_sample_count = len(val_dataset)
+
+    _configure_training_acceleration(device=device, use_cuda=use_cuda, deterministic=deterministic)
+
+    train_generator = _build_torch_generator(effective_seed)
+    sampler_generator = _build_torch_generator(None if effective_seed is None else effective_seed + 1)
+    worker_init_fn = _build_worker_init_fn(effective_seed)
+    train_sampler, sampler_mode = _build_balanced_sampler(
+        train_dataset.samples,
+        num_classes=len(labels),
+        requested=balanced_sampler,
+        distribution=train_distribution,
+        generator=sampler_generator,
+    )
 
     train_loader = _build_dataloader(
         dataset=train_dataset,
         batch_size=resolved_batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=resolved_num_workers,
         pin_memory=use_pin_memory,
         pin_memory_device=resolved_pin_memory_device,
         prefetch_factor=resolved_prefetch_factor,
         persistent_workers=use_persistent_workers,
+        generator=train_generator,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = _build_dataloader(
         dataset=val_dataset,
         batch_size=resolved_eval_batch_size,
         shuffle=False,
+        sampler=None,
         num_workers=resolved_num_workers,
         pin_memory=use_pin_memory,
         pin_memory_device=resolved_pin_memory_device,
         prefetch_factor=resolved_prefetch_factor,
         persistent_workers=use_persistent_workers,
+        generator=None,
+        worker_init_fn=worker_init_fn,
     )
 
     first_pose, _first_mask, _first_label = train_dataset[0]
@@ -337,9 +421,23 @@ def train_action_classifier(
         device=device,
     )
 
-    class_weights = _build_class_weights(train_dataset.samples, len(labels)).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    class_weights, class_weight_mode = _resolve_class_weights(
+        train_dataset.samples,
+        num_classes=len(labels),
+        requested=class_weight,
+    )
+    class_weights_for_loss = class_weights.to(device) if class_weights is not None else None
+    criterion, resolved_loss_name = _build_loss_function(
+        loss_name=loss_name,
+        class_weights=class_weights_for_loss,
+        focal_gamma=focal_gamma,
+        label_smoothing=label_smoothing,
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=max(float(weight_decay), 0.0),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     scaler = _create_grad_scaler(enabled=use_amp)
 
@@ -351,20 +449,20 @@ def train_action_classifier(
     epochs_without_improvement = 0
     stopped_early = False
     stop_reason: str | None = None
-    train_sample_count = len(train_dataset)
-    val_sample_count = len(val_dataset)
-    train_distribution = _summarize_class_distribution(
-        train_dataset.samples,
-        labels,
-        min_samples=imbalance_warn_min_samples,
-        ratio_warn=imbalance_warn_ratio,
-    )
-    val_distribution = _summarize_class_distribution(
-        val_dataset.samples,
-        labels,
-        min_samples=imbalance_warn_min_samples,
-        ratio_warn=imbalance_warn_ratio,
-    )
+    effective_grad_clip_norm = max(float(grad_clip_norm), 0.0)
+    training_options = {
+        **label_mapping_payload,
+        "loss_name": resolved_loss_name,
+        "class_weight_mode": class_weight_mode,
+        "class_weights": _tensor_to_float_list(class_weights),
+        "balanced_sampler": sampler_mode,
+        "label_smoothing": max(0.0, min(float(label_smoothing), 0.999)),
+        "focal_gamma": max(float(focal_gamma), 0.0),
+        "weight_decay": max(float(weight_decay), 0.0),
+        "grad_clip_norm": effective_grad_clip_norm,
+        "seed": effective_seed,
+        "deterministic": bool(deterministic),
+    }
 
     print(
         "[train] acceleration "
@@ -379,7 +477,13 @@ def train_action_classifier(
         f"workers={resolved_num_workers} "
         f"pin_memory={'on' if use_pin_memory else 'off'} "
         f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
-        f"persistent={'on' if use_persistent_workers else 'off'}"
+        f"persistent={'on' if use_persistent_workers else 'off'} "
+        f"loss={resolved_loss_name} "
+        f"class_weight={class_weight_mode} "
+        f"sampler={sampler_mode} "
+        f"weight_decay={max(float(weight_decay), 0.0):.6g} "
+        f"grad_clip={effective_grad_clip_norm:.4g} "
+        f"seed={effective_seed if effective_seed is not None else 'none'}"
     )
     if train_distribution.get("messages"):
         print(
@@ -423,6 +527,7 @@ def train_action_classifier(
                 "pin_memory_device": resolved_pin_memory_device,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
+                **training_options,
                 "train_distribution": train_distribution,
                 "val_distribution": val_distribution,
                 "stopped_early": False,
@@ -449,6 +554,7 @@ def train_action_classifier(
             use_amp=use_amp,
             amp_dtype=resolved_amp_dtype,
             scaler=scaler,
+            grad_clip_norm=effective_grad_clip_norm,
         )
         val_metrics = _evaluate(
             model=model,
@@ -456,6 +562,7 @@ def train_action_classifier(
             criterion=criterion,
             device=device,
             num_classes=len(labels),
+            label_names=labels,
             use_amp=use_amp,
             amp_dtype=resolved_amp_dtype,
         )
@@ -467,6 +574,7 @@ def train_action_classifier(
             "val_loss": round(val_metrics["loss"], 6),
             "val_accuracy": round(val_metrics["accuracy"], 6),
             "val_macro_f1": round(val_metrics["macro_f1"], 6),
+            "val_loss_gap": round(val_metrics["loss"] - train_loss, 6),
             "learning_rate": round(current_lr, 8),
         }
         history.append(epoch_metrics)
@@ -491,11 +599,15 @@ def train_action_classifier(
                 {
                     "model_state_dict": base_model.state_dict(),
                     "labels": labels,
+                    **label_mapping_payload,
                     "num_joints": int(first_pose.shape[1]),
                     "input_dim": int(first_pose.shape[2]),
                     "hidden_dim": hidden_dim,
                     "num_layers": num_layers,
                     "dropout": dropout,
+                    "best_epoch": best_epoch,
+                    "best_val_macro_f1": round(best_val_f1, 6),
+                    "training_options": training_options,
                 },
             )
         else:
@@ -530,6 +642,7 @@ def train_action_classifier(
                     "pin_memory_device": resolved_pin_memory_device,
                     "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                     "persistent_workers": use_persistent_workers,
+                    **training_options,
                     "train_distribution": train_distribution,
                     "val_distribution": val_distribution,
                     "stopped_early": False,
@@ -553,7 +666,7 @@ def train_action_classifier(
             print(f"[train] early stopping triggered: {stop_reason}")
             break
 
-    write_json_atomic(labels_path, {"labels": labels})
+    write_json_atomic(labels_path, {"labels": labels, **label_mapping_payload})
 
     if best_model_path.exists():
         best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=True)
@@ -567,6 +680,7 @@ def train_action_classifier(
         criterion=criterion,
         device=device,
         num_classes=len(labels),
+        label_names=labels,
         use_amp=use_amp,
         amp_dtype=resolved_amp_dtype,
     )
@@ -577,6 +691,7 @@ def train_action_classifier(
             "final_validation": final_metrics,
             "labels": labels,
             "best_epoch": best_epoch,
+            "best_val_macro_f1": round(best_val_f1, 6),
             "resumed_from_checkpoint": resumed_from_checkpoint,
             "resume_mode": resume_mode,
             "train_samples": train_sample_count,
@@ -593,6 +708,7 @@ def train_action_classifier(
             "pin_memory_device": resolved_pin_memory_device,
             "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
             "persistent_workers": use_persistent_workers,
+            **training_options,
             "train_distribution": train_distribution,
             "val_distribution": val_distribution,
             "stopped_early": stopped_early,
@@ -637,6 +753,7 @@ def train_action_classifier(
                 "pin_memory_device": resolved_pin_memory_device,
                 "prefetch_factor": resolved_prefetch_factor if resolved_num_workers > 0 else 0,
                 "persistent_workers": use_persistent_workers,
+                **training_options,
                 "train_distribution": train_distribution,
                 "val_distribution": val_distribution,
                 "stopped_early": stopped_early,
@@ -662,7 +779,9 @@ def train_action_classifier(
 def _build_class_weights(samples: list[dict], num_classes: int) -> torch.Tensor:
     counts = np.ones(num_classes, dtype=np.float32)
     for sample in samples:
-        counts[int(sample["label_idx"])] += 1.0
+        label_idx = _safe_label_index(sample.get("label_idx"), num_classes=num_classes)
+        if label_idx >= 0:
+            counts[label_idx] += 1.0
     weights = counts.sum() / (counts * len(counts))
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -676,7 +795,7 @@ def _summarize_class_distribution(
 ) -> dict:
     by_label: dict[str, int] = {label: 0 for label in labels}
     for sample in samples:
-        label_idx = int(sample.get("label_idx", -1) or -1)
+        label_idx = _safe_label_index(sample.get("label_idx"), num_classes=len(labels))
         if 0 <= label_idx < len(labels):
             by_label[labels[label_idx]] = int(by_label.get(labels[label_idx], 0) or 0) + 1
     summary = analyze_class_balance(
@@ -687,6 +806,235 @@ def _summarize_class_distribution(
     )
     summary["total_samples"] = len(samples)
     return summary
+
+
+def _safe_label_index(value, *, num_classes: int | None = None) -> int:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return -1
+    if num_classes is not None and not 0 <= index < num_classes:
+        return -1
+    return index
+
+
+def _build_label_mapping_payload(labels: list[str]) -> dict:
+    class_to_idx = {label: index for index, label in enumerate(labels)}
+    idx_to_class = {str(index): label for label, index in class_to_idx.items()}
+    return {
+        "class_to_idx": class_to_idx,
+        "idx_to_class": idx_to_class,
+    }
+
+
+def _validate_dataset_label_mapping(samples: list[dict], labels: list[str], *, split_name: str) -> None:
+    mismatches: list[str] = []
+    for index, sample in enumerate(samples):
+        label_idx = _safe_label_index(sample.get("label_idx"), num_classes=len(labels))
+        target_label = str(sample.get("target_label") or "").strip()
+        if label_idx < 0:
+            mismatches.append(
+                f"{split_name}[{index}] "
+                f"label_idx={sample.get('label_idx')} "
+                f"target_label={target_label or '-'}"
+            )
+            continue
+        expected_label = labels[label_idx]
+        if target_label and target_label != expected_label:
+            mismatches.append(
+                f"{split_name}[{index}] "
+                f"label_idx={label_idx} "
+                f"expected={expected_label} "
+                f"target_label={target_label}"
+            )
+    if mismatches:
+        examples = "\n".join(f"- {message}" for message in mismatches[:8])
+        raise RuntimeError(
+            "학습 manifest의 label_idx와 target_label 매핑이 현재 labels 순서와 일치하지 않습니다.\n"
+            f"{examples}\n"
+            "prepare/train manifest를 다시 materialize 하거나 dataset.target_labels 순서를 확인해 주세요."
+        )
+
+
+def _resolve_training_seed(seed: int | str | None) -> int | None:
+    if seed is None:
+        return None
+    if isinstance(seed, str):
+        normalized = seed.strip().lower()
+        if normalized in {"", "none", "off", "false"}:
+            return None
+        return int(normalized)
+    return int(seed)
+
+
+def _set_training_seed(seed: int, *, deterministic: bool) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic and hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+
+
+def _build_torch_generator(seed: int | None) -> torch.Generator | None:
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _build_worker_init_fn(seed: int | None):
+    if seed is None:
+        return None
+    return partial(_seed_worker_with_base, base_seed=int(seed))
+
+
+def _seed_worker_with_base(worker_id: int, *, base_seed: int) -> None:
+    worker_seed = int(base_seed) + int(worker_id)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed % (2**32 - 1))
+    torch.manual_seed(worker_seed)
+
+
+def _resolve_class_weights(
+    samples: list[dict],
+    *,
+    num_classes: int,
+    requested: bool | str,
+) -> tuple[torch.Tensor | None, str]:
+    if isinstance(requested, str):
+        normalized = requested.strip().lower()
+        enabled = normalized not in {"", "0", "false", "off", "none", "disabled"}
+        mode = normalized or "off"
+    else:
+        enabled = bool(requested)
+        mode = "balanced" if enabled else "off"
+    if not enabled:
+        return None, "off"
+    return _build_class_weights(samples, num_classes), mode if mode != "true" else "balanced"
+
+
+def _build_loss_function(
+    *,
+    loss_name: str,
+    class_weights: torch.Tensor | None,
+    focal_gamma: float,
+    label_smoothing: float,
+) -> tuple[nn.Module, str]:
+    normalized_loss = str(loss_name or "cross_entropy").strip().lower()
+    smoothing = max(0.0, min(float(label_smoothing), 0.999))
+    if normalized_loss in {"focal", "focal_loss"}:
+        return (
+            FocalLoss(
+                weight=class_weights,
+                gamma=max(float(focal_gamma), 0.0),
+                label_smoothing=smoothing,
+            ),
+            "focal",
+        )
+    return (
+        nn.CrossEntropyLoss(
+            weight=class_weights,
+            reduction="none",
+            label_smoothing=smoothing,
+        ),
+        "cross_entropy",
+    )
+
+
+def _build_balanced_sampler(
+    samples: list[dict],
+    *,
+    num_classes: int,
+    requested: bool | str,
+    distribution: dict,
+    generator: torch.Generator | None,
+) -> tuple[WeightedRandomSampler | None, str]:
+    enabled = False
+    mode = "off"
+    if isinstance(requested, str):
+        normalized = requested.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "balanced"}:
+            enabled = True
+            mode = "balanced"
+        elif normalized in {"auto", "default"}:
+            imbalance_ratio = distribution.get("imbalance_ratio")
+            enabled = (
+                imbalance_ratio is not None
+                and float(imbalance_ratio) >= float(distribution.get("ratio_warn", 5.0) or 5.0)
+            )
+            mode = "auto_on" if enabled else "auto_off"
+        else:
+            mode = "off"
+    else:
+        enabled = bool(requested)
+        mode = "balanced" if enabled else "off"
+
+    if not enabled:
+        return None, mode
+
+    sample_weights = _build_sample_weights(samples, num_classes=num_classes)
+    if sample_weights is None:
+        return None, f"{mode}_unavailable"
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=generator,
+    )
+    return sampler, mode
+
+
+def _build_sample_weights(samples: list[dict], *, num_classes: int) -> torch.Tensor | None:
+    counts = np.zeros(num_classes, dtype=np.float64)
+    label_indices: list[int] = []
+    for sample in samples:
+        label_idx = _safe_label_index(sample.get("label_idx"), num_classes=num_classes)
+        label_indices.append(label_idx)
+        if label_idx >= 0:
+            counts[label_idx] += 1.0
+    nonzero_classes = int(np.count_nonzero(counts))
+    if nonzero_classes <= 1:
+        return None
+    class_weights = np.zeros(num_classes, dtype=np.float64)
+    total = float(counts.sum())
+    for class_index, count in enumerate(counts):
+        if count > 0:
+            class_weights[class_index] = total / (count * nonzero_classes)
+    sample_weights = [
+        class_weights[label_idx] if label_idx >= 0 else 0.0
+        for label_idx in label_indices
+    ]
+    return torch.tensor(sample_weights, dtype=torch.double)
+
+
+def _mean_loss(loss_values: torch.Tensor) -> torch.Tensor:
+    if loss_values.ndim == 0:
+        return loss_values
+    return loss_values.mean()
+
+
+def _sum_loss(loss_values: torch.Tensor, *, batch_size: int) -> float:
+    if loss_values.ndim == 0:
+        return float(loss_values.detach().item()) * batch_size
+    return float(loss_values.detach().sum().item())
+
+
+def _tensor_to_float_list(values: torch.Tensor | None) -> list[float] | None:
+    if values is None:
+        return None
+    return [round(float(value), 6) for value in values.detach().cpu().tolist()]
+
+
+def _label_name(labels: list[str] | None, index: int) -> str:
+    if labels is not None and 0 <= index < len(labels):
+        return labels[index]
+    return str(index)
 
 
 def _run_epoch(
@@ -700,6 +1048,7 @@ def _run_epoch(
     use_amp: bool,
     amp_dtype: torch.dtype | None,
     scaler,
+    grad_clip_norm: float,
 ) -> float:
     if train:
         model.train()
@@ -719,19 +1068,25 @@ def _run_epoch(
 
         with _autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype):
             logits = model(pose, mask)
-            loss = criterion(logits, labels)
+            loss_values = criterion(logits, labels)
+            loss = _mean_loss(loss_values)
 
         if train:
             if scaler is not None:
                 scaler.scale(loss).backward()
+                if grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
         batch_size = int(labels.shape[0])
-        total_loss += float(loss.item()) * batch_size
+        total_loss += _sum_loss(loss_values, batch_size=batch_size)
         total_items += batch_size
 
     return total_loss / max(total_items, 1)
@@ -745,6 +1100,7 @@ def _evaluate(
     criterion: nn.Module,
     device: str,
     num_classes: int,
+    label_names: list[str] | None,
     use_amp: bool,
     amp_dtype: torch.dtype | None,
 ) -> dict:
@@ -752,6 +1108,9 @@ def _evaluate(
     total_loss = 0.0
     total_items = 0
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    misclassified: list[dict] = []
+    dataset_samples = getattr(loader.dataset, "samples", [])
+    sample_offset = 0
 
     for pose, mask, labels in loader:
         pose = pose.to(device, non_blocking=True)
@@ -760,45 +1119,68 @@ def _evaluate(
 
         with _autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype):
             logits = model(pose, mask)
-            loss = criterion(logits, labels)
+            loss_values = criterion(logits, labels)
         preds = logits.argmax(dim=1)
 
         batch_size = int(labels.shape[0])
-        total_loss += float(loss.item()) * batch_size
+        total_loss += _sum_loss(loss_values, batch_size=batch_size)
         total_items += batch_size
 
         true_np = labels.detach().cpu().numpy()
         pred_np = preds.detach().cpu().numpy()
-        for true_label, pred_label in zip(true_np, pred_np):
+        for batch_index, (true_label, pred_label) in enumerate(zip(true_np, pred_np, strict=False)):
             confusion[int(true_label), int(pred_label)] += 1
+            if int(true_label) == int(pred_label) or len(misclassified) >= 50:
+                continue
+            sample_index = sample_offset + batch_index
+            sample = dataset_samples[sample_index] if sample_index < len(dataset_samples) else {}
+            true_name = _label_name(label_names, int(true_label))
+            pred_name = _label_name(label_names, int(pred_label))
+            misclassified.append(
+                {
+                    "sample_index": sample_index,
+                    "item_id": sample.get("item_id"),
+                    "target_label": sample.get("target_label") or true_name,
+                    "predicted_label": pred_name,
+                    "true_index": int(true_label),
+                    "predicted_index": int(pred_label),
+                    "pose_path": sample.get("pose_path"),
+                    "video_path": sample.get("video_path"),
+                }
+            )
+        sample_offset += batch_size
 
     accuracy = float(np.trace(confusion) / max(confusion.sum(), 1))
-    macro_f1, per_class = _compute_f1(confusion)
+    macro_f1, per_class = _compute_f1(confusion, labels=label_names)
     return {
         "loss": total_loss / max(total_items, 1),
         "accuracy": accuracy,
         "macro_f1": macro_f1,
         "confusion_matrix": confusion.tolist(),
         "per_class": per_class,
+        "misclassified_examples": misclassified,
     }
 
 
-def _compute_f1(confusion: np.ndarray) -> tuple[float, list[dict]]:
+def _compute_f1(confusion: np.ndarray, *, labels: list[str] | None = None) -> tuple[float, list[dict]]:
     metrics = []
     f1_scores = []
     for class_index in range(confusion.shape[0]):
         tp = float(confusion[class_index, class_index])
         fp = float(confusion[:, class_index].sum() - tp)
         fn = float(confusion[class_index, :].sum() - tp)
+        support = int(confusion[class_index, :].sum())
         precision = tp / max(tp + fp, 1.0)
         recall = tp / max(tp + fn, 1.0)
         f1 = 2 * precision * recall / max(precision + recall, 1e-8)
         metrics.append(
             {
                 "class_index": class_index,
+                "label": _label_name(labels, class_index),
                 "precision": round(precision, 6),
                 "recall": round(recall, 6),
                 "f1": round(f1, 6),
+                "support": support,
             }
         )
         f1_scores.append(f1)
@@ -829,18 +1211,29 @@ def _build_dataloader(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool,
+    sampler,
     num_workers: int,
     pin_memory: bool,
     pin_memory_device: str | None,
     prefetch_factor: int,
     persistent_workers: bool,
+    generator: torch.Generator | None,
+    worker_init_fn,
 ) -> DataLoader:
     kwargs = {
         "batch_size": batch_size,
-        "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
+        kwargs["shuffle"] = False
+    else:
+        kwargs["shuffle"] = shuffle
+    if generator is not None and sampler is None:
+        kwargs["generator"] = generator
+    if worker_init_fn is not None:
+        kwargs["worker_init_fn"] = worker_init_fn
     if pin_memory and pin_memory_device and DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE:
         kwargs["pin_memory_device"] = pin_memory_device
     if num_workers > 0:
@@ -909,11 +1302,13 @@ def _resolve_pin_memory_device(*, use_pin_memory: bool, device: str) -> str | No
     return str(device).strip()
 
 
-def _configure_training_acceleration(*, device: str, use_cuda: bool) -> None:
+def _configure_training_acceleration(*, device: str, use_cuda: bool, deterministic: bool) -> None:
     if not use_cuda:
         return
     if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = not deterministic
+        if hasattr(torch.backends.cudnn, "deterministic"):
+            torch.backends.cudnn.deterministic = bool(deterministic)
         if hasattr(torch.backends.cudnn, "allow_tf32"):
             torch.backends.cudnn.allow_tf32 = True
     if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
@@ -938,7 +1333,12 @@ def _create_grad_scaler(*, enabled: bool):
     return None
 
 
-def _resolve_amp_dtype(*, device: str, enabled: bool, requested_dtype: str | None) -> tuple[torch.dtype | None, str]:
+def _resolve_amp_dtype(
+    *,
+    device: str,
+    enabled: bool,
+    requested_dtype: str | None,
+) -> tuple[torch.dtype | None, str]:
     if not enabled or not _uses_cuda(device):
         return None, "disabled"
 
@@ -986,7 +1386,7 @@ def _autocast_context(*, device: str, enabled: bool, amp_dtype: torch.dtype | No
 def _write_progress(progress_path: Path, payload: dict) -> None:
     content = {
         **payload,
-        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "updated_at": datetime.now(UTC).astimezone().isoformat(),
     }
     write_json_atomic(progress_path, content)
 

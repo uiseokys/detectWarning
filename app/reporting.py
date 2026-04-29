@@ -513,7 +513,10 @@ def remap_per_class_rows(rows: list, *, source_labels: list[str], target_labels:
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        source_index = int(row.get("class_index", -1) or -1)
+        try:
+            source_index = int(row.get("class_index", -1))
+        except (TypeError, ValueError):
+            source_index = -1
         source_label = (
             source_labels[source_index]
             if 0 <= source_index < len(source_labels)

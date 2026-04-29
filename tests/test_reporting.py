@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import sys
-from tempfile import TemporaryDirectory
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
@@ -20,8 +20,8 @@ from reporting import (
 class ReportingTests(unittest.TestCase):
     def test_remap_per_class_rows_fills_missing_target_labels(self) -> None:
         rows = [
-            {"class_index": 0, "label": "normal", "precision": 0.9, "recall": 0.8, "f1": 0.85},
-            {"class_index": 1, "label": "violence", "precision": 0.5, "recall": 0.4, "f1": 0.44},
+            {"class_index": 0, "precision": 0.9, "recall": 0.8, "f1": 0.85},
+            {"class_index": 1, "precision": 0.5, "recall": 0.4, "f1": 0.44},
         ]
 
         remapped = remap_per_class_rows(
@@ -31,6 +31,7 @@ class ReportingTests(unittest.TestCase):
         )
 
         self.assertEqual([row["label"] for row in remapped], ["normal", "violence", "collapse"])
+        self.assertEqual(remapped[0]["precision"], 0.9)
         self.assertIsNone(remapped[2]["precision"])
 
     def test_remap_confusion_matrix_aligns_existing_labels(self) -> None:
@@ -46,7 +47,9 @@ class ReportingTests(unittest.TestCase):
         payload = {
             "labels": ["normal", "violence"],
             "final_validation": {
-                "per_class": [{"class_index": 0, "label": "normal", "precision": 1.0, "recall": 1.0, "f1": 1.0}],
+                "per_class": [
+                    {"class_index": 0, "label": "normal", "precision": 1.0, "recall": 1.0, "f1": 1.0}
+                ],
                 "confusion_matrix": [[1, 0], [0, 0]],
             },
         }

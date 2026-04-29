@@ -12,19 +12,16 @@ import subprocess
 import time
 import uuid
 import zipfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
-from action_model import train_action_classifier
-from detector import FaceDetector, PersonDetector
-from pipeline_prepare import extract_pose_sequence_from_payload, load_video_sequence_payload
 from reporting import write_json_atomic
 from training_config import load_action_training_config
 
@@ -181,6 +178,8 @@ def main() -> None:
                 candidate_checkpoint = paths["artifacts_dir"] / "best_action_model.pt"
                 if candidate_checkpoint.exists():
                     resume_from = candidate_checkpoint
+            from action_model import train_action_classifier
+
             artifacts = train_action_classifier(
                 train_manifest=train_manifest,
                 val_manifest=val_manifest,
@@ -190,9 +189,18 @@ def main() -> None:
                 batch_size=int(config.get("training", {}).get("batch_size", 16)),
                 eval_batch_size=int(config.get("training", {}).get("eval_batch_size", 0) or 0),
                 learning_rate=float(config.get("training", {}).get("learning_rate", 1e-3)),
+                weight_decay=float(config.get("training", {}).get("weight_decay", 1e-3)),
                 hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
                 num_layers=int(config.get("training", {}).get("num_layers", 2)),
                 dropout=float(config.get("training", {}).get("dropout", 0.2)),
+                label_smoothing=float(config.get("training", {}).get("label_smoothing", 0.05)),
+                loss_name=str(config.get("training", {}).get("loss", "cross_entropy")),
+                focal_gamma=float(config.get("training", {}).get("focal_gamma", 2.0)),
+                class_weight=config.get("training", {}).get("class_weight", "balanced"),
+                balanced_sampler=config.get("training", {}).get("balanced_sampler", "auto"),
+                grad_clip_norm=float(config.get("training", {}).get("grad_clip_norm", 1.0)),
+                seed=config.get("training", {}).get("seed", config.get("split", {}).get("seed", 42)),
+                deterministic=bool(config.get("training", {}).get("deterministic", False)),
                 num_workers=config.get("training", {}).get("num_workers", "auto"),
                 device=str(config.get("training", {}).get("device", "cuda")),
                 amp=bool(config.get("training", {}).get("amp", True)),
@@ -317,7 +325,7 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
         "state": state,
         "message": message,
         "workspace_dir": str(paths["workspace_dir"]),
-        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "updated_at": datetime.now(UTC).astimezone().isoformat(),
         "pipeline_started_at": extra.pop("pipeline_started_at", existing.get("pipeline_started_at")),
         "stage_started_at": extra.pop("stage_started_at", existing.get("stage_started_at")),
         "stage_timings": extra.pop("stage_timings", existing.get("stage_timings") or {}),
@@ -329,7 +337,7 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
 
 
 def current_timestamp_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()
 
 
 def build_stage_timing_entry(started_at: str | None, finished_at: str | None) -> dict:
@@ -350,11 +358,14 @@ def build_stage_timing_entry(started_at: str | None, finished_at: str | None) ->
 
 def create_skip_report() -> dict:
     return {
-        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "updated_at": datetime.now(UTC).astimezone().isoformat(),
         "summary": {
             "total_issues": 0,
             "broken_count": 0,
             "skipped_count": 0,
+            "by_reason": {},
+            "by_split": {},
+            "by_label": {},
         },
         "issues": [],
     }
@@ -367,20 +378,27 @@ def append_skip_issue(
     split_name: str,
     video_path: Path,
     reason: str,
+    target_label: str | None = None,
     detail: str | None = None,
     valid_frames: int | None = None,
     confirmed_frames: int | None = None,
+    total_valid_keypoints: int | None = None,
+    recovery_actions: list[str] | None = None,
 ) -> None:
+    normalized_label = str(target_label or "unknown").strip() or "unknown"
     issue = {
         "category": category,
         "split": split_name,
+        "target_label": normalized_label,
         "video_name": video_path.name,
         "video_path": str(video_path),
         "reason": reason,
         "detail": detail,
         "valid_frames": valid_frames,
         "confirmed_frames": confirmed_frames,
-        "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "total_valid_keypoints": total_valid_keypoints,
+        "recovery_actions": recovery_actions or [],
+        "created_at": datetime.now(UTC).astimezone().isoformat(),
     }
     issues = report.setdefault("issues", [])
     issues.append(issue)
@@ -390,6 +408,15 @@ def append_skip_issue(
         summary["broken_count"] = int(summary.get("broken_count", 0) or 0) + 1
     else:
         summary["skipped_count"] = int(summary.get("skipped_count", 0) or 0) + 1
+    increment_nested_counter(summary, "by_reason", reason)
+    increment_nested_counter(summary, "by_split", split_name)
+    increment_nested_counter(summary, "by_label", normalized_label)
+
+
+def increment_nested_counter(payload: dict, key: str, item: str) -> None:
+    counters = payload.setdefault(key, {})
+    item_key = str(item or "unknown")
+    counters[item_key] = int(counters.get(item_key, 0) or 0) + 1
 
 
 def build_skip_issue_key(issue: dict) -> str:
@@ -413,7 +440,7 @@ def read_json_file(path: Path) -> dict | None:
 
 
 def write_skip_reports(paths: dict, report: dict) -> None:
-    report["updated_at"] = datetime.now(timezone.utc).astimezone().isoformat()
+    report["updated_at"] = datetime.now(UTC).astimezone().isoformat()
     write_json_atomic(paths["current_skip_report"], report)
 
     cumulative = read_json_file(paths["cumulative_skip_report"]) or create_skip_report()
@@ -430,12 +457,26 @@ def write_skip_reports(paths: dict, report: dict) -> None:
 
     cumulative_issues[:] = cumulative_issues[-1000:]
     cumulative["updated_at"] = report["updated_at"]
-    cumulative["summary"] = {
-        "total_issues": len(cumulative_issues),
-        "broken_count": sum(1 for issue in cumulative_issues if issue.get("category") == "broken"),
-        "skipped_count": sum(1 for issue in cumulative_issues if issue.get("category") != "broken"),
-    }
+    cumulative["summary"] = build_skip_issue_summary(cumulative_issues)
     write_json_atomic(paths["cumulative_skip_report"], cumulative)
+
+
+def build_skip_issue_summary(issues: list[dict]) -> dict:
+    by_reason: Counter[str] = Counter()
+    by_split: Counter[str] = Counter()
+    by_label: Counter[str] = Counter()
+    for issue in issues:
+        by_reason[str(issue.get("reason") or "unknown")] += 1
+        by_split[str(issue.get("split") or "unknown")] += 1
+        by_label[str(issue.get("target_label") or "unknown")] += 1
+    return {
+        "total_issues": len(issues),
+        "broken_count": sum(1 for issue in issues if issue.get("category") == "broken"),
+        "skipped_count": sum(1 for issue in issues if issue.get("category") != "broken"),
+        "by_reason": dict(sorted(by_reason.items())),
+        "by_split": dict(sorted(by_split.items())),
+        "by_label": dict(sorted(by_label.items())),
+    }
 
 
 def format_pipeline_status_log(payload: dict) -> str:
@@ -1441,11 +1482,17 @@ def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -
         by_label[item.target_label].append(item)
 
     split_items = {"train": [], "val": [], "test": []}
-    for label, items in by_label.items():
+    for _label, items in by_label.items():
         rng.shuffle(items)
         total = len(items)
-        train_end = max(1, int(total * train_ratio))
-        val_end = train_end + max(1, int(total * val_ratio)) if total >= 3 else train_end
+        train_count, val_count, _test_count = compute_split_counts(
+            total,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+        )
+        train_end = train_count
+        val_end = train_count + val_count
         split_items["train"].extend(items[:train_end])
         split_items["val"].extend(items[train_end:val_end])
         split_items["test"].extend(items[val_end:])
@@ -1472,6 +1519,33 @@ def split_dataset(downloaded: list[DownloadedItem], config: dict, paths: dict) -
     return split_paths
 
 
+def compute_split_counts(
+    total: int,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> tuple[int, int, int]:
+    total = max(int(total), 0)
+    if total <= 0:
+        return 0, 0, 0
+    if total == 1:
+        return 1, 0, 0
+    if total == 2:
+        return 1, 1, 0
+
+    train_count = max(1, int(total * train_ratio))
+    val_count = max(1, int(total * val_ratio)) if val_ratio > 0 else 0
+    if train_count + val_count > total:
+        overflow = train_count + val_count - total
+        train_count = max(1, train_count - overflow)
+    test_count = max(total - train_count - val_count, 0)
+    if test_ratio > 0 and test_count == 0 and train_count > 1:
+        train_count -= 1
+        test_count = 1
+    return train_count, val_count, test_count
+
+
 def load_existing_current_split_manifests(paths: dict) -> dict[str, Path]:
     split_paths = {
         "train": paths["current_split_train"],
@@ -1485,6 +1559,9 @@ def load_existing_current_split_manifests(paths: dict) -> dict[str, Path]:
 
 
 def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, Path]) -> dict[str, Path]:
+    from detector import FaceDetector, PersonDetector
+    from pipeline_prepare import extract_pose_sequence_from_payload, load_video_sequence_payload
+
     preprocess_config = config.get("preprocess", {})
     device = str(preprocess_config.get("device", "cuda:0"))
     compress_prepared_pose = bool(preprocess_config.get("compress_prepared_pose", False))
@@ -1501,7 +1578,21 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     sequence_length = max(int(preprocess_config.get("sequence_length", 48)), 1)
     max_frames_to_scan = max(int(preprocess_config.get("max_frames_to_scan", 160)), sequence_length)
     detector_batch_size = max(int(preprocess_config.get("detector_batch_size", 8)), 1)
+    strict_data_validation = bool(preprocess_config.get("strict_data_validation", False))
     min_frames_with_person = int(preprocess_config.get("min_frames_with_person", 4))
+    fallback_min_frames_with_person = int(preprocess_config.get("fallback_min_frames_with_person", 1))
+    min_total_keypoints = int(preprocess_config.get("min_total_keypoints", 1))
+    max_missing_frames_ratio = float(preprocess_config.get("max_missing_frames_ratio", 0.98))
+    allow_partial_pose = bool(preprocess_config.get("allow_partial_pose", True)) and not strict_data_validation
+    allow_padding = bool(preprocess_config.get("allow_padding", True)) and not strict_data_validation
+    allow_rejected_pose_fallback = (
+        bool(preprocess_config.get("allow_rejected_pose_fallback", True))
+        and not strict_data_validation
+    )
+    fallback_min_keypoints = int(preprocess_config.get("fallback_min_keypoints", 3))
+    fallback_min_detection_confidence = float(preprocess_config.get("fallback_min_detection_confidence", 0.15))
+    fallback_min_person_score = int(preprocess_config.get("fallback_min_person_score", 20))
+    skip_invalid_labels = bool(preprocess_config.get("skip_invalid_labels", True))
 
     prepared_paths = {
         "train": paths["current_prepared_train"],
@@ -1512,6 +1603,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     manifest_rows: dict[str, list[dict]] = {}
     overall_total = 0
     skip_report = create_skip_report()
+    prepare_stats = create_prepare_stats(target_labels)
     for split_name, manifest_path in split_manifests.items():
         rows = read_jsonl_entries(manifest_path)
         manifest_rows[split_name] = rows
@@ -1570,7 +1662,8 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         payload_future = None
 
                     video_path = Path(sample["video_path"])
-                    target_label = sample["target_label"]
+                    target_label = str(sample.get("target_label") or "").strip()
+                    register_prepare_input(prepare_stats, split_name=split_name, label=target_label)
                     processed_total += 1
                     if (
                         processed_total == 1
@@ -1594,6 +1687,46 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                             skipped_items=skipped,
                             prefetch_workers=video_prefetch_workers,
                         )
+                    if target_label not in label_to_idx:
+                        reason = "class_mapping_failed"
+                        detail = f"target_label={target_label or '-'}"
+                        if not skip_invalid_labels:
+                            raise RuntimeError(f"클래스 매핑 실패: {detail}")
+                        skipped += 1
+                        register_prepare_skip(
+                            prepare_stats,
+                            split_name=split_name,
+                            label=target_label,
+                            reason=reason,
+                        )
+                        append_skip_issue(
+                            skip_report,
+                            category="skipped",
+                            split_name=split_name,
+                            video_path=video_path,
+                            target_label=target_label,
+                            reason=reason,
+                            detail=detail,
+                        )
+                        continue
+                    if not video_path.exists():
+                        reason = "file_missing"
+                        skipped += 1
+                        register_prepare_skip(
+                            prepare_stats,
+                            split_name=split_name,
+                            label=target_label,
+                            reason=reason,
+                        )
+                        append_skip_issue(
+                            skip_report,
+                            category="broken",
+                            split_name=split_name,
+                            video_path=video_path,
+                            target_label=target_label,
+                            reason=reason,
+                        )
+                        continue
                     try:
                         if payload_future is not None:
                             payload = payload_future.result()
@@ -1609,31 +1742,67 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                             person_detector=person_detector,
                             face_detector=face_detector,
                             detector_batch_size=detector_batch_size,
+                            allow_rejected_pose_fallback=allow_rejected_pose_fallback,
+                            fallback_min_keypoints=fallback_min_keypoints,
+                            fallback_min_detection_confidence=fallback_min_detection_confidence,
+                            fallback_min_person_score=fallback_min_person_score,
                         )
                     except Exception as exc:
+                        reason = "unreadable_video"
                         skipped += 1
+                        register_prepare_skip(
+                            prepare_stats,
+                            split_name=split_name,
+                            label=target_label,
+                            reason=reason,
+                        )
                         append_skip_issue(
                             skip_report,
                             category="broken",
                             split_name=split_name,
                             video_path=video_path,
-                            reason="unreadable_video",
+                            target_label=target_label,
+                            reason=reason,
                             detail=str(exc),
                         )
                         print(f"[prepare] skip unreadable video: {video_path} ({exc})")
                         continue
-                    if sequence["valid_frames"] < min_frames_with_person:
+                    keep_sample, skip_reason, recovery_actions = decide_prepare_sample_usage(
+                        sequence,
+                        sequence_length=sequence_length,
+                        min_frames_with_person=min_frames_with_person,
+                        fallback_min_frames_with_person=fallback_min_frames_with_person,
+                        min_total_keypoints=min_total_keypoints,
+                        max_missing_frames_ratio=max_missing_frames_ratio,
+                        allow_partial_pose=allow_partial_pose,
+                        allow_padding=allow_padding,
+                    )
+                    if not keep_sample:
                         skipped += 1
+                        register_prepare_skip(
+                            prepare_stats,
+                            split_name=split_name,
+                            label=target_label,
+                            reason=skip_reason,
+                        )
                         append_skip_issue(
                             skip_report,
                             category="skipped",
                             split_name=split_name,
                             video_path=video_path,
-                            reason="min_frames_with_person",
+                            target_label=target_label,
+                            reason=skip_reason,
                             valid_frames=int(sequence["valid_frames"]),
                             confirmed_frames=int(sequence["confirmed_frames"]),
+                            total_valid_keypoints=int(sequence.get("total_valid_keypoints", 0) or 0),
                         )
                         continue
+                    register_prepare_used(
+                        prepare_stats,
+                        split_name=split_name,
+                        label=target_label,
+                        recovery_actions=recovery_actions,
+                    )
 
                     pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
                     pose_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1654,7 +1823,15 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                                 "label_idx": label_to_idx[target_label],
                                 "valid_frames": sequence["valid_frames"],
                                 "confirmed_frames": sequence["confirmed_frames"],
+                                "fallback_frames": sequence.get("fallback_frames", 0),
+                                "total_valid_keypoints": sequence.get("total_valid_keypoints", 0),
+                                "avg_pose_confidence": round(
+                                    float(sequence.get("avg_pose_confidence", 0.0) or 0.0),
+                                    6,
+                                ),
                                 "chosen_track_id": sequence["chosen_track_id"],
+                                "recovery_actions": recovery_actions,
+                                "frame_stats": sequence.get("frame_stats", {}),
                             },
                             ensure_ascii=False,
                         )
@@ -1683,6 +1860,27 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         print(f"[prepare] {split_name}: {kept} samples ({skipped} skipped) -> {target_manifest_path}")
         kept_by_split[split_name] = kept
 
+    prepare_summary = finalize_prepare_stats(prepare_stats)
+    skip_report["prepare_summary"] = prepare_summary
+    skip_report["summary"].update(
+        {
+            "total_items": prepare_summary["overall"]["total"],
+            "used_items": prepare_summary["overall"]["used"],
+            "skipped_items": prepare_summary["overall"]["skipped"],
+            "recovered_items": prepare_summary["overall"]["recovered"],
+            "skip_ratio": prepare_summary["overall"]["skip_ratio"],
+            "by_reason": prepare_summary["by_reason"],
+            "by_split": {
+                split_name: split_payload["skipped"]
+                for split_name, split_payload in prepare_summary["by_split"].items()
+            },
+            "by_label": {
+                label: label_payload["skipped"]
+                for label, label_payload in prepare_summary["by_label"].items()
+            },
+        }
+    )
+    print_prepare_summary(prepare_summary)
     write_skip_reports(paths, skip_report)
     summary = skip_report.get("summary", {})
     print(
@@ -1697,6 +1895,255 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         )
 
     return prepared_paths
+
+
+def create_prepare_stats(labels: list[str]) -> dict:
+    return {
+        "labels": list(labels),
+        "overall": Counter(),
+        "by_reason": Counter(),
+        "by_split": defaultdict(Counter),
+        "by_split_reason": defaultdict(Counter),
+        "by_label": defaultdict(Counter),
+        "by_label_reason": defaultdict(Counter),
+        "recovery_actions": Counter(),
+    }
+
+
+def register_prepare_input(stats: dict, *, split_name: str, label: str) -> None:
+    normalized_label = normalize_stats_label(label)
+    stats["overall"]["total"] += 1
+    stats["by_split"][split_name]["total"] += 1
+    stats["by_label"][normalized_label]["total"] += 1
+
+
+def register_prepare_used(
+    stats: dict,
+    *,
+    split_name: str,
+    label: str,
+    recovery_actions: list[str],
+) -> None:
+    normalized_label = normalize_stats_label(label)
+    stats["overall"]["used"] += 1
+    stats["by_split"][split_name]["used"] += 1
+    stats["by_label"][normalized_label]["used"] += 1
+    if recovery_actions:
+        stats["overall"]["recovered"] += 1
+        stats["by_split"][split_name]["recovered"] += 1
+        stats["by_label"][normalized_label]["recovered"] += 1
+        for action in recovery_actions:
+            stats["recovery_actions"][str(action)] += 1
+
+
+def register_prepare_skip(stats: dict, *, split_name: str, label: str, reason: str) -> None:
+    normalized_label = normalize_stats_label(label)
+    normalized_reason = str(reason or "unknown")
+    stats["overall"]["skipped"] += 1
+    stats["by_reason"][normalized_reason] += 1
+    stats["by_split"][split_name]["skipped"] += 1
+    stats["by_split_reason"][split_name][normalized_reason] += 1
+    stats["by_label"][normalized_label]["skipped"] += 1
+    stats["by_label_reason"][normalized_label][normalized_reason] += 1
+
+
+def normalize_stats_label(label: str) -> str:
+    return str(label or "unknown").strip() or "unknown"
+
+
+def decide_prepare_sample_usage(
+    sequence: dict,
+    *,
+    sequence_length: int,
+    min_frames_with_person: int,
+    fallback_min_frames_with_person: int,
+    min_total_keypoints: int,
+    max_missing_frames_ratio: float,
+    allow_partial_pose: bool,
+    allow_padding: bool,
+) -> tuple[bool, str, list[str]]:
+    valid_frames = int(sequence.get("valid_frames", 0) or 0)
+    total_keypoints = int(sequence.get("total_valid_keypoints", 0) or 0)
+    skip_reason = str(sequence.get("skip_reason") or "")
+    if valid_frames <= 0:
+        return False, skip_reason or "person_not_detected", []
+
+    if total_keypoints < max(int(min_total_keypoints), 0):
+        return False, "pose_keypoint_insufficient", []
+
+    missing_ratio = 1.0 - (valid_frames / max(int(sequence_length), 1))
+    if missing_ratio > float(max_missing_frames_ratio) and not allow_padding:
+        return False, "too_many_missing_frames", []
+
+    recovery_actions = list(sequence.get("recovery_actions") or [])
+    if valid_frames >= max(int(min_frames_with_person), 1):
+        if missing_ratio > 0:
+            recovery_actions.append("mask_padding")
+        return True, "", sorted(set(recovery_actions))
+
+    can_recover_partial = (
+        allow_partial_pose
+        and allow_padding
+        and valid_frames >= max(int(fallback_min_frames_with_person), 1)
+    )
+    if can_recover_partial:
+        recovery_actions.extend(["partial_pose_padding", "below_min_frames_recovered"])
+        return True, "", sorted(set(recovery_actions))
+
+    return False, "min_frames_with_person", []
+
+
+def finalize_prepare_stats(stats: dict) -> dict:
+    labels = list(stats.get("labels") or [])
+    overall = counter_to_plain_dict(stats["overall"])
+    normalize_prepare_counter(overall)
+
+    by_split = {
+        split_name: build_prepare_counter_payload(counter)
+        for split_name, counter in sorted(stats["by_split"].items())
+    }
+    by_label = {
+        label: build_prepare_counter_payload(stats["by_label"].get(label, Counter()))
+        for label in labels
+    }
+    for label, counter in sorted(stats["by_label"].items()):
+        if label not in by_label:
+            by_label[label] = build_prepare_counter_payload(counter)
+
+    by_split_reason = {
+        split_name: dict(sorted(counter.items()))
+        for split_name, counter in sorted(stats["by_split_reason"].items())
+    }
+    by_label_reason = {
+        label: dict(sorted(counter.items()))
+        for label, counter in sorted(stats["by_label_reason"].items())
+    }
+    most_lost_class = max(
+        by_label.items(),
+        key=lambda item: (item[1]["skip_ratio"], item[1]["skipped"]),
+        default=(None, None),
+    )
+    used_counts = {label: payload["used"] for label, payload in by_label.items()}
+    original_counts = {label: payload["total"] for label, payload in by_label.items()}
+    return {
+        "overall": overall,
+        "by_reason": dict(sorted(stats["by_reason"].items())),
+        "by_split": by_split,
+        "by_split_reason": by_split_reason,
+        "by_label": by_label,
+        "by_label_reason": by_label_reason,
+        "recovery_actions": dict(sorted(stats["recovery_actions"].items())),
+        "original_class_counts": original_counts,
+        "used_class_counts": used_counts,
+        "most_lost_class": {
+            "label": most_lost_class[0],
+            "skip_ratio": most_lost_class[1]["skip_ratio"] if most_lost_class[1] else 0.0,
+            "skipped": most_lost_class[1]["skipped"] if most_lost_class[1] else 0,
+        },
+        "imbalance": build_prepare_imbalance_summary(original_counts, used_counts),
+    }
+
+
+def build_prepare_counter_payload(counter: Counter) -> dict:
+    payload = counter_to_plain_dict(counter)
+    normalize_prepare_counter(payload)
+    return payload
+
+
+def counter_to_plain_dict(counter: Counter | dict) -> dict:
+    return {
+        "total": int(counter.get("total", 0) or 0),
+        "used": int(counter.get("used", 0) or 0),
+        "skipped": int(counter.get("skipped", 0) or 0),
+        "recovered": int(counter.get("recovered", 0) or 0),
+    }
+
+
+def normalize_prepare_counter(payload: dict) -> None:
+    total = int(payload.get("total", 0) or 0)
+    skipped = int(payload.get("skipped", 0) or 0)
+    used = int(payload.get("used", 0) or 0)
+    payload["skip_ratio"] = round(skipped / total, 6) if total else 0.0
+    payload["use_ratio"] = round(used / total, 6) if total else 0.0
+
+
+def build_prepare_imbalance_summary(original_counts: dict[str, int], used_counts: dict[str, int]) -> dict:
+    original_ratio = compute_count_ratio(original_counts)
+    used_ratio = compute_count_ratio(used_counts)
+    return {
+        "original_ratio": original_ratio,
+        "used_ratio": used_ratio,
+        "worsened_after_skip": (
+            used_ratio is not None
+            and original_ratio is not None
+            and used_ratio > original_ratio
+        ),
+    }
+
+
+def compute_count_ratio(counts: dict[str, int]) -> float | None:
+    nonzero_counts = [int(value) for value in counts.values() if int(value or 0) > 0]
+    if len(nonzero_counts) < 2:
+        return None
+    return round(max(nonzero_counts) / max(min(nonzero_counts), 1), 6)
+
+
+def print_prepare_summary(summary: dict) -> None:
+    overall = summary.get("overall", {})
+    print(
+        "[prepare] data usage "
+        f"total={overall.get('total', 0)} "
+        f"used={overall.get('used', 0)} "
+        f"skipped={overall.get('skipped', 0)} "
+        f"recovered={overall.get('recovered', 0)} "
+        f"skip_ratio={float(overall.get('skip_ratio', 0.0)):.2%}"
+    )
+    by_reason = summary.get("by_reason") or {}
+    if by_reason:
+        print(
+            "[prepare] skip reasons "
+            + ", ".join(f"{reason}={count}" for reason, count in by_reason.items())
+        )
+    if summary.get("recovery_actions"):
+        print(
+            "[prepare] recovery actions "
+            + ", ".join(
+                f"{action}={count}"
+                for action, count in summary["recovery_actions"].items()
+            )
+        )
+    for split_name, payload in summary.get("by_split", {}).items():
+        print(
+            "[prepare] split usage "
+            f"{split_name}: total={payload.get('total', 0)} "
+            f"used={payload.get('used', 0)} "
+            f"skipped={payload.get('skipped', 0)} "
+            f"recovered={payload.get('recovered', 0)} "
+            f"skip_ratio={float(payload.get('skip_ratio', 0.0)):.2%}"
+        )
+    for label, payload in summary.get("by_label", {}).items():
+        print(
+            "[prepare] class usage "
+            f"{label}: total={payload.get('total', 0)} "
+            f"used={payload.get('used', 0)} "
+            f"skipped={payload.get('skipped', 0)} "
+            f"recovered={payload.get('recovered', 0)} "
+            f"skip_ratio={float(payload.get('skip_ratio', 0.0)):.2%}"
+        )
+    most_lost = summary.get("most_lost_class") or {}
+    if most_lost.get("label"):
+        print(
+            "[prepare] most lost class "
+            f"{most_lost['label']} skipped={most_lost.get('skipped', 0)} "
+            f"skip_ratio={float(most_lost.get('skip_ratio', 0.0)):.2%}"
+        )
+    imbalance = summary.get("imbalance") or {}
+    print(
+        "[prepare] imbalance "
+        f"original_ratio={imbalance.get('original_ratio')} "
+        f"used_ratio={imbalance.get('used_ratio')} "
+        f"worsened_after_skip={imbalance.get('worsened_after_skip')}"
+    )
 
 
 def load_existing_current_prepared_manifests(paths: dict) -> dict[str, Path]:
@@ -1750,7 +2197,7 @@ def update_cumulative_manifests(
     job_meta = {
         "job_datasetkey": str(shell_config.get("datasetkey", "")).strip() or None,
         "job_filekey": normalize_requested_filekeys(shell_config.get("filekey")),
-        "job_added_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "job_added_at": datetime.now(UTC).astimezone().isoformat(),
     }
 
     merge_jsonl_entries(
@@ -1841,19 +2288,32 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
         print("[train-manifest] 기존 active manifest를 재사용합니다.")
         return active_paths
 
-    for split_name, source_path in prepared_manifests.items():
+    seen_keys: set[str] = set()
+    split_order = [split_name for split_name in ("train", "val", "test") if split_name in prepared_manifests]
+    split_order.extend(split_name for split_name in prepared_manifests if split_name not in split_order)
+    for split_name in split_order:
+        source_path = prepared_manifests[split_name]
         target_path = active_paths[split_name]
         kept = 0
         skipped = 0
+        duplicate_skipped = 0
         with target_path.open("w", encoding="utf-8") as handle:
             for entry in read_jsonl_entries(source_path):
                 remapped = remap_prepared_entry(entry, label_to_idx=label_to_idx, label_mapping=label_mapping)
                 if remapped is None:
                     skipped += 1
                     continue
+                unique_key = build_manifest_unique_key(remapped)
+                if unique_key in seen_keys:
+                    duplicate_skipped += 1
+                    continue
                 handle.write(json.dumps(remapped, ensure_ascii=False) + "\n")
+                seen_keys.add(unique_key)
                 kept += 1
-        print(f"[train-manifest] {split_name}: {kept} kept ({skipped} filtered) -> {target_path}")
+        print(
+            f"[train-manifest] {split_name}: {kept} kept "
+            f"({skipped} filtered, {duplicate_skipped} duplicate/leakage skipped) -> {target_path}"
+        )
 
     write_active_manifest_state(paths["active_manifest_state"], desired_state)
     return active_paths
@@ -1981,6 +2441,7 @@ def build_active_manifest_state(
     source_manifests: dict[str, Path],
 ) -> dict:
     schema_payload = {
+        "materializer_version": 2,
         "target_labels": list(target_labels),
         "label_mapping": label_mapping,
     }
@@ -2039,7 +2500,8 @@ def write_active_manifest_state(state_path: Path, desired_state: dict) -> None:
         state_path,
         {
             **desired_state,
-            "materialized_at": datetime.now(timezone.utc).astimezone().isoformat(),
+            "materializer_version": 2,
+            "materialized_at": datetime.now(UTC).astimezone().isoformat(),
         },
     )
 

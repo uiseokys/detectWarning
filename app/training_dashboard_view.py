@@ -307,9 +307,10 @@ def _render_actions_panel(
         "</div>"
         "<input type=\"hidden\" id=\"filekeys-input\" name=\"filekeys\" value=\"\" />"
         "<button type=\"submit\" class=\"primary-button\">선택한 filekey 큐 시작 / 추가</button>"
+        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_enqueue_next\" value=\"1\">추천 자동 시작</button>"
         "</form>"
         "<div class=\"action-grid\">"
-        "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">자동 시작 재개</button></form>"
+        "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><input type=\"hidden\" name=\"auto_enqueue_next\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">추천 자동 시작 재개</button></form>"
         "<form method=\"post\" action=\"/actions/pause\"><button type=\"submit\" class=\"secondary-button secondary-button-warn\">현재 작업 후 중지</button></form>"
         "<form method=\"post\" action=\"/actions/force-stop\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">지금 중단</button></form>"
         "<form method=\"post\" action=\"/actions/reset\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">처음부터 다시 시작</button></form>"
@@ -578,7 +579,8 @@ def _render_main_live_sections(
             <article class="panel">
               <div class="panel-head"><div><h2>현재 스킵 이슈</h2><p>이번 작업에서 건너뛴 항목만 따로 모아 보여줍니다.</p></div></div>
               <div class="panel-body">
-                {_render_table(["split", "video", "reason", "valid_frames", "confirmed_frames"], issue_rows, "표시할 현재 스킵 이슈가 없습니다.")}
+                {_render_table(["type", "name", "count"], _build_skip_summary_rows(skip_report), "표시할 현재 스킵 요약이 없습니다.", compact=True)}
+                {_render_table(["split", "label", "video", "reason", "valid_frames", "keypoints", "recovery"], issue_rows, "표시할 현재 스킵 이슈가 없습니다.")}
               </div>
             </article>
           </section>
@@ -739,7 +741,7 @@ def _render_live_refresh_script() -> str:
       return '대기중';
     }
     if (status === 'running') {
-      return '실행중';
+      return '학습중';
     }
     return '미확인';
   }
@@ -809,6 +811,8 @@ def _render_live_refresh_script() -> str:
       '<div class="filekey-chip"><span>전체 filekey</span><strong>' + escapeHtml(stats.total || 0) + '</strong></div>' +
       '<div class="filekey-chip filekey-chip-trainable"><span>학습 가능</span><strong>' + escapeHtml(stats.selectable || 0) + '</strong></div>' +
       '<div class="filekey-chip filekey-chip-trained"><span>학습됨</span><strong>' + escapeHtml(stats.trained || 0) + '</strong></div>' +
+      '<div class="filekey-chip"><span>학습중</span><strong>' + escapeHtml(stats.running || 0) + '</strong></div>' +
+      '<div class="filekey-chip"><span>대기중</span><strong>' + escapeHtml(stats.queued || 0) + '</strong></div>' +
       '<div class="filekey-chip"><span>제외</span><strong>' + escapeHtml(stats.excluded || 0) + '</strong></div>' +
       '<div class="filekey-chip"><span>미확인</span><strong>' + escapeHtml(stats.unknown || 0) + '</strong></div>';
 
@@ -818,6 +822,8 @@ def _render_live_refresh_script() -> str:
         '<strong>' + escapeHtml(item.total || 0) + '개</strong>' +
         '<em>선택 ' + escapeHtml(item.selectable || 0) +
         ' / 학습됨 ' + escapeHtml(item.trained || 0) +
+        ' / 학습중 ' + escapeHtml(item.running || 0) +
+        ' / 대기 ' + escapeHtml(item.queued || 0) +
         ' / 제외 ' + escapeHtml(item.excluded || 0) + '</em>' +
         '</div>';
     }).join('');
@@ -1300,13 +1306,14 @@ def _render_live_refresh_script() -> str:
     });
   }
 
-  async function submitActionForm(form) {
+  async function submitActionForm(form, submitter) {
     if (!form || form.dataset.pending === '1') {
       return;
     }
+    var autoRecommendedStart = !!(submitter && submitter.name === 'auto_enqueue_next');
     if (form.id === 'start-job-form') {
       var selectedFilekeys = syncSelectedFilekeysToForm();
-      if (!selectedFilekeys.length) {
+      if (!selectedFilekeys.length && !autoRecommendedStart) {
         showActionNotice('큐에 넣을 filekey를 먼저 선택해 주세요.', 'warn');
         return;
       }
@@ -1318,6 +1325,9 @@ def _render_live_refresh_script() -> str:
       formData.forEach(function (value, key) {
         encodedBody.append(key, value);
       });
+      if (submitter && submitter.name) {
+        encodedBody.append(submitter.name, submitter.value || '1');
+      }
       var response = await fetch(form.action, {
         method: String(form.method || 'POST').toUpperCase(),
         body: encodedBody,
@@ -1361,7 +1371,7 @@ def _render_live_refresh_script() -> str:
       return;
     }
     event.preventDefault();
-    submitActionForm(form);
+    submitActionForm(form, event.submitter);
   });
 
   document.addEventListener('visibilitychange', function () {
@@ -1517,12 +1527,35 @@ def _build_issue_rows(issues: list[dict], limit: int = 20) -> list[list[str]]:
         rows.append(
             [
                 _split_label(issue.get("split")),
+                _text(issue.get("target_label")),
                 _text(issue.get("video_name")),
                 _text(issue.get("reason")),
                 _int_text(issue.get("valid_frames"), "0"),
-                _int_text(issue.get("confirmed_frames"), "0"),
+                _int_text(issue.get("total_valid_keypoints"), "0"),
+                _text(", ".join(str(action) for action in issue.get("recovery_actions") or []), "-"),
             ]
         )
+    return rows
+
+
+def _build_skip_summary_rows(skip_report: dict, limit: int = 30) -> list[list[str]]:
+    summary = skip_report.get("summary") or {}
+    rows: list[list[str]] = []
+    for group_name, values in (
+        ("reason", summary.get("by_reason") or {}),
+        ("split", summary.get("by_split") or {}),
+        ("label", summary.get("by_label") or {}),
+    ):
+        if not isinstance(values, dict):
+            continue
+        sorted_items = sorted(
+            values.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0])),
+        )
+        for name, count in sorted_items:
+            rows.append([_text(group_name), _text(name), _int_text(count)])
+            if len(rows) >= limit:
+                return rows
     return rows
 
 
@@ -3384,14 +3417,6 @@ def render_dashboard_page(
         continual_state=continual_state,
         element_id="hero-kpis",
     )
-    hero_status_card = _render_hero_status_card(
-        pipeline=pipeline,
-        launcher=launcher,
-        gpu=gpu,
-        latest_loss=latest_loss,
-        element_id="hero-status-card",
-    )
-
     dataset_rows = _build_dataset_rows(dataset)
     current_dataset_rows = _build_dataset_rows(current_dataset)
 
