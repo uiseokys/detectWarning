@@ -281,7 +281,7 @@ def _render_actions_panel(
 
     return (
         "<section class=\"panel sidebar-panel\">"
-        "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>스크립트 없이도 동작하는 기본 입력 폼입니다.</p></div></div>"
+        "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>datasetkey로 파일 목록을 불러온 뒤 선택한 filekey만 큐에 추가합니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
         "<form method=\"post\" action=\"/actions/start\" class=\"stack-form\" id=\"start-job-form\">"
         "<label class=\"field-label\">datasetkey"
@@ -290,10 +290,23 @@ def _render_actions_panel(
         "<label class=\"field-label\">AIHub API 키"
         "<input type=\"password\" id=\"api-key-input\" name=\"api_key\" value=\"\" placeholder=\"필요할 때만 입력\" data-persist-key=\"dashboard.api_key\" />"
         "</label>"
-        "<label class=\"field-label\">filekeys"
-        "<textarea name=\"filekeys\" rows=\"7\" placeholder=\"예:&#10;49841&#10;49842&#10;49843\"></textarea>"
-        "</label>"
-        "<button type=\"submit\" class=\"primary-button\">큐 시작 / 추가</button>"
+        "<div class=\"filekey-lookup\" id=\"filekey-lookup-panel\">"
+        "<div class=\"filekey-lookup-head\">"
+        "<div><strong>AIHub 파일 목록</strong><span id=\"filekey-lookup-status\">datasetkey 대기 중</span></div>"
+        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-lookup-button\">목록 조회</button>"
+        "</div>"
+        "<div class=\"filekey-lookup-summary\" id=\"filekey-lookup-summary\"></div>"
+        "<div class=\"filekey-lookup-zip-groups\" id=\"filekey-lookup-zip-groups\"></div>"
+        "<div class=\"filekey-lookup-filters\" id=\"filekey-lookup-filters\"></div>"
+        "<div class=\"filekey-lookup-groups\" id=\"filekey-lookup-groups\"></div>"
+        "<div class=\"filekey-lookup-actions\">"
+        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-select-trainable-button\">학습 가능 전체 선택</button>"
+        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-clear-selection-button\">선택 해제</button>"
+        "</div>"
+        "<div class=\"filekey-lookup-list\" id=\"filekey-lookup-list\"></div>"
+        "</div>"
+        "<input type=\"hidden\" id=\"filekeys-input\" name=\"filekeys\" value=\"\" />"
+        "<button type=\"submit\" class=\"primary-button\">선택한 filekey 큐 시작 / 추가</button>"
         "</form>"
         "<div class=\"action-grid\">"
         "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">자동 시작 재개</button></form>"
@@ -623,6 +636,12 @@ def _render_live_refresh_script() -> str:
   var delayMs = 1200;
   var disposed = false;
   var noticeTimer = null;
+  var filekeyLookupTimer = null;
+  var filekeyLookupAbort = null;
+  var filekeyLookupRequestId = 0;
+  var lastFilekeyLookupSignature = '';
+  var latestFilekeyLookupPayload = null;
+  var filekeyViewFilters = { outside: true, inside: true, other: true };
   var lastOverviewRevision = document.documentElement.getAttribute('data-overview-revision') || null;
 
   function safeStorage() {
@@ -686,6 +705,416 @@ def _render_live_refresh_script() -> str:
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  function setFilekeyLookupStatus(message, tone) {
+    var status = document.getElementById('filekey-lookup-status');
+    if (!status) {
+      return;
+    }
+    status.textContent = message || '';
+    status.dataset.tone = tone || 'neutral';
+  }
+
+  function clearFilekeyLookup() {
+    ['filekey-lookup-summary', 'filekey-lookup-zip-groups', 'filekey-lookup-filters', 'filekey-lookup-groups', 'filekey-lookup-list'].forEach(function (id) {
+      var node = document.getElementById(id);
+      if (node) {
+        node.innerHTML = '';
+      }
+    });
+  }
+
+  function statusLabel(status) {
+    if (status === 'trainable') {
+      return '학습 가능';
+    }
+    if (status === 'trained') {
+      return '학습됨';
+    }
+    if (status === 'excluded') {
+      return '제외됨';
+    }
+    if (status === 'queued') {
+      return '대기중';
+    }
+    if (status === 'running') {
+      return '실행중';
+    }
+    return '미확인';
+  }
+
+  function viewBucketForZipGroup(group) {
+    var normalized = String(group || '').toLowerCase();
+    if (normalized === 'outsidedoor') {
+      return 'outside';
+    }
+    if (normalized === 'insidedoor' || normalized === 'inside_croki') {
+      return 'inside';
+    }
+    return 'other';
+  }
+
+  function isVisibleByViewFilter(item) {
+    var bucket = viewBucketForZipGroup(item && item.zip_group);
+    return filekeyViewFilters[bucket] !== false;
+  }
+
+  function filteredLookupEntries() {
+    var entries = (latestFilekeyLookupPayload && latestFilekeyLookupPayload.entries) || [];
+    return entries.filter(isVisibleByViewFilter);
+  }
+
+  function renderFilekeyViewFilters(payload) {
+    var container = document.getElementById('filekey-lookup-filters');
+    if (!container) {
+      return;
+    }
+    var entries = (payload && payload.entries) || [];
+    var counts = { outside: 0, inside: 0, other: 0 };
+    entries.forEach(function (item) {
+      counts[viewBucketForZipGroup(item && item.zip_group)] += 1;
+    });
+    var options = [
+      { key: 'outside', label: 'outside', count: counts.outside },
+      { key: 'inside', label: 'inside', count: counts.inside },
+      { key: 'other', label: '기타', count: counts.other }
+    ].filter(function (item) { return item.count > 0; });
+    container.innerHTML = options.map(function (item) {
+      var checked = filekeyViewFilters[item.key] !== false ? ' checked' : '';
+      return '<label class="filekey-filter-option">' +
+        '<input type="checkbox" data-filekey-view-filter="' + escapeHtml(item.key) + '"' + checked + ' />' +
+        '<span>' + escapeHtml(item.label) + '</span>' +
+        '<strong>' + escapeHtml(item.count) + '</strong>' +
+        '</label>';
+    }).join('');
+  }
+
+  function renderFilekeyLookup(payload) {
+    latestFilekeyLookupPayload = payload || null;
+    var summary = document.getElementById('filekey-lookup-summary');
+    var zipGroups = document.getElementById('filekey-lookup-zip-groups');
+    var groups = document.getElementById('filekey-lookup-groups');
+    var list = document.getElementById('filekey-lookup-list');
+    if (!summary || !zipGroups || !groups || !list) {
+      return;
+    }
+
+    var stats = (payload && payload.summary) || {};
+    var entries = (payload && payload.entries) || [];
+    var visibleEntries = entries.filter(isVisibleByViewFilter);
+    var zipGroupItems = (payload && payload.zip_groups) || [];
+    var groupItems = (payload && payload.groups) || [];
+    summary.innerHTML =
+      '<div class="filekey-chip"><span>전체 filekey</span><strong>' + escapeHtml(stats.total || 0) + '</strong></div>' +
+      '<div class="filekey-chip filekey-chip-trainable"><span>학습 가능</span><strong>' + escapeHtml(stats.selectable || 0) + '</strong></div>' +
+      '<div class="filekey-chip filekey-chip-trained"><span>학습됨</span><strong>' + escapeHtml(stats.trained || 0) + '</strong></div>' +
+      '<div class="filekey-chip"><span>제외</span><strong>' + escapeHtml(stats.excluded || 0) + '</strong></div>' +
+      '<div class="filekey-chip"><span>미확인</span><strong>' + escapeHtml(stats.unknown || 0) + '</strong></div>';
+
+    zipGroups.innerHTML = zipGroupItems.map(function (item) {
+      return '<div class="filekey-group filekey-zip-group">' +
+        '<span>' + escapeHtml(item.label || '기타') + '</span>' +
+        '<strong>' + escapeHtml(item.total || 0) + '개</strong>' +
+        '<em>선택 ' + escapeHtml(item.selectable || 0) +
+        ' / 학습됨 ' + escapeHtml(item.trained || 0) +
+        ' / 제외 ' + escapeHtml(item.excluded || 0) + '</em>' +
+        '</div>';
+    }).join('');
+
+    renderFilekeyViewFilters(payload);
+
+    var visibleGroupCounts = {};
+    visibleEntries.forEach(function (item) {
+      var label = item.source_label || item.source_alias || item.matched_source_label || '미분류';
+      visibleGroupCounts[label] = (visibleGroupCounts[label] || 0) + 1;
+    });
+    groups.innerHTML = Object.keys(visibleGroupCounts).sort().map(function (label) {
+      return '<div class="filekey-group">' +
+        '<span>' + escapeHtml(label) + '</span>' +
+        '<strong>' + escapeHtml(visibleGroupCounts[label]) + '개</strong>' +
+        '</div>';
+    }).join('');
+
+    list.innerHTML = visibleEntries.map(function (item, index) {
+      var filekey = String(item.filekey || '');
+      var selectable = item.selectable !== false && item.status !== 'excluded' && item.status !== 'trained' && item.status !== 'queued' && item.status !== 'running';
+      var disabled = selectable ? '' : ' disabled';
+      var checked = '';
+      var title = item.name || item.source_label || item.source_alias || 'AIHub 파일';
+      var metaParts = [];
+      if (item.source_label) {
+        metaParts.push(item.source_label);
+      }
+      if (item.zip_group) {
+        metaParts.push(item.zip_group + (item.zip_number != null ? '_' + item.zip_number : ''));
+      }
+      if (item.target_label) {
+        metaParts.push('target ' + item.target_label);
+      }
+      if (item.excluded_source_label) {
+        metaParts.push('excluded ' + item.excluded_source_label);
+      }
+      if (item.trained_at) {
+        metaParts.push('trained ' + item.trained_at);
+      }
+      if (item.job_state === 'queued') {
+        metaParts.push('queue pending');
+      }
+      if (item.job_state === 'running') {
+        metaParts.push('currently running');
+      }
+      return '<label class="filekey-row">' +
+        '<input type="checkbox" data-filekey="' + escapeHtml(filekey) + '"' + checked + disabled + ' />' +
+        '<span class="filekey-main">' +
+        '<strong>' + escapeHtml(filekey) + ' · ' + escapeHtml(title) + '</strong>' +
+        '<span>' + escapeHtml(metaParts.join(' / ') || '라벨 정보 없음') + '</span>' +
+        '</span>' +
+        '<span class="filekey-badges">' +
+        (item.zip_group ? '<span class="filekey-zip-badge">' + escapeHtml(item.zip_group) + '</span>' : '') +
+        '<span class="filekey-status ' + escapeHtml(item.status || 'unknown') + '">' + escapeHtml(statusLabel(item.status)) + '</span>' +
+        '</span>' +
+        '</label>';
+    }).join('');
+
+    var sourceLabel = payload && payload.source === 'aihubshell' ? 'aihubshell' : 'AIHub API';
+    var cacheLabel = payload && payload.cache && payload.cache.hit ? ' / cache' : '';
+    setFilekeyLookupStatus(sourceLabel + cacheLabel + ' 조회 완료', 'good');
+    writeFilekeys(selectedLookupFilekeys());
+  }
+
+  function selectedLookupFilekeys() {
+    var list = document.getElementById('filekey-lookup-list');
+    if (!list) {
+      return [];
+    }
+    return Array.prototype.slice.call(list.querySelectorAll('input[data-filekey]:checked'))
+      .map(function (input) { return input.getAttribute('data-filekey') || ''; })
+      .filter(Boolean);
+  }
+
+  function selectedVisibleLookupFilekeys() {
+    var visible = {};
+    filteredLookupEntries().forEach(function (item) {
+      if (item && item.filekey) {
+        visible[String(item.filekey)] = true;
+      }
+    });
+    return selectedLookupFilekeys().filter(function (filekey) {
+      return !!visible[filekey];
+    });
+  }
+
+  function writeFilekeys(values) {
+    var input = document.getElementById('filekeys-input');
+    if (!input) {
+      return;
+    }
+    var unique = [];
+    var seen = {};
+    values.forEach(function (value) {
+      var filekey = String(value || '').trim();
+      if (!filekey || seen[filekey]) {
+        return;
+      }
+      seen[filekey] = true;
+      unique.push(filekey);
+    });
+    input.value = unique.join('\\n');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (input.type !== 'hidden') {
+      input.focus();
+    }
+  }
+
+  function setLookupCheckedByFilekeys(values) {
+    var list = document.getElementById('filekey-lookup-list');
+    if (!list) {
+      return;
+    }
+    var selected = {};
+    (values || []).forEach(function (value) {
+      var filekey = String(value || '').trim();
+      if (filekey) {
+        selected[filekey] = true;
+      }
+    });
+    Array.prototype.slice.call(list.querySelectorAll('input[data-filekey]')).forEach(function (input) {
+      if (input.disabled) {
+        input.checked = false;
+        return;
+      }
+      input.checked = !!selected[input.getAttribute('data-filekey') || ''];
+    });
+    writeFilekeys(selectedLookupFilekeys());
+  }
+
+  function clearLookupSelection() {
+    setLookupCheckedByFilekeys([]);
+  }
+
+  function syncSelectedFilekeysToForm() {
+    var selected = selectedVisibleLookupFilekeys();
+    writeFilekeys(selected);
+    return selected;
+  }
+
+  async function lookupAiHubFilekeys(force) {
+    var datasetInput = document.getElementById('datasetkey-input');
+    var apiKeyInput = document.getElementById('api-key-input');
+    if (!datasetInput) {
+      return;
+    }
+    var datasetkey = String(datasetInput.value || '').trim();
+    var apiKey = apiKeyInput ? String(apiKeyInput.value || '').trim() : '';
+    if (!datasetkey) {
+      latestFilekeyLookupPayload = null;
+      lastFilekeyLookupSignature = '';
+      clearFilekeyLookup();
+      setFilekeyLookupStatus('datasetkey 대기 중', 'neutral');
+      return;
+    }
+    var signature = datasetkey + '|' + apiKey;
+    if (!force && signature === lastFilekeyLookupSignature && latestFilekeyLookupPayload) {
+      renderFilekeyLookup(latestFilekeyLookupPayload);
+      return;
+    }
+    lastFilekeyLookupSignature = signature;
+
+    if (filekeyLookupAbort && typeof filekeyLookupAbort.abort === 'function') {
+      filekeyLookupAbort.abort();
+    }
+    filekeyLookupAbort = window.AbortController ? new AbortController() : null;
+    var requestId = ++filekeyLookupRequestId;
+    setFilekeyLookupStatus('파일 목록 조회 중...', 'accent');
+    try {
+      var response = await fetch('/api/aihub/filekeys', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ datasetkey: datasetkey, api_key: apiKey }),
+        signal: filekeyLookupAbort ? filekeyLookupAbort.signal : undefined
+      });
+      var payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+      if (!response.ok || !payload || payload.ok === false) {
+        throw new Error((payload && (payload.detail || payload.message)) || '파일 목록 조회 실패');
+      }
+      if (requestId !== filekeyLookupRequestId) {
+        return;
+      }
+      renderFilekeyLookup(payload);
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        return;
+      }
+      if (requestId !== filekeyLookupRequestId) {
+        return;
+      }
+      latestFilekeyLookupPayload = null;
+      clearFilekeyLookup();
+      setFilekeyLookupStatus((error && error.message) || '파일 목록 조회 실패', 'danger');
+    }
+  }
+
+  function scheduleFilekeyLookup(force, delay) {
+    if (filekeyLookupTimer) {
+      window.clearTimeout(filekeyLookupTimer);
+    }
+    filekeyLookupTimer = window.setTimeout(function () {
+      lookupAiHubFilekeys(!!force);
+    }, typeof delay === 'number' ? delay : 650);
+  }
+
+  function bindFilekeyLookup() {
+    var datasetInput = document.getElementById('datasetkey-input');
+    var apiKeyInput = document.getElementById('api-key-input');
+    var lookupButton = document.getElementById('filekey-lookup-button');
+    var selectTrainableButton = document.getElementById('filekey-select-trainable-button');
+    var clearSelectionButton = document.getElementById('filekey-clear-selection-button');
+    var lookupList = document.getElementById('filekey-lookup-list');
+    var filterContainer = document.getElementById('filekey-lookup-filters');
+    if (!datasetInput) {
+      return;
+    }
+    datasetInput.addEventListener('input', function () {
+      var value = String(datasetInput.value || '').trim();
+      if (!value) {
+        latestFilekeyLookupPayload = null;
+        lastFilekeyLookupSignature = '';
+        clearFilekeyLookup();
+        setFilekeyLookupStatus('datasetkey 대기 중', 'neutral');
+        return;
+      }
+      scheduleFilekeyLookup(false);
+    });
+    datasetInput.addEventListener('change', function () {
+      scheduleFilekeyLookup(true, 0);
+    });
+    if (apiKeyInput) {
+      apiKeyInput.addEventListener('change', function () {
+        scheduleFilekeyLookup(true, 0);
+      });
+    }
+    if (lookupButton) {
+      lookupButton.addEventListener('click', function () {
+        scheduleFilekeyLookup(true, 0);
+      });
+    }
+    if (selectTrainableButton) {
+      selectTrainableButton.addEventListener('click', function () {
+        var values = latestFilekeyLookupPayload && latestFilekeyLookupPayload.trainable_filekeys;
+        values = Array.isArray(values) ? values : [];
+        if (!values.length) {
+          setFilekeyLookupStatus('선택할 학습 가능 filekey가 없습니다.', 'warn');
+          return;
+        }
+        setLookupCheckedByFilekeys(values);
+        setFilekeyLookupStatus(values.length + '개 filekey 선택됨', 'good');
+      });
+    }
+    if (clearSelectionButton) {
+      clearSelectionButton.addEventListener('click', function () {
+        clearLookupSelection();
+        setFilekeyLookupStatus('선택을 해제했습니다.', 'neutral');
+      });
+    }
+    if (lookupList) {
+      lookupList.addEventListener('change', function (event) {
+        if (!event.target || !event.target.matches('input[data-filekey]')) {
+          return;
+        }
+        var values = syncSelectedFilekeysToForm();
+        setFilekeyLookupStatus(values.length + '개 filekey 선택됨', values.length ? 'good' : 'neutral');
+      });
+    }
+    if (filterContainer) {
+      filterContainer.addEventListener('change', function (event) {
+        var target = event.target;
+        if (!target || !target.matches('input[data-filekey-view-filter]')) {
+          return;
+        }
+        var key = target.getAttribute('data-filekey-view-filter');
+        if (key) {
+          filekeyViewFilters[key] = !!target.checked;
+          if (latestFilekeyLookupPayload) {
+            renderFilekeyLookup(latestFilekeyLookupPayload);
+          }
+          var values = syncSelectedFilekeysToForm();
+          setFilekeyLookupStatus(values.length + '개 filekey 선택됨', values.length ? 'good' : 'neutral');
+        }
+      });
+    }
+    if (String(datasetInput.value || '').trim()) {
+      scheduleFilekeyLookup(false, 350);
+    }
   }
 
   function resolveNoticeTone(level) {
@@ -875,6 +1304,13 @@ def _render_live_refresh_script() -> str:
     if (!form || form.dataset.pending === '1') {
       return;
     }
+    if (form.id === 'start-job-form') {
+      var selectedFilekeys = syncSelectedFilekeysToForm();
+      if (!selectedFilekeys.length) {
+        showActionNotice('큐에 넣을 filekey를 먼저 선택해 주세요.', 'warn');
+        return;
+      }
+    }
     setFormPending(form, true);
     try {
       var formData = new FormData(form);
@@ -940,6 +1376,7 @@ def _render_live_refresh_script() -> str:
   });
 
   bindPersistedInputs();
+  bindFilekeyLookup();
   schedule(1200);
 }());
 </script>
@@ -1685,9 +2122,12 @@ def _styles() -> str:
     }
     .sidebar {
       display: grid;
-      grid-template-columns: minmax(360px, 1.2fr) repeat(2, minmax(260px, 1fr));
+      grid-template-columns: minmax(420px, 1.15fr) minmax(340px, 0.85fr);
       gap: 16px;
       align-items: start;
+    }
+    .sidebar > .sidebar-panel:first-child {
+      grid-row: span 2;
     }
     .content {
       display: grid;
@@ -1833,6 +2273,13 @@ def _styles() -> str:
       color: var(--accent);
       border: 1px solid rgba(15,111,255,0.14);
     }
+    .secondary-button-compact {
+      width: auto;
+      padding: 9px 11px;
+      border-radius: 12px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
     .secondary-button-warn {
       background: rgba(217,119,6,0.10);
       color: var(--warn);
@@ -1842,6 +2289,232 @@ def _styles() -> str:
       background: rgba(220,38,38,0.10);
       color: var(--danger);
       border-color: rgba(220,38,38,0.14);
+    }
+    .filekey-lookup {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(15,111,255,0.14);
+      background: rgba(248,251,255,0.72);
+    }
+    .filekey-lookup-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .filekey-lookup-head strong,
+    .filekey-lookup-head span {
+      display: block;
+    }
+    .filekey-lookup-head strong {
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .filekey-lookup-head span {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .filekey-lookup-head span[data-tone="good"] {
+      color: var(--good);
+    }
+    .filekey-lookup-head span[data-tone="accent"] {
+      color: var(--accent);
+    }
+    .filekey-lookup-head span[data-tone="warn"] {
+      color: var(--warn);
+    }
+    .filekey-lookup-head span[data-tone="danger"] {
+      color: var(--danger);
+    }
+    .filekey-lookup-summary,
+    .filekey-lookup-zip-groups,
+    .filekey-lookup-filters,
+    .filekey-lookup-groups {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .filekey-lookup-summary:empty,
+    .filekey-lookup-zip-groups:empty,
+    .filekey-lookup-filters:empty,
+    .filekey-lookup-groups:empty,
+    .filekey-lookup-list:empty {
+      display: none;
+    }
+    .filekey-chip,
+    .filekey-group {
+      min-width: 0;
+      padding: 9px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(148,163,184,0.18);
+      background: rgba(255,255,255,0.72);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .filekey-chip span,
+    .filekey-group span {
+      display: block;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .filekey-chip strong,
+    .filekey-group strong {
+      display: block;
+      margin-top: 2px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    .filekey-chip-trainable {
+      border-color: rgba(5,150,105,0.24);
+      background: rgba(5,150,105,0.08);
+    }
+    .filekey-chip-trainable span,
+    .filekey-chip-trainable strong {
+      color: var(--good);
+    }
+    .filekey-chip-trained {
+      border-color: rgba(67,56,202,0.24);
+      background: rgba(67,56,202,0.08);
+    }
+    .filekey-chip-trained span,
+    .filekey-chip-trained strong {
+      color: #4338ca;
+    }
+    .filekey-group em {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-style: normal;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .filekey-zip-group {
+      border-color: rgba(15,111,255,0.20);
+      background: rgba(15,111,255,0.07);
+    }
+    .filekey-lookup-filters {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .filekey-filter-option {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      padding: 9px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(15,111,255,0.16);
+      background: rgba(255,255,255,0.78);
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--ink);
+    }
+    .filekey-filter-option span {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .filekey-filter-option strong {
+      color: var(--accent);
+      font-size: 12px;
+    }
+    .filekey-lookup-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .filekey-lookup-actions:empty {
+      display: none;
+    }
+    .filekey-lookup-list {
+      display: grid;
+      gap: 8px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+    .filekey-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 9px;
+      align-items: start;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(148,163,184,0.18);
+      background: rgba(255,255,255,0.78);
+    }
+    .filekey-row input {
+      margin-top: 3px;
+    }
+    .filekey-main {
+      min-width: 0;
+    }
+    .filekey-main strong {
+      display: block;
+      font-size: 13px;
+      line-height: 1.35;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .filekey-main span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .filekey-status {
+      padding: 5px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.2;
+      color: var(--accent);
+      background: rgba(15,111,255,0.10);
+      white-space: nowrap;
+    }
+    .filekey-badges {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 5px;
+    }
+    .filekey-zip-badge {
+      padding: 5px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.2;
+      color: #334155;
+      background: rgba(148,163,184,0.16);
+      white-space: nowrap;
+    }
+    .filekey-status.trainable {
+      color: var(--good);
+      background: rgba(5,150,105,0.10);
+    }
+    .filekey-status.excluded {
+      color: var(--danger);
+      background: rgba(220,38,38,0.10);
+    }
+    .filekey-status.trained {
+      color: #4338ca;
+      background: rgba(67,56,202,0.12);
+    }
+    .filekey-status.queued,
+    .filekey-status.running {
+      color: var(--accent);
+      background: rgba(15,111,255,0.12);
+    }
+    .filekey-status.unknown {
+      color: var(--warn);
+      background: rgba(217,119,6,0.10);
     }
     .key-metric-grid {
       display: grid;
@@ -2479,6 +3152,9 @@ def _styles() -> str:
       .sidebar,
       .action-grid {
         grid-template-columns: 1fr;
+      }
+      .sidebar > .sidebar-panel:first-child {
+        grid-row: auto;
       }
       .section-nav {
         top: 8px;

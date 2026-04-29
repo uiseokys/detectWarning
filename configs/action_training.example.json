@@ -32,9 +32,7 @@
       "violence",
       "collapse",
       "abduction",
-      "intrusion_crime",
-      "loitering",
-      "vandalism"
+      "loitering"
     ],
     "label_mapping": {
       "일반행동": "normal",
@@ -64,23 +62,11 @@
       "kidnap": "abduction",
       "kidnapping": "abduction",
       "abduction": "abduction",
-      "절도": "intrusion_crime",
-      "절도(burglary)": "intrusion_crime",
-      "burglary": "intrusion_crime",
-      "침입": "intrusion_crime",
-      "침입(trespass)": "intrusion_crime",
-      "trespass": "intrusion_crime",
-      "강도": "intrusion_crime",
-      "강도(robbery)": "intrusion_crime",
-      "robbery": "intrusion_crime",
       "배회": "loitering",
       "배회(wander)": "loitering",
       "loitering": "loitering",
       "wander": "loitering",
-      "wandering": "loitering",
-      "기물파손": "vandalism",
-      "기물파손(vandalism)": "vandalism",
-      "vandalism": "vandalism"
+      "wandering": "loitering"
     },
     "excluded_source_labels": [
       "주취행동",
@@ -88,7 +74,19 @@
       "drunken",
       "투기",
       "투기(dump)",
-      "dump"
+      "dump",
+      "절도",
+      "절도(burglary)",
+      "burglary",
+      "침입",
+      "침입(trespass)",
+      "trespass",
+      "강도",
+      "강도(robbery)",
+      "robbery",
+      "기물파손",
+      "기물파손(vandalism)",
+      "vandalism"
     ],
     "video_extensions": [
       ".mp4",

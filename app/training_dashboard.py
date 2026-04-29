@@ -22,7 +22,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from action_training_pipeline import get_target_labels, load_config, resolve_paths
+from action_training_pipeline import (
+    build_source_label_matchers,
+    collect_aihub_file_entries,
+    extract_json_payload,
+    fetch_aihub_file_tree,
+    fetch_aihub_file_tree_via_shell,
+    get_target_labels,
+    load_config,
+    match_source_label_text,
+    parse_aihub_file_tree_listing,
+    resolve_aihub_shell_path,
+    resolve_paths,
+)
 from dashboard_runtime import (
     build_job,
     build_retry_job_from,
@@ -91,6 +103,230 @@ OVERVIEW_CURRENT_DATASET_MANIFEST_SPECS = (
     ("prepared_val", "current_prepared_val"),
     ("prepared_test", "current_prepared_test"),
 )
+AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS = 15 * 60
+AIHUB_FILEKEY_LOOKUP_TEXT_KEYS = (
+    "source_label",
+    "source_alias",
+    "sourceLabel",
+    "sourceAlias",
+    "label",
+    "name",
+    "fileName",
+    "fileNm",
+    "filePath",
+    "path",
+)
+AIHUB_FILEKEY_LOOKUP_STATUS_KEYS = (
+    "trainable",
+    "trained",
+    "excluded",
+    "queued",
+    "running",
+    "unknown",
+)
+AIHUB_TRAINED_JOB_STATES = {"completed", "completed_warning"}
+AIHUB_ZIP_GROUP_ORDER = ("outsidedoor", "insidedoor", "inside_croki")
+AIHUB_ZIP_GROUP_PATTERN = re.compile(
+    r"^(?P<group>outsidedoor|insidedoor|inside_croki)(?:[_-](?P<number>\d+))?",
+    re.IGNORECASE,
+)
+
+
+def optional_aihub_api_key(shell_config: dict, override: str = "") -> str:
+    explicit = str(override or "").strip()
+    if explicit:
+        return explicit
+    direct_key = str(shell_config.get("api_key", "")).strip()
+    if direct_key:
+        return direct_key
+    env_name = str(shell_config.get("api_key_env", "AIHUB_API_KEY")).strip()
+    return str(os.environ.get(env_name) or "").strip()
+
+
+def aihub_entry_text(entry: dict) -> str:
+    return " ".join(
+        str(entry.get(key) or "")
+        for key in AIHUB_FILEKEY_LOOKUP_TEXT_KEYS
+        if entry.get(key) not in (None, "")
+    )
+
+
+def aihub_filekey_sort_key(entry: dict) -> tuple[int, int | str]:
+    value = str(entry.get("filekey") or "").strip()
+    if value.isdigit():
+        return (0, int(value))
+    return (1, value)
+
+
+def classify_aihub_zip_name(value: str) -> dict:
+    raw_value = str(value or "").strip()
+    filename = re.split(r"[/\\]", raw_value)[-1].strip()
+    match = AIHUB_ZIP_GROUP_PATTERN.match(filename.lower())
+    if not match:
+        return {
+            "zip_group": "",
+            "zip_number": None,
+            "zip_filename": filename,
+        }
+    number_text = match.group("number")
+    return {
+        "zip_group": match.group("group").lower(),
+        "zip_number": int(number_text) if number_text else None,
+        "zip_filename": filename,
+    }
+
+
+def normalize_aihub_lookup_entries(
+    entries: list[dict],
+    *,
+    label_mapping: dict,
+    excluded_source_labels: list,
+) -> list[dict]:
+    label_matchers = build_source_label_matchers(label_mapping.keys())
+    excluded_matchers = build_source_label_matchers(excluded_source_labels)
+    normalized_entries: list[dict] = []
+
+    for entry in sorted(entries, key=aihub_filekey_sort_key):
+        if not isinstance(entry, dict):
+            continue
+        filekey = str(entry.get("filekey") or "").strip()
+        if not filekey:
+            continue
+
+        entry_text = aihub_entry_text(entry)
+        matched_source_label = match_source_label_text(entry_text, matchers=label_matchers)
+        excluded_source_label = match_source_label_text(entry_text, matchers=excluded_matchers)
+        target_label = str(label_mapping.get(matched_source_label) or "").strip()
+        source_label = str(entry.get("source_label") or entry.get("sourceLabel") or "").strip()
+        source_alias = str(entry.get("source_alias") or entry.get("sourceAlias") or "").strip()
+        name = str(
+            entry.get("name")
+            or entry.get("fileName")
+            or entry.get("fileNm")
+            or entry.get("filePath")
+            or entry.get("path")
+            or ""
+        ).strip()
+        zip_info = classify_aihub_zip_name(name)
+        if excluded_source_label:
+            status = "excluded"
+        elif target_label:
+            status = "trainable"
+        else:
+            status = "unknown"
+
+        normalized_entries.append(
+            {
+                "filekey": filekey,
+                "name": name,
+                "source_label": source_label,
+                "source_alias": source_alias,
+                "matched_source_label": matched_source_label,
+                "target_label": target_label,
+                "excluded_source_label": excluded_source_label,
+                **zip_info,
+                "status": status,
+                "trainable": status == "trainable",
+                "selectable": status in {"trainable", "unknown"},
+            }
+        )
+
+    return normalized_entries
+
+
+def build_aihub_lookup_result(
+    *,
+    datasetkey: str,
+    source: str,
+    entries: list[dict],
+    cache_hit: bool,
+) -> dict:
+    summary = {"total": len(entries)}
+    for key in AIHUB_FILEKEY_LOOKUP_STATUS_KEYS:
+        summary[key] = len([entry for entry in entries if entry.get("status") == key])
+    summary["selectable"] = len([entry for entry in entries if entry.get("selectable")])
+
+    return {
+        "ok": True,
+        "datasetkey": datasetkey,
+        "source": source,
+        "summary": summary,
+        "groups": summarize_aihub_lookup_groups(entries),
+        "zip_groups": summarize_aihub_zip_groups(entries),
+        "entries": entries,
+        "filekeys": [entry["filekey"] for entry in entries],
+        "trainable_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trainable"],
+        "selectable_filekeys": [entry["filekey"] for entry in entries if entry.get("selectable")],
+        "trained_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trained"],
+        "excluded_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "excluded"],
+        "unknown_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "unknown"],
+        "cache": {
+            "hit": bool(cache_hit),
+            "ttl_seconds": AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS,
+        },
+    }
+
+
+def summarize_aihub_zip_groups(entries: list[dict]) -> list[dict]:
+    groups: dict[str, dict] = {
+        label: {
+            "label": label,
+            "total": 0,
+            "selectable": 0,
+            "trained": 0,
+            "excluded": 0,
+            "unknown": 0,
+        }
+        for label in AIHUB_ZIP_GROUP_ORDER
+    }
+    for entry in entries:
+        label = str(entry.get("zip_group") or "기타")
+        group = groups.setdefault(
+            label,
+            {
+                "label": label,
+                "total": 0,
+                "selectable": 0,
+                "trained": 0,
+                "excluded": 0,
+                "unknown": 0,
+            },
+        )
+        group["total"] += 1
+        if entry.get("selectable"):
+            group["selectable"] += 1
+        status = str(entry.get("status") or "unknown")
+        if status in {"trained", "excluded", "unknown"}:
+            group[status] += 1
+
+    ordered_labels = [*AIHUB_ZIP_GROUP_ORDER, *sorted(label for label in groups if label not in AIHUB_ZIP_GROUP_ORDER)]
+    return [groups[label] for label in ordered_labels if groups[label]["total"] > 0]
+
+
+def summarize_aihub_lookup_groups(entries: list[dict]) -> list[dict]:
+    groups: dict[str, dict] = {}
+    for entry in entries:
+        label = (
+            entry.get("source_label")
+            or entry.get("source_alias")
+            or entry.get("matched_source_label")
+            or "미분류"
+        )
+        group = groups.setdefault(
+            str(label),
+            {
+                "label": str(label),
+                "total": 0,
+                "trainable": 0,
+                "excluded": 0,
+                "unknown": 0,
+            },
+        )
+        group["total"] += 1
+        status = str(entry.get("status") or "unknown")
+        if status in {"trainable", "excluded", "unknown"}:
+            group[status] += 1
+    return sorted(groups.values(), key=lambda item: item["label"])
 
 
 def wants_json_response(request: Request | None) -> bool:
@@ -719,6 +955,8 @@ def create_app(config_path: Path) -> FastAPI:
         allow_headers=["*"],
     )
     state_lock = threading.Lock()
+    aihub_filekey_lookup_cache: dict[str, dict] = {}
+    aihub_filekey_lookup_cache_lock = threading.Lock()
 
     launcher_state: dict[str, object] = {
         "process": None,
@@ -5185,6 +5423,183 @@ def create_app(config_path: Path) -> FastAPI:
                 payload[key] = values
         return payload
 
+    def fetch_aihub_file_tree_for_dashboard(datasetkey: str, api_key: str = "") -> tuple[dict | list, str]:
+        shell_config = config.get("aihub_shell", {})
+        if not isinstance(shell_config, dict):
+            shell_config = {}
+        errors: list[str] = []
+
+        try:
+            return fetch_aihub_file_tree(datasetkey=datasetkey), "public_api"
+        except Exception as exc:
+            errors.append(f"public API: {exc}")
+
+        shell_api_key = optional_aihub_api_key(shell_config, api_key)
+        if not shell_api_key:
+            errors.append("aihubshell fallback: API 키가 없어 건너뜀")
+        else:
+            try:
+                shell_path = resolve_aihub_shell_path(shell_config)
+                merged_output = fetch_aihub_file_tree_via_shell(
+                    shell_path=shell_path,
+                    api_key=shell_api_key,
+                    datasetkey=datasetkey,
+                )
+                payload_text = extract_json_payload(merged_output)
+                if payload_text:
+                    return json.loads(payload_text), "aihubshell"
+                listing_entries = parse_aihub_file_tree_listing(merged_output)
+                if listing_entries:
+                    return listing_entries, "aihubshell"
+                errors.append("aihubshell fallback: 파일 목록 응답을 해석하지 못함")
+            except Exception as exc:
+                errors.append(f"aihubshell fallback: {exc}")
+
+        raise RuntimeError(
+            "AIHub 파일 목록 조회에 실패했습니다.\n"
+            f"- datasetkey: {datasetkey}\n"
+            + "\n".join(f"- {message}" for message in errors)
+        )
+
+    def collect_aihub_filekey_job_marks(datasetkey: str) -> dict[str, dict]:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        marks: dict[str, dict] = {}
+
+        def dataset_matches(job: dict) -> bool:
+            job_datasetkey = str(job.get("datasetkey") or "").strip()
+            return not job_datasetkey or not normalized_datasetkey or job_datasetkey == normalized_datasetkey
+
+        def remember(job: dict, status: str, priority: int) -> None:
+            if not isinstance(job, dict) or not dataset_matches(job):
+                return
+            filekey = str(job.get("filekey") or "").strip()
+            if not filekey:
+                return
+            current = marks.get(filekey)
+            if current and int(current.get("priority") or 0) > priority:
+                return
+            marks[filekey] = {
+                "status": status,
+                "priority": priority,
+                "finished_at": job.get("finished_at"),
+                "started_at": job.get("started_at"),
+                "log_path": job.get("log_path"),
+                "job_id": job.get("job_id"),
+            }
+
+        with state_lock:
+            update_process_state()
+            current_job = launcher_state.get("current_job")
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            completed_jobs = launcher_state.get("completed_jobs", [])
+            if isinstance(current_job, dict):
+                remember(snapshot_job(current_job) or current_job, "running", 40)
+            if isinstance(pending_jobs, list):
+                for job in pending_jobs:
+                    remember(snapshot_job(job) or job, "queued", 30)
+            if isinstance(completed_jobs, list):
+                for job in completed_jobs:
+                    if str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+                        remember(snapshot_job(job) or job, "trained", 20)
+
+        history_payload = read_json(launcher_history_path) or {}
+        history_jobs = history_payload.get("completed_jobs", []) if isinstance(history_payload, dict) else []
+        if isinstance(history_jobs, list):
+            for job in history_jobs:
+                if isinstance(job, dict) and str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+                    remember(job, "trained", 20)
+
+        for job in restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir, limit=1000):
+            if str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+                remember(job, "trained", 10)
+
+        return marks
+
+    def apply_aihub_filekey_job_marks(entries: list[dict], datasetkey: str) -> list[dict]:
+        marks = collect_aihub_filekey_job_marks(datasetkey)
+        marked_entries: list[dict] = []
+        for entry in entries:
+            item = dict(entry)
+            filekey = str(item.get("filekey") or "").strip()
+            mark = marks.get(filekey)
+            item["base_status"] = item.get("status") or "unknown"
+            if mark:
+                item["status"] = mark.get("status") or item["base_status"]
+                item["trainable"] = False
+                item["selectable"] = False
+                item["job_state"] = mark.get("status")
+                item["job_id"] = mark.get("job_id")
+                item["trained_at"] = mark.get("finished_at")
+                item["started_at"] = mark.get("started_at")
+                item["log_path"] = mark.get("log_path")
+            else:
+                item["selectable"] = item.get("status") in {"trainable", "unknown"}
+            marked_entries.append(item)
+        return marked_entries
+
+    def lookup_aihub_filekeys_request(payload: dict) -> dict:
+        datasetkey = str(payload.get("datasetkey", "")).strip()
+        if not datasetkey:
+            raise HTTPException(status_code=400, detail="datasetkey를 입력해 주세요.")
+
+        now = time.time()
+        with aihub_filekey_lookup_cache_lock:
+            cached = aihub_filekey_lookup_cache.get(datasetkey)
+            if (
+                isinstance(cached, dict)
+                and now - float(cached.get("timestamp") or 0.0) < AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS
+                and isinstance(cached.get("value"), dict)
+            ):
+                cached_value = cached["value"]
+                entries = apply_aihub_filekey_job_marks(
+                    list(cached_value.get("entries") or []),
+                    datasetkey,
+                )
+                return build_aihub_lookup_result(
+                    datasetkey=datasetkey,
+                    source=str(cached_value.get("source") or "cache"),
+                    entries=entries,
+                    cache_hit=True,
+                )
+
+        api_key = str(payload.get("api_key", "")).strip()
+        try:
+            raw_payload, source = fetch_aihub_file_tree_for_dashboard(datasetkey, api_key=api_key)
+            collected_entries = collect_aihub_file_entries(raw_payload)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        dataset_config = config.get("dataset", {})
+        if not isinstance(dataset_config, dict):
+            dataset_config = {}
+        label_mapping = dataset_config.get("label_mapping", {})
+        if not isinstance(label_mapping, dict):
+            label_mapping = {}
+        excluded_source_labels = dataset_config.get("excluded_source_labels", [])
+        if not isinstance(excluded_source_labels, list):
+            excluded_source_labels = []
+
+        entries = normalize_aihub_lookup_entries(
+            collected_entries,
+            label_mapping=label_mapping,
+            excluded_source_labels=excluded_source_labels,
+        )
+        result = build_aihub_lookup_result(
+            datasetkey=datasetkey,
+            source=source,
+            entries=apply_aihub_filekey_job_marks(entries, datasetkey),
+            cache_hit=False,
+        )
+        with aihub_filekey_lookup_cache_lock:
+            aihub_filekey_lookup_cache[datasetkey] = {
+                "timestamp": now,
+                "value": {
+                    "source": source,
+                    "entries": entries,
+                },
+            }
+        return result
+
     def start_training_request(payload: dict) -> dict:
         if str(config.get("dataset_source", "")).strip().lower() != "aihub_shell":
             raise HTTPException(
@@ -5548,6 +5963,25 @@ def create_app(config_path: Path) -> FastAPI:
             },
             headers=NO_CACHE_HEADERS,
         )
+
+    @app.get("/api/aihub/filekeys")
+    def lookup_aihub_filekeys_get(request: Request, datasetkey: str = "") -> JSONResponse:
+        ensure_dashboard_control_access(request)
+        return JSONResponse(
+            lookup_aihub_filekeys_request({"datasetkey": datasetkey}),
+            headers=NO_CACHE_HEADERS,
+        )
+
+    @app.post("/api/aihub/filekeys")
+    async def lookup_aihub_filekeys(request: Request) -> JSONResponse:
+        ensure_dashboard_control_access(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = await read_form_payload(request)
+        if not isinstance(payload, dict):
+            payload = {}
+        return JSONResponse(lookup_aihub_filekeys_request(payload), headers=NO_CACHE_HEADERS)
 
     @app.post("/api/start")
     async def start_training(request: Request) -> dict:
