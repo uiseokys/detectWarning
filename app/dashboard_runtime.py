@@ -179,6 +179,21 @@ def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> 
     pipeline_status = read_json(paths["pipeline_status"]) or {}
     pipeline_state = str(pipeline_status.get("state", "")).strip().lower()
     pipeline_stage = str(pipeline_status.get("stage", "")).strip().lower()
+    training_progress_path = paths.get("training_progress")
+    if training_progress_path:
+        training_progress = read_json(training_progress_path) or {}
+    else:
+        training_progress = {}
+    training_progress_state = str(training_progress.get("state", "")).strip().lower()
+    artifacts_dir = paths.get("artifacts_dir")
+    has_completed_artifacts = False
+    if artifacts_dir is not None:
+        artifacts_dir = Path(artifacts_dir)
+        has_completed_artifacts = (
+            (artifacts_dir / "best_action_model.pt").exists()
+            and (artifacts_dir / "metrics.json").exists()
+            and (artifacts_dir / "labels.json").exists()
+        )
     log_tail = read_log_tail(current_job.get("log_path") if isinstance(current_job, dict) else None, max_lines=60, max_chars=6000)
     success_markers = (
         "[train] best model:",
@@ -186,6 +201,9 @@ def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> 
         "[train] labels:",
     )
     has_success_markers = any(marker in log_tail for marker in success_markers)
+
+    if pipeline_state == "completed" and training_progress_state == "completed" and has_completed_artifacts:
+        return "completed", "현재 작업은 학습 산출물이 확인되어 정상 완료되었습니다."
 
     if pipeline_state == "completed" or pipeline_stage == "completed" or has_success_markers:
         return (

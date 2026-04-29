@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from reporting import analyze_class_balance, write_json_atomic
 
 DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE = "pin_memory_device" in inspect.signature(DataLoader).parameters
+POSE_COORD_CLIP_RANGE = (-0.5, 1.5)
+POSE_CONFIDENCE_CLIP_RANGE = (0.0, 1.0)
 
 
 @dataclass
@@ -71,12 +73,34 @@ class PoseSequenceDataset(Dataset):
         with np.load(pose_path, allow_pickle=False) as loaded:
             pose = np.asarray(loaded["pose"], dtype=np.float32)
             mask = np.asarray(loaded["mask"], dtype=np.float32)
+        pose, mask = _sanitize_pose_arrays(pose, mask)
         label_idx = int(sample["label_idx"])
         return (
             torch.from_numpy(pose),
             torch.from_numpy(mask),
             torch.tensor(label_idx, dtype=torch.long),
         )
+
+
+def _sanitize_pose_arrays(pose: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    pose = np.nan_to_num(
+        np.asarray(pose, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    mask = np.nan_to_num(
+        np.asarray(mask, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    if pose.ndim >= 1 and pose.shape[-1] >= 2:
+        pose[..., 0:2] = np.clip(pose[..., 0:2], *POSE_COORD_CLIP_RANGE)
+    if pose.ndim >= 1 and pose.shape[-1] >= 3:
+        pose[..., 2] = np.clip(pose[..., 2], *POSE_CONFIDENCE_CLIP_RANGE)
+    mask = np.clip(mask, 0.0, 1.0)
+    return pose.astype(np.float32, copy=False), mask.astype(np.float32, copy=False)
 
 
 class TemporalPoseClassifier(nn.Module):
@@ -572,9 +596,14 @@ def train_action_classifier(
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
             "val_loss": round(val_metrics["loss"], 6),
+            "val_cross_entropy_loss": round(val_metrics["cross_entropy_loss"], 6),
             "val_accuracy": round(val_metrics["accuracy"], 6),
             "val_macro_f1": round(val_metrics["macro_f1"], 6),
+            "val_macro_f1_supported": round(val_metrics["macro_f1_supported"], 6),
+            "val_balanced_accuracy": round(val_metrics["balanced_accuracy"], 6),
             "val_loss_gap": round(val_metrics["loss"] - train_loss, 6),
+            "val_mean_true_confidence": round(val_metrics["mean_true_confidence"], 6),
+            "val_mean_pred_confidence": round(val_metrics["mean_pred_confidence"], 6),
             "learning_rate": round(current_lr, 8),
         }
         history.append(epoch_metrics)
@@ -585,6 +614,7 @@ def train_action_classifier(
             f"(epoch {epoch}/{epochs}) "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_metrics['loss']:.4f} "
+            f"val_ce={val_metrics['cross_entropy_loss']:.4f} "
             f"val_acc={val_metrics['accuracy']:.4f} "
             f"val_f1={val_metrics['macro_f1']:.4f}"
         )
@@ -607,6 +637,7 @@ def train_action_classifier(
                     "dropout": dropout,
                     "best_epoch": best_epoch,
                     "best_val_macro_f1": round(best_val_f1, 6),
+                    "best_validation": val_metrics,
                     "training_options": training_options,
                 },
             )
@@ -1106,7 +1137,10 @@ def _evaluate(
 ) -> dict:
     model.eval()
     total_loss = 0.0
+    total_cross_entropy_loss = 0.0
     total_items = 0
+    true_confidence_total = 0.0
+    pred_confidence_total = 0.0
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     misclassified: list[dict] = []
     dataset_samples = getattr(loader.dataset, "samples", [])
@@ -1120,10 +1154,18 @@ def _evaluate(
         with _autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype):
             logits = model(pose, mask)
             loss_values = criterion(logits, labels)
+        logits_for_metrics = logits.float()
+        cross_entropy_loss_values = F.cross_entropy(logits_for_metrics, labels, reduction="none")
+        probabilities = F.softmax(logits_for_metrics, dim=1)
         preds = logits.argmax(dim=1)
 
         batch_size = int(labels.shape[0])
         total_loss += _sum_loss(loss_values, batch_size=batch_size)
+        total_cross_entropy_loss += float(cross_entropy_loss_values.detach().sum().item())
+        true_confidence_total += float(
+            probabilities.gather(1, labels.view(-1, 1)).detach().sum().item()
+        )
+        pred_confidence_total += float(probabilities.max(dim=1).values.detach().sum().item())
         total_items += batch_size
 
         true_np = labels.detach().cpu().numpy()
@@ -1152,10 +1194,15 @@ def _evaluate(
 
     accuracy = float(np.trace(confusion) / max(confusion.sum(), 1))
     macro_f1, per_class = _compute_f1(confusion, labels=label_names)
+    classification_summary = _summarize_classification_metrics(per_class)
     return {
         "loss": total_loss / max(total_items, 1),
+        "cross_entropy_loss": total_cross_entropy_loss / max(total_items, 1),
         "accuracy": accuracy,
         "macro_f1": macro_f1,
+        **classification_summary,
+        "mean_true_confidence": true_confidence_total / max(total_items, 1),
+        "mean_pred_confidence": pred_confidence_total / max(total_items, 1),
         "confusion_matrix": confusion.tolist(),
         "per_class": per_class,
         "misclassified_examples": misclassified,
@@ -1186,6 +1233,26 @@ def _compute_f1(confusion: np.ndarray, *, labels: list[str] | None = None) -> tu
         f1_scores.append(f1)
     macro_f1 = float(sum(f1_scores) / max(len(f1_scores), 1))
     return macro_f1, metrics
+
+
+def _summarize_classification_metrics(per_class: list[dict]) -> dict:
+    supported_rows = [
+        row for row in per_class
+        if int(row.get("support", 0) or 0) > 0
+    ]
+    zero_support_labels = [
+        str(row.get("label") or row.get("class_index"))
+        for row in per_class
+        if int(row.get("support", 0) or 0) <= 0
+    ]
+    supported_f1 = [float(row.get("f1", 0.0) or 0.0) for row in supported_rows]
+    supported_recall = [float(row.get("recall", 0.0) or 0.0) for row in supported_rows]
+    return {
+        "macro_f1_supported": float(sum(supported_f1) / max(len(supported_f1), 1)),
+        "balanced_accuracy": float(sum(supported_recall) / max(len(supported_recall), 1)),
+        "zero_support_labels": zero_support_labels,
+        "supported_class_count": len(supported_rows),
+    }
 
 
 def _load_compatible_state_dict(model: nn.Module, checkpoint_state: dict) -> tuple[int, list[str]]:
@@ -1256,7 +1323,7 @@ def _resolve_num_workers(value: int | str, *, batch_size: int) -> int:
     else:
         requested = max(int(value), 0)
 
-    if requested is not None and requested > 0:
+    if requested is not None:
         return requested
 
     cpu_count = os.cpu_count() or 2

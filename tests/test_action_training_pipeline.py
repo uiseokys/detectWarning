@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from action_training_pipeline import (
     DownloadedItem,
+    build_prepared_quality_rules,
+    check_prepared_entry_quality,
     compute_split_counts,
     create_prepare_stats,
     decide_prepare_sample_usage,
@@ -111,6 +113,57 @@ class ActionTrainingPipelineTests(unittest.TestCase):
         self.assertEqual(reason, "min_frames_with_person")
         self.assertEqual(recovery_actions, [])
 
+    def test_decide_prepare_sample_usage_enforces_missing_ratio_even_with_padding(self) -> None:
+        keep, reason, recovery_actions = decide_prepare_sample_usage(
+            {
+                "valid_frames": 3,
+                "confirmed_frames": 3,
+                "total_valid_keypoints": 30,
+                "recovery_actions": [],
+            },
+            sequence_length=48,
+            min_frames_with_person=4,
+            fallback_min_frames_with_person=1,
+            min_total_keypoints=1,
+            max_missing_frames_ratio=0.5,
+            allow_partial_pose=True,
+            allow_padding=True,
+        )
+
+        self.assertFalse(keep)
+        self.assertEqual(reason, "too_many_missing_frames")
+        self.assertEqual(recovery_actions, [])
+
+    def test_prepared_quality_rules_filter_existing_low_quality_entries(self) -> None:
+        rules = build_prepared_quality_rules(
+            {
+                "preprocess": {
+                    "sequence_length": 48,
+                    "min_frames_with_person": 8,
+                    "fallback_min_frames_with_person": 4,
+                    "min_confirmed_frames_with_person": 2,
+                    "max_missing_frames_ratio": 0.85,
+                    "max_fallback_frames_ratio": 0.6,
+                    "min_total_keypoints": 32,
+                    "allow_partial_pose": True,
+                    "allow_padding": True,
+                }
+            }
+        )
+
+        keep, reason = check_prepared_entry_quality(
+            {
+                "valid_frames": 3,
+                "confirmed_frames": 3,
+                "fallback_frames": 0,
+                "total_valid_keypoints": 30,
+            },
+            rules,
+        )
+
+        self.assertFalse(keep)
+        self.assertEqual(reason, "pose_keypoint_insufficient")
+
     def test_finalize_prepare_stats_reports_class_skip_ratios(self) -> None:
         stats = create_prepare_stats(["normal", "violence"])
         register_prepare_input(stats, split_name="train", label="normal")
@@ -142,6 +195,50 @@ class ActionTrainingPipelineTests(unittest.TestCase):
             }
             train_source.write_text(json.dumps(duplicate_entry, ensure_ascii=False) + "\n", encoding="utf-8")
             val_source.write_text(json.dumps(duplicate_entry, ensure_ascii=False) + "\n", encoding="utf-8")
+            test_source.write_text("", encoding="utf-8")
+            paths = {
+                "active_prepared_train": manifests / "active_train.jsonl",
+                "active_prepared_val": manifests / "active_val.jsonl",
+                "active_prepared_test": manifests / "active_test.jsonl",
+                "active_manifest_state": manifests / "active_state.json",
+            }
+
+            active_paths = materialize_training_manifests(
+                {"dataset": {"target_labels": ["normal"], "label_mapping": {"normal": "normal"}}},
+                paths,
+                {"train": train_source, "val": val_source, "test": test_source},
+            )
+
+            train_rows = list(iter_jsonl_entries(active_paths["train"]))
+            val_rows = list(iter_jsonl_entries(active_paths["val"]))
+
+        self.assertEqual(len(train_rows), 1)
+        self.assertEqual(val_rows, [])
+
+    def test_materialize_training_manifests_removes_same_video_with_different_pose_paths(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            manifests = workspace / "manifests"
+            manifests.mkdir()
+            train_source = manifests / "prepared_train.jsonl"
+            val_source = manifests / "prepared_val.jsonl"
+            test_source = manifests / "prepared_test.jsonl"
+            base_entry = {
+                "item_id": "same-video",
+                "source_label": "normal",
+                "target_label": "normal",
+                "label_idx": 0,
+                "video_path": str(workspace / "raw" / "same.mp4"),
+                "metadata": {"relative_path": "same.mp4"},
+            }
+            train_source.write_text(
+                json.dumps({**base_entry, "pose_path": str(workspace / "train" / "same.npz")}) + "\n",
+                encoding="utf-8",
+            )
+            val_source.write_text(
+                json.dumps({**base_entry, "pose_path": str(workspace / "val" / "same.npz")}) + "\n",
+                encoding="utf-8",
+            )
             test_source.write_text("", encoding="utf-8")
             paths = {
                 "active_prepared_train": manifests / "active_train.jsonl",

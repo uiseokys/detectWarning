@@ -1581,9 +1581,20 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     strict_data_validation = bool(preprocess_config.get("strict_data_validation", False))
     min_frames_with_person = int(preprocess_config.get("min_frames_with_person", 4))
     fallback_min_frames_with_person = int(preprocess_config.get("fallback_min_frames_with_person", 1))
+    min_confirmed_frames_with_person = int(preprocess_config.get("min_confirmed_frames_with_person", 0))
     min_total_keypoints = int(preprocess_config.get("min_total_keypoints", 1))
-    max_missing_frames_ratio = float(preprocess_config.get("max_missing_frames_ratio", 0.98))
-    allow_partial_pose = bool(preprocess_config.get("allow_partial_pose", True)) and not strict_data_validation
+    max_missing_frames_ratio = max(
+        0.0,
+        min(float(preprocess_config.get("max_missing_frames_ratio", 0.98)), 1.0),
+    )
+    max_fallback_frames_ratio = max(
+        0.0,
+        min(float(preprocess_config.get("max_fallback_frames_ratio", 1.0)), 1.0),
+    )
+    allow_partial_pose = (
+        bool(preprocess_config.get("allow_partial_pose", True))
+        and not strict_data_validation
+    )
     allow_padding = bool(preprocess_config.get("allow_padding", True)) and not strict_data_validation
     allow_rejected_pose_fallback = (
         bool(preprocess_config.get("allow_rejected_pose_fallback", True))
@@ -1772,8 +1783,10 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         sequence_length=sequence_length,
                         min_frames_with_person=min_frames_with_person,
                         fallback_min_frames_with_person=fallback_min_frames_with_person,
+                        min_confirmed_frames_with_person=min_confirmed_frames_with_person,
                         min_total_keypoints=min_total_keypoints,
                         max_missing_frames_ratio=max_missing_frames_ratio,
+                        max_fallback_frames_ratio=max_fallback_frames_ratio,
                         allow_partial_pose=allow_partial_pose,
                         allow_padding=allow_padding,
                     )
@@ -1961,8 +1974,12 @@ def decide_prepare_sample_usage(
     max_missing_frames_ratio: float,
     allow_partial_pose: bool,
     allow_padding: bool,
+    min_confirmed_frames_with_person: int = 0,
+    max_fallback_frames_ratio: float = 1.0,
 ) -> tuple[bool, str, list[str]]:
     valid_frames = int(sequence.get("valid_frames", 0) or 0)
+    confirmed_frames = int(sequence.get("confirmed_frames", 0) or 0)
+    fallback_frames = int(sequence.get("fallback_frames", 0) or 0)
     total_keypoints = int(sequence.get("total_valid_keypoints", 0) or 0)
     skip_reason = str(sequence.get("skip_reason") or "")
     if valid_frames <= 0:
@@ -1972,8 +1989,13 @@ def decide_prepare_sample_usage(
         return False, "pose_keypoint_insufficient", []
 
     missing_ratio = 1.0 - (valid_frames / max(int(sequence_length), 1))
-    if missing_ratio > float(max_missing_frames_ratio) and not allow_padding:
+    if missing_ratio > float(max_missing_frames_ratio):
         return False, "too_many_missing_frames", []
+    if confirmed_frames < max(int(min_confirmed_frames_with_person), 0):
+        return False, "confirmed_frames_insufficient", []
+    fallback_ratio = fallback_frames / max(valid_frames, 1)
+    if fallback_ratio > float(max_fallback_frames_ratio):
+        return False, "too_many_fallback_frames", []
 
     recovery_actions = list(sequence.get("recovery_actions") or [])
     if valid_frames >= max(int(min_frames_with_person), 1):
@@ -2266,10 +2288,15 @@ def update_cumulative_manifests(
     )
 
 
-def materialize_training_manifests(config: dict, paths: dict, prepared_manifests: dict[str, Path]) -> dict[str, Path]:
+def materialize_training_manifests(
+    config: dict,
+    paths: dict,
+    prepared_manifests: dict[str, Path],
+) -> dict[str, Path]:
     target_labels = get_target_labels(config)
     label_to_idx = {label: index for index, label in enumerate(target_labels)}
     label_mapping = config.get("dataset", {}).get("label_mapping", {}) or {}
+    quality_rules = build_prepared_quality_rules(config)
     active_paths = {
         "train": paths["active_prepared_train"],
         "val": paths["active_prepared_val"],
@@ -2278,6 +2305,7 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
     desired_state = build_active_manifest_state(
         target_labels=target_labels,
         label_mapping=label_mapping,
+        quality_rules=quality_rules,
         source_manifests=prepared_manifests,
     )
     if active_manifests_are_current(
@@ -2296,12 +2324,19 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
         target_path = active_paths[split_name]
         kept = 0
         skipped = 0
+        quality_skipped = 0
         duplicate_skipped = 0
+        quality_skip_reasons: Counter[str] = Counter()
         with target_path.open("w", encoding="utf-8") as handle:
             for entry in read_jsonl_entries(source_path):
                 remapped = remap_prepared_entry(entry, label_to_idx=label_to_idx, label_mapping=label_mapping)
                 if remapped is None:
                     skipped += 1
+                    continue
+                quality_keep, quality_reason = check_prepared_entry_quality(remapped, quality_rules)
+                if not quality_keep:
+                    quality_skipped += 1
+                    quality_skip_reasons[quality_reason] += 1
                     continue
                 unique_key = build_manifest_unique_key(remapped)
                 if unique_key in seen_keys:
@@ -2310,9 +2345,15 @@ def materialize_training_manifests(config: dict, paths: dict, prepared_manifests
                 handle.write(json.dumps(remapped, ensure_ascii=False) + "\n")
                 seen_keys.add(unique_key)
                 kept += 1
+        quality_summary = ""
+        if quality_skipped:
+            quality_summary = ", quality reasons: " + ", ".join(
+                f"{reason}={count}" for reason, count in sorted(quality_skip_reasons.items())
+            )
         print(
             f"[train-manifest] {split_name}: {kept} kept "
-            f"({skipped} filtered, {duplicate_skipped} duplicate/leakage skipped) -> {target_path}"
+            f"({skipped} label filtered, {quality_skipped} quality filtered, "
+            f"{duplicate_skipped} duplicate/leakage skipped{quality_summary}) -> {target_path}"
         )
 
     write_active_manifest_state(paths["active_manifest_state"], desired_state)
@@ -2335,6 +2376,68 @@ def remap_prepared_entry(entry: dict, *, label_to_idx: dict[str, int], label_map
     mapped_entry["target_label"] = target_label
     mapped_entry["label_idx"] = int(label_to_idx[target_label])
     return mapped_entry
+
+
+def build_prepared_quality_rules(config: dict) -> dict:
+    preprocess_config = config.get("preprocess", {}) or {}
+    if not bool(preprocess_config.get("filter_existing_prepared_by_quality", True)):
+        return {"enabled": False}
+    strict_data_validation = bool(preprocess_config.get("strict_data_validation", False))
+    return {
+        "enabled": True,
+        "sequence_length": max(int(preprocess_config.get("sequence_length", 48)), 1),
+        "min_frames_with_person": int(preprocess_config.get("min_frames_with_person", 4)),
+        "fallback_min_frames_with_person": int(preprocess_config.get("fallback_min_frames_with_person", 1)),
+        "min_confirmed_frames_with_person": int(preprocess_config.get("min_confirmed_frames_with_person", 0)),
+        "min_total_keypoints": int(preprocess_config.get("min_total_keypoints", 1)),
+        "max_missing_frames_ratio": max(
+            0.0,
+            min(float(preprocess_config.get("max_missing_frames_ratio", 0.98)), 1.0),
+        ),
+        "max_fallback_frames_ratio": max(
+            0.0,
+            min(float(preprocess_config.get("max_fallback_frames_ratio", 1.0)), 1.0),
+        ),
+        "allow_partial_pose": (
+            bool(preprocess_config.get("allow_partial_pose", True))
+            and not strict_data_validation
+        ),
+        "allow_padding": bool(preprocess_config.get("allow_padding", True)) and not strict_data_validation,
+    }
+
+
+def check_prepared_entry_quality(entry: dict, rules: dict) -> tuple[bool, str]:
+    if not rules.get("enabled"):
+        return True, ""
+    valid_frames = optional_int(entry.get("valid_frames"))
+    if valid_frames is None:
+        return True, ""
+    sequence = {
+        "valid_frames": valid_frames,
+        "confirmed_frames": optional_int(entry.get("confirmed_frames")) or 0,
+        "fallback_frames": optional_int(entry.get("fallback_frames")) or 0,
+        "total_valid_keypoints": optional_int(entry.get("total_valid_keypoints")) or 0,
+    }
+    keep, reason, _recovery_actions = decide_prepare_sample_usage(
+        sequence,
+        sequence_length=int(rules["sequence_length"]),
+        min_frames_with_person=int(rules["min_frames_with_person"]),
+        fallback_min_frames_with_person=int(rules["fallback_min_frames_with_person"]),
+        min_total_keypoints=int(rules["min_total_keypoints"]),
+        max_missing_frames_ratio=float(rules["max_missing_frames_ratio"]),
+        allow_partial_pose=bool(rules["allow_partial_pose"]),
+        allow_padding=bool(rules["allow_padding"]),
+        min_confirmed_frames_with_person=int(rules["min_confirmed_frames_with_person"]),
+        max_fallback_frames_ratio=float(rules["max_fallback_frames_ratio"]),
+    )
+    return keep, reason
+
+
+def optional_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def merge_jsonl_entries(source_path: Path, target_path: Path, *, extra_fields: dict | None = None) -> int:
@@ -2408,20 +2511,26 @@ def append_jsonl_entries(path: Path, entries: list[dict]) -> None:
 
 def build_manifest_unique_key(entry: dict) -> str:
     metadata = entry.get("metadata") or {}
-    pose_path = entry.get("pose_path")
-    if pose_path:
-        return f"pose::{pose_path}"
     relative_path = metadata.get("relative_path")
     if relative_path:
-        return f"relative::{relative_path}"
+        return f"relative::{normalize_manifest_identity(relative_path)}"
     source_path = metadata.get("source_path")
     if source_path:
-        return f"source::{source_path}"
+        return f"source::{normalize_manifest_identity(source_path)}"
+    video_path = entry.get("video_path")
+    if video_path:
+        return f"video::{normalize_manifest_identity(video_path)}"
     item_id = entry.get("item_id")
-    target_label = entry.get("target_label")
     if item_id:
-        return f"item::{item_id}::{target_label}"
+        return f"item::{normalize_manifest_identity(item_id)}"
+    pose_path = entry.get("pose_path")
+    if pose_path:
+        return f"pose::{normalize_manifest_identity(pose_path)}"
     return json.dumps(entry, sort_keys=True, ensure_ascii=False)
+
+
+def normalize_manifest_identity(value) -> str:
+    return str(value or "").strip().replace("\\", "/")
 
 
 def count_manifest_lines(path: Path) -> int:
@@ -2439,11 +2548,13 @@ def build_active_manifest_state(
     target_labels: list[str],
     label_mapping: dict,
     source_manifests: dict[str, Path],
+    quality_rules: dict | None = None,
 ) -> dict:
     schema_payload = {
-        "materializer_version": 2,
+        "materializer_version": 3,
         "target_labels": list(target_labels),
         "label_mapping": label_mapping,
+        "quality_rules": quality_rules or {},
     }
     schema_fingerprint = hashlib.sha1(
         json.dumps(schema_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -2479,7 +2590,12 @@ def build_manifest_signature(path: Path) -> dict:
     }
 
 
-def active_manifests_are_current(*, state_path: Path, active_paths: dict[str, Path], desired_state: dict) -> bool:
+def active_manifests_are_current(
+    *,
+    state_path: Path,
+    active_paths: dict[str, Path],
+    desired_state: dict,
+) -> bool:
     if not all(path.exists() for path in active_paths.values()):
         return False
     if not state_path.exists():
@@ -2500,7 +2616,7 @@ def write_active_manifest_state(state_path: Path, desired_state: dict) -> None:
         state_path,
         {
             **desired_state,
-            "materializer_version": 2,
+            "materializer_version": 3,
             "materialized_at": datetime.now(UTC).astimezone().isoformat(),
         },
     )

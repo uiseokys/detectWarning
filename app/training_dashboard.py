@@ -67,6 +67,7 @@ from reporting import (
     write_json_atomic,
 )
 from training_config import resolve_pages_sync_config
+from training_insights import interpret_training_results
 from training_dashboard_view import render_dashboard_live_fragments, render_dashboard_page
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
@@ -127,10 +128,21 @@ AIHUB_FILEKEY_LOOKUP_STATUS_KEYS = (
 )
 AIHUB_TRAINED_JOB_STATES = {"completed", "completed_warning"}
 AIHUB_ZIP_GROUP_ORDER = ("outsidedoor", "insidedoor", "inside_croki")
+AIHUB_AUTO_RECOMMEND_ZIP_GROUPS = ("outsidedoor",)
+AIHUB_AUTO_RECOMMEND_MAX_PENDING = 1
 AIHUB_ZIP_GROUP_PATTERN = re.compile(
     r"^(?P<group>outsidedoor|insidedoor|inside_croki)(?:[_-](?P<number>\d+))?",
     re.IGNORECASE,
 )
+DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS = {
+    "critical": 160.0,
+    "warning": 100.0,
+    "warn": 100.0,
+    "watch": 45.0,
+    "good": 0.0,
+    "normal": 0.0,
+    "improving": 0.0,
+}
 
 
 def optional_aihub_api_key(shell_config: dict, override: str = "") -> str:
@@ -175,6 +187,183 @@ def classify_aihub_zip_name(value: str) -> dict:
         "zip_number": int(number_text) if number_text else None,
         "zip_filename": filename,
     }
+
+
+def aihub_entry_zip_group(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    explicit_group = str(entry.get("zip_group") or "").strip().lower()
+    if explicit_group:
+        return explicit_group
+    for key in ("zip_filename", "name", "fileName", "fileNm", "filePath", "path"):
+        value = str(entry.get(key) or "").strip()
+        if not value:
+            continue
+        zip_group = classify_aihub_zip_name(value).get("zip_group")
+        if zip_group:
+            return str(zip_group)
+    return ""
+
+
+def aihub_entry_matches_zip_groups(entry: dict, allowed_zip_groups: set[str]) -> bool:
+    if not allowed_zip_groups:
+        return True
+    return aihub_entry_zip_group(entry) in allowed_zip_groups
+
+
+def normalize_recommendation_label(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def insight_level_weight(level) -> float:
+    return DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS.get(
+        str(level or "").strip().lower(),
+        DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS["watch"],
+    )
+
+
+def add_diagnosis_label_priority(
+    priorities: dict[str, dict],
+    label,
+    *,
+    weight: float,
+    reason: str,
+    level: str = "watch",
+) -> None:
+    normalized = normalize_recommendation_label(label)
+    if not normalized or weight <= 0:
+        return
+    payload = priorities.setdefault(
+        normalized,
+        {
+            "label": str(label).strip(),
+            "priority": 0.0,
+            "reasons": [],
+            "level": "good",
+        },
+    )
+    payload["priority"] = round(float(payload.get("priority", 0.0) or 0.0) + float(weight), 6)
+    if reason and reason not in payload["reasons"]:
+        payload["reasons"].append(reason)
+    if insight_level_weight(level) > insight_level_weight(payload.get("level")):
+        payload["level"] = str(level or "watch").strip().lower()
+
+
+def build_diagnosis_label_priorities(insights: dict | None) -> dict[str, dict]:
+    insights = insights if isinstance(insights, dict) else {}
+    priorities: dict[str, dict] = {}
+
+    for item in insights.get("class_insights") or []:
+        if not isinstance(item, dict):
+            continue
+        level = str(item.get("level") or "watch").strip().lower()
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        title = str(item.get("title") or "")
+        base_weight = insight_level_weight(level)
+        title_bonus = 40.0 if ("위험" in title or "danger" in title.lower()) else 0.0
+        label = details.get("label")
+        if label:
+            add_diagnosis_label_priority(
+                priorities,
+                label,
+                weight=base_weight + title_bonus,
+                reason=title or "class insight",
+                level=level,
+            )
+        for label in details.get("labels") or []:
+            add_diagnosis_label_priority(
+                priorities,
+                label,
+                weight=base_weight,
+                reason=title or "class insight",
+                level=level,
+            )
+
+    for item in insights.get("confusion_insights") or []:
+        if not isinstance(item, dict):
+            continue
+        level = str(item.get("level") or "watch").strip().lower()
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        title = str(item.get("title") or "")
+        base_weight = insight_level_weight(level)
+        source_label = details.get("from")
+        if source_label:
+            add_diagnosis_label_priority(
+                priorities,
+                source_label,
+                weight=base_weight + 25.0,
+                reason=title or "confusion insight",
+                level=level,
+            )
+        for label in details.get("labels") or []:
+            add_diagnosis_label_priority(
+                priorities,
+                label,
+                weight=base_weight,
+                reason=title or "confusion insight",
+                level=level,
+            )
+
+    for item in insights.get("diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        level = str(item.get("level") or "watch").strip().lower()
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        title = str(item.get("title") or "")
+        base_weight = insight_level_weight(level)
+        for key in ("minority_label", "dominant_label"):
+            label = details.get(key)
+            if key == "dominant_label":
+                continue
+            if label:
+                add_diagnosis_label_priority(
+                    priorities,
+                    label,
+                    weight=base_weight * 0.7,
+                    reason=title or "distribution insight",
+                    level=level,
+                )
+        for label in details.get("empty_labels") or []:
+            add_diagnosis_label_priority(
+                priorities,
+                label,
+                weight=base_weight,
+                reason=title or "empty class",
+                level=level,
+            )
+        for row in details.get("low_sample_labels") or []:
+            if isinstance(row, dict) and row.get("label"):
+                add_diagnosis_label_priority(
+                    priorities,
+                    row.get("label"),
+                    weight=base_weight * 0.8,
+                    reason=title or "low sample class",
+                    level=level,
+                )
+
+    for item in insights.get("data_quality_insights") or []:
+        if not isinstance(item, dict):
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        label = details.get("label")
+        if label:
+            level = str(item.get("level") or "watch").strip().lower()
+            add_diagnosis_label_priority(
+                priorities,
+                label,
+                weight=insight_level_weight(level) * 0.45,
+                reason=str(item.get("title") or "data quality insight"),
+                level=level,
+            )
+
+    return priorities
+
+
+def diagnosis_priority_for_label(label, priorities: dict[str, dict]) -> dict:
+    return priorities.get(
+        normalize_recommendation_label(label),
+        {"label": str(label or "").strip(), "priority": 0.0, "reasons": [], "level": "good"},
+    )
 
 
 def normalize_aihub_lookup_entries(
@@ -241,6 +430,7 @@ def build_aihub_lookup_result(
     source: str,
     entries: list[dict],
     cache_hit: bool,
+    target_labels: list[str] | None = None,
 ) -> dict:
     summary = {"total": len(entries)}
     for key in AIHUB_FILEKEY_LOOKUP_STATUS_KEYS:
@@ -254,6 +444,7 @@ def build_aihub_lookup_result(
         "summary": summary,
         "groups": summarize_aihub_lookup_groups(entries),
         "zip_groups": summarize_aihub_zip_groups(entries),
+        "target_labels": [str(label) for label in (target_labels or [])],
         "entries": entries,
         "filekeys": [entry["filekey"] for entry in entries],
         "trainable_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trainable"],
@@ -273,22 +464,33 @@ def find_next_trainable_aihub_entry(
     *,
     existing_filekeys: set[str] | None = None,
     prepared_label_counts: dict[str, int] | None = None,
+    allowed_zip_groups: list[str] | tuple[str, ...] | set[str] | None = None,
+    insights: dict | None = None,
 ) -> dict | None:
     blocked = {str(filekey).strip() for filekey in (existing_filekeys or set()) if str(filekey).strip()}
+    allowed_groups = {
+        str(group).strip().lower()
+        for group in (allowed_zip_groups or [])
+        if str(group).strip()
+    }
     prepared_counts = Counter(
         {
             str(label): int(count or 0)
             for label, count in (prepared_label_counts or {}).items()
         }
     )
+    diagnosis_priorities = build_diagnosis_label_priorities(insights)
     planned_counts: Counter[str] = Counter()
     trained_counts: Counter[str] = Counter()
     active_zip_counts: Counter[str] = Counter()
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        if not aihub_entry_matches_zip_groups(entry, allowed_groups):
+            continue
         label = recommendation_label(entry)
         zip_group = str(entry.get("zip_group") or "기타")
+        zip_group = aihub_entry_zip_group(entry) or zip_group or "기타"
         status = str(entry.get("status") or "unknown")
         if status in {"queued", "running"}:
             planned_counts[label] += 1
@@ -304,14 +506,20 @@ def find_next_trainable_aihub_entry(
         filekey = str(entry.get("filekey") or "").strip()
         if not filekey or filekey in blocked:
             continue
+        if not aihub_entry_matches_zip_groups(entry, allowed_groups):
+            continue
         if entry.get("status") == "trainable" and entry.get("selectable") is not False:
             label = recommendation_label(entry)
             zip_group = str(entry.get("zip_group") or "기타")
+            zip_group = aihub_entry_zip_group(entry) or zip_group or "기타"
+            diagnosis_priority = diagnosis_priority_for_label(label, diagnosis_priorities)
+            insight_priority = float(diagnosis_priority.get("priority", 0.0) or 0.0)
             prepared_count = int(prepared_counts[label])
             planned_count = int(planned_counts[label])
             trained_count = int(trained_counts[label])
             active_zip_count = int(active_zip_counts[zip_group])
             score = (
+                -insight_priority,
                 prepared_count + planned_count,
                 prepared_count,
                 planned_count,
@@ -322,9 +530,16 @@ def find_next_trainable_aihub_entry(
             )
             candidate = {
                 **entry,
-                "recommendation_reason": "class_balance",
+                "recommendation_reason": "diagnosis_guided" if insight_priority > 0 else "class_balance",
+                "recommendation_scope": {
+                    "allowed_zip_groups": sorted(allowed_groups),
+                    "zip_group": zip_group,
+                },
                 "recommendation_score": {
                     "target_label": label,
+                    "insight_priority": round(insight_priority, 6),
+                    "insight_reasons": list(diagnosis_priority.get("reasons") or [])[:4],
+                    "insight_level": diagnosis_priority.get("level") or "good",
                     "prepared_count": prepared_count,
                     "planned_count": planned_count,
                     "trained_count": trained_count,
@@ -5672,6 +5887,7 @@ def create_app(config_path: Path) -> FastAPI:
                     source=str(cached_value.get("source") or "cache"),
                     entries=entries,
                     cache_hit=True,
+                    target_labels=get_target_labels(config),
                 )
 
         try:
@@ -5704,6 +5920,7 @@ def create_app(config_path: Path) -> FastAPI:
                 refresh_process=refresh_process,
             ),
             cache_hit=False,
+            target_labels=get_target_labels(config),
         )
         with aihub_filekey_lookup_cache_lock:
             aihub_filekey_lookup_cache[datasetkey] = {
@@ -5767,6 +5984,163 @@ def create_app(config_path: Path) -> FastAPI:
                 counts[str(label)] += int(count or 0)
         return dict(counts)
 
+    def build_auto_recommendation_insights() -> dict:
+        target_labels = get_target_labels(config)
+        training_progress = normalize_metric_payload(
+            read_json(paths["training_progress"]),
+            target_labels=target_labels,
+        )
+        metrics = normalize_metric_payload(
+            read_json(paths["artifacts_dir"] / "metrics.json"),
+            target_labels=target_labels,
+        )
+        history = training_progress.get("history") or metrics.get("history") or []
+        latest = training_progress.get("latest") or (
+            history[-1] if isinstance(history, list) and history else {}
+        )
+        final_validation = (
+            training_progress.get("final_validation")
+            or metrics.get("final_validation")
+            or {}
+        )
+        insight_metrics = {
+            **(metrics if isinstance(metrics, dict) else {}),
+            "labels": target_labels,
+            "history": history if isinstance(history, list) else [],
+            "latest": latest if isinstance(latest, dict) else {},
+            "final_validation": final_validation if isinstance(final_validation, dict) else {},
+            "best_epoch": training_progress.get("best_epoch") or metrics.get("best_epoch"),
+            "best_val_macro_f1": training_progress.get("best_val_macro_f1") or metrics.get("best_val_macro_f1"),
+            "best_validation": training_progress.get("best_validation") or metrics.get("best_validation") or {},
+        }
+        return interpret_training_results(
+            insight_metrics,
+            history=insight_metrics["history"],
+            class_report=insight_metrics["final_validation"].get("per_class") or [],
+            confusion_matrix=insight_metrics["final_validation"].get("confusion_matrix") or [],
+            data_stats={
+                "labels": target_labels,
+                "skip_report": read_json(paths["current_skip_report"]) or {},
+                "cumulative_skip_report": read_json(paths["cumulative_skip_report"]) or {},
+                "train_distribution": training_progress.get("train_distribution") or metrics.get("train_distribution") or {},
+                "val_distribution": training_progress.get("val_distribution") or metrics.get("val_distribution") or {},
+            },
+        )
+
+    def count_auto_recommended_pending_jobs_locked(datasetkey: str) -> int:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        pending_jobs = launcher_state.get("queued_jobs", [])
+        if not isinstance(pending_jobs, list):
+            return 0
+        return sum(
+            1
+            for job in pending_jobs
+            if isinstance(job, dict)
+            and job.get("auto_recommended")
+            and str(job.get("datasetkey") or "").strip() == normalized_datasetkey
+        )
+
+    def optimize_auto_recommended_queue_locked(datasetkey: str, entries: list[dict], insights: dict) -> dict:
+        pending_jobs = launcher_state.get("queued_jobs", [])
+        if not isinstance(pending_jobs, list) or not pending_jobs:
+            return {"removed": [], "retained_auto_count": 0, "targeted_available": False}
+
+        normalized_datasetkey = str(datasetkey or "").strip()
+        allowed_groups = {
+            str(group).strip().lower()
+            for group in AIHUB_AUTO_RECOMMEND_ZIP_GROUPS
+            if str(group).strip()
+        }
+        diagnosis_priorities = build_diagnosis_label_priorities(insights)
+        entry_by_filekey = {
+            str(entry.get("filekey") or "").strip(): entry
+            for entry in entries
+            if isinstance(entry, dict) and str(entry.get("filekey") or "").strip()
+        }
+        targeted_available = any(
+            isinstance(entry, dict)
+            and entry.get("status") == "trainable"
+            and entry.get("selectable") is not False
+            and aihub_entry_matches_zip_groups(entry, allowed_groups)
+            and float(diagnosis_priority_for_label(recommendation_label(entry), diagnosis_priorities).get("priority", 0.0) or 0.0) > 0
+            for entry in entries
+        )
+
+        retained_jobs: list = []
+        removed_jobs: list[dict] = []
+        retained_auto: list[tuple[float, int, dict]] = []
+        seen_auto_filekeys: set[str] = set()
+        for order, job in enumerate(pending_jobs):
+            if not isinstance(job, dict):
+                retained_jobs.append(job)
+                continue
+            if not job.get("auto_recommended") or str(job.get("datasetkey") or "").strip() != normalized_datasetkey:
+                retained_jobs.append(job)
+                continue
+
+            filekey = str(job.get("filekey") or "").strip()
+            entry = entry_by_filekey.get(filekey) or job
+            label = str(job.get("target_label") or recommendation_label(entry))
+            priority_payload = diagnosis_priority_for_label(label, diagnosis_priorities)
+            insight_priority = float(priority_payload.get("priority", 0.0) or 0.0)
+            remove_reason = ""
+            if not filekey:
+                remove_reason = "missing_filekey"
+            elif filekey in seen_auto_filekeys:
+                remove_reason = "duplicate_auto_recommendation"
+            elif not aihub_entry_matches_zip_groups(entry, allowed_groups):
+                remove_reason = "outside_scope_changed"
+            elif targeted_available and insight_priority <= 0:
+                remove_reason = "diagnosis_priority_changed"
+
+            if remove_reason:
+                removed = snapshot_job(job)
+                removed["remove_reason"] = remove_reason
+                removed_jobs.append(removed)
+                continue
+
+            seen_auto_filekeys.add(filekey)
+            job["recommendation_reason"] = "diagnosis_guided" if insight_priority > 0 else job.get("recommendation_reason", "class_balance")
+            job["recommendation_scope"] = {
+                "allowed_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
+                "zip_group": aihub_entry_zip_group(entry),
+            }
+            score = job.setdefault("recommendation_score", {})
+            if isinstance(score, dict):
+                score["target_label"] = label
+                score["insight_priority"] = round(insight_priority, 6)
+                score["insight_reasons"] = list(priority_payload.get("reasons") or [])[:4]
+                score["insight_level"] = priority_payload.get("level") or "good"
+            retained_jobs.append(job)
+            retained_auto.append((insight_priority, order, job))
+
+        if len(retained_auto) > AIHUB_AUTO_RECOMMEND_MAX_PENDING:
+            keep_ids = {
+                id(job)
+                for _, _, job in sorted(retained_auto, key=lambda item: (-item[0], item[1]))[:AIHUB_AUTO_RECOMMEND_MAX_PENDING]
+            }
+            trimmed_jobs = []
+            for job in retained_jobs:
+                if (
+                    isinstance(job, dict)
+                    and job.get("auto_recommended")
+                    and str(job.get("datasetkey") or "").strip() == normalized_datasetkey
+                    and id(job) not in keep_ids
+                ):
+                    removed = snapshot_job(job)
+                    removed["remove_reason"] = "auto_recommendation_queue_limit"
+                    removed_jobs.append(removed)
+                    continue
+                trimmed_jobs.append(job)
+            retained_jobs = trimmed_jobs
+
+        launcher_state["queued_jobs"] = retained_jobs
+        return {
+            "removed": removed_jobs,
+            "retained_auto_count": count_auto_recommended_pending_jobs_locked(datasetkey),
+            "targeted_available": targeted_available,
+        }
+
     def enable_auto_enqueue_locked(datasetkey: str, api_key: str) -> None:
         launcher_state["auto_enqueue_enabled"] = True
         launcher_state["auto_enqueue_datasetkey"] = str(datasetkey or "").strip()
@@ -5803,14 +6177,38 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_state["last_state"] = "error"
             return {"ok": False, "message": message, "job": None}
 
+        prepared_label_counts = collect_prepared_label_counts()
+        insights = build_auto_recommendation_insights()
+        queue_plan = optimize_auto_recommended_queue_locked(datasetkey, lookup.get("entries") or [], insights)
+        if count_auto_recommended_pending_jobs_locked(datasetkey) >= AIHUB_AUTO_RECOMMEND_MAX_PENDING:
+            message = "진단 기준으로 기존 자동 추천 큐를 유지합니다. 현재 대기 중인 자동 추천 작업이 먼저 실행됩니다."
+            if queue_plan.get("removed"):
+                message = f"{len(queue_plan.get('removed') or [])}개 자동 추천 큐를 진단 기준에 맞게 정리했고, 기존 자동 추천 큐를 유지합니다."
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = message
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            kept_job = next(
+                (
+                    snapshot_job(job)
+                    for job in pending_jobs
+                    if isinstance(job, dict)
+                    and job.get("auto_recommended")
+                    and str(job.get("datasetkey") or "").strip() == datasetkey
+                ),
+                None,
+            )
+            return {"ok": True, "message": message, "job": kept_job, "queue_plan": queue_plan}
+
         existing_filekeys = collect_active_queue_filekeys_locked(datasetkey)
         recommended = find_next_trainable_aihub_entry(
             lookup.get("entries") or [],
             existing_filekeys=existing_filekeys,
-            prepared_label_counts=collect_prepared_label_counts(),
+            prepared_label_counts=prepared_label_counts,
+            allowed_zip_groups=AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
+            insights=insights,
         )
         if not recommended:
-            message = "더 이상 학습 가능한 추천 filekey가 없어 자동 큐 추가를 마쳤습니다."
+            message = "outside(outsidedoor)에서 더 이상 학습 가능한 추천 filekey가 없어 자동 큐 추가를 멈췄습니다."
             disable_auto_enqueue_locked(message)
             launcher_state["last_state"] = launcher_state.get("last_state") or "completed"
             return {"ok": False, "message": message, "job": None}
@@ -5822,17 +6220,30 @@ def create_app(config_path: Path) -> FastAPI:
         job["source_label"] = recommended.get("source_label") or recommended.get("matched_source_label")
         job["target_label"] = recommended.get("target_label")
         job["recommendation_reason"] = recommended.get("recommendation_reason") or "class_balance"
+        job["recommendation_scope"] = recommended.get("recommendation_scope") or {
+            "allowed_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
+            "zip_group": aihub_entry_zip_group(recommended),
+        }
         job["recommendation_score"] = recommended.get("recommendation_score") or {}
         if isinstance(pending_jobs, list):
             pending_jobs.append(job)
         launcher_state["last_state"] = "queued"
         score = job["recommendation_score"] if isinstance(job.get("recommendation_score"), dict) else {}
         target_label = score.get("target_label") or job.get("target_label") or "-"
+        insight_priority = float(score.get("insight_priority", 0.0) or 0.0)
+        insight_reasons = [str(reason) for reason in score.get("insight_reasons") or [] if str(reason).strip()]
+        reason_text = ", ".join(insight_reasons[:2]) if insight_reasons else f"부족한 클래스 {target_label}"
+        if queue_plan.get("removed"):
+            reason_text = f"{len(queue_plan.get('removed') or [])}개 자동 추천 큐 정리 후 {reason_text}"
         launcher_state["last_message"] = (
-            f"추천 filekey {filekey}를 자동으로 큐에 추가했습니다. "
-            f"기준: 부족한 클래스 {target_label}"
+            f"outside 추천 filekey {filekey}를 자동으로 큐에 추가했습니다. "
+            f"기준: outsidedoor 범위 / 부족한 클래스 {target_label}"
         )
-        return {"ok": True, "message": launcher_state["last_message"], "job": job}
+        launcher_state["last_message"] = (
+            f"outside 추천 filekey {filekey}를 자동으로 큐에 추가했습니다. "
+            f"기준: {'진단 우선순위' if insight_priority > 0 else '클래스 균형'} / {reason_text}"
+        )
+        return {"ok": True, "message": launcher_state["last_message"], "job": job, "queue_plan": queue_plan}
 
     def start_training_request(payload: dict) -> dict:
         if str(config.get("dataset_source", "")).strip().lower() != "aihub_shell":
@@ -5868,9 +6279,8 @@ def create_app(config_path: Path) -> FastAPI:
             if resume_only:
                 if auto_enqueue_next:
                     enable_auto_enqueue_locked(datasetkey, api_key)
-                    if not current_job and isinstance(pending_jobs, list) and not pending_jobs:
-                        enqueue_next_recommended_job_locked()
-                        pending_jobs = launcher_state.setdefault("queued_jobs", [])
+                    enqueue_next_recommended_job_locked()
+                    pending_jobs = launcher_state.setdefault("queued_jobs", [])
                 has_pending = isinstance(pending_jobs, list) and len(pending_jobs) > 0
                 if not current_job and not has_pending:
                     raise HTTPException(status_code=409, detail="재개하거나 추천할 학습 가능 filekey가 없습니다.")
@@ -6588,6 +6998,40 @@ def build_overview(
         current_dataset_summary=current_dataset_summary,
         completed_jobs=enriched_completed_jobs,
     )
+    metric_history = training_progress.get("history") or metrics.get("history") or []
+    latest_metrics = training_progress.get("latest") or (
+        metric_history[-1] if isinstance(metric_history, list) and metric_history else {}
+    )
+    final_validation = (
+        training_progress.get("final_validation")
+        or metrics.get("final_validation")
+        or {}
+    )
+    insight_metrics = {
+        **(metrics if isinstance(metrics, dict) else {}),
+        "labels": target_labels,
+        "history": metric_history if isinstance(metric_history, list) else [],
+        "latest": latest_metrics if isinstance(latest_metrics, dict) else {},
+        "final_validation": final_validation if isinstance(final_validation, dict) else {},
+        "best_epoch": training_progress.get("best_epoch") or metrics.get("best_epoch"),
+        "best_val_macro_f1": training_progress.get("best_val_macro_f1") or metrics.get("best_val_macro_f1"),
+        "best_validation": training_progress.get("best_validation") or metrics.get("best_validation") or {},
+    }
+    insights = interpret_training_results(
+        insight_metrics,
+        history=insight_metrics["history"],
+        class_report=insight_metrics["final_validation"].get("per_class") or [],
+        confusion_matrix=insight_metrics["final_validation"].get("confusion_matrix") or [],
+        data_stats={
+            "labels": target_labels,
+            "dataset": dataset_summary,
+            "current_dataset": current_dataset_summary,
+            "skip_report": current_skip_report,
+            "cumulative_skip_report": cumulative_skip_report,
+            "train_distribution": training_progress.get("train_distribution") or metrics.get("train_distribution") or {},
+            "val_distribution": training_progress.get("val_distribution") or metrics.get("val_distribution") or {},
+        },
+    )
 
     overview = {
         "overview_revision": overview_revision,
@@ -6657,6 +7101,7 @@ def build_overview(
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
         "diagnostics": diagnostics,
+        "insights": insights,
         "skip_report": current_skip_report,
         "cumulative_skip_report": cumulative_skip_report if not lite else {},
         "metrics": metrics if not lite else {},

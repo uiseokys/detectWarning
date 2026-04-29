@@ -347,7 +347,11 @@ def normalize_pose(keypoints: list[dict], bbox) -> np.ndarray:
         conf = float(point.get("confidence", 0.0))
         if conf <= 0.0:
             continue
-        normalized[index, 0] = float((float(point.get("x", 0.0)) - x) / max(w, 1))
-        normalized[index, 1] = float((float(point.get("y", 0.0)) - y) / max(h, 1))
-        normalized[index, 2] = conf
+        normalized[index, 0] = float(
+            np.clip((float(point.get("x", 0.0)) - x) / max(w, 1), -0.5, 1.5)
+        )
+        normalized[index, 1] = float(
+            np.clip((float(point.get("y", 0.0)) - y) / max(h, 1), -0.5, 1.5)
+        )
+        normalized[index, 2] = float(np.clip(conf, 0.0, 1.0))
     return normalized

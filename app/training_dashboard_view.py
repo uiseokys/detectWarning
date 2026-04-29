@@ -49,6 +49,7 @@ SPLIT_SEQUENCE = (
 
 SECTION_NAV_ITEMS = (
     ("overview", "개요"),
+    ("diagnosis", "Diagnosis"),
     ("training", "학습"),
     ("dataset", "데이터셋"),
     ("validation", "검증"),
@@ -307,10 +308,10 @@ def _render_actions_panel(
         "</div>"
         "<input type=\"hidden\" id=\"filekeys-input\" name=\"filekeys\" value=\"\" />"
         "<button type=\"submit\" class=\"primary-button\">선택한 filekey 큐 시작 / 추가</button>"
-        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_enqueue_next\" value=\"1\">추천 자동 시작</button>"
+        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_enqueue_next\" value=\"1\">outside 추천 자동 시작</button>"
         "</form>"
         "<div class=\"action-grid\">"
-        "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><input type=\"hidden\" name=\"auto_enqueue_next\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">추천 자동 시작 재개</button></form>"
+        "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><input type=\"hidden\" name=\"auto_enqueue_next\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">outside 추천 자동 시작 재개</button></form>"
         "<form method=\"post\" action=\"/actions/pause\"><button type=\"submit\" class=\"secondary-button secondary-button-warn\">현재 작업 후 중지</button></form>"
         "<form method=\"post\" action=\"/actions/force-stop\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">지금 중단</button></form>"
         "<form method=\"post\" action=\"/actions/reset\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">처음부터 다시 시작</button></form>"
@@ -468,9 +469,135 @@ def _render_system_panel(
     )
 
 
+def _insight_tone(level: str | None) -> str:
+    normalized = str(level or "").strip().lower()
+    if normalized in {"good", "normal", "improving"}:
+        return "good"
+    if normalized in {"critical", "danger"}:
+        return "danger"
+    if normalized in {"watch", "warning", "warn"}:
+        return "warn"
+    return "neutral"
+
+
+def _insight_level_label(level: str | None) -> str:
+    normalized = str(level or "").strip().lower()
+    labels = {
+        "good": "정상",
+        "normal": "정상",
+        "improving": "개선",
+        "watch": "주의",
+        "warning": "경고",
+        "warn": "경고",
+        "critical": "심각",
+        "danger": "심각",
+    }
+    return labels.get(normalized, _text(level, "정보"))
+
+
+def _render_insight_badges(badges: list[dict]) -> str:
+    if not badges:
+        return ""
+    return (
+        "<div class=\"insight-badge-row\">"
+        + "".join(
+            (
+                f"<span class=\"insight-badge {_insight_tone(badge.get('level'))}\">"
+                f"<strong>{_text(badge.get('label'))}</strong>"
+                f"<em>{_text(_insight_level_label(badge.get('level')))}</em>"
+                f"<small>{_text(badge.get('detail'), '')}</small>"
+                "</span>"
+            )
+            for badge in badges[:8]
+            if isinstance(badge, dict)
+        )
+        + "</div>"
+    )
+
+
+def _render_insight_items(items: list[dict], empty_text: str, *, limit: int = 6) -> str:
+    normalized_items = [item for item in items if isinstance(item, dict)]
+    if not normalized_items:
+        return f"<div class=\"chart-empty\">{_text(empty_text)}</div>"
+    rows = []
+    for item in normalized_items[:limit]:
+        tone = _insight_tone(item.get("level"))
+        rows.append(
+            (
+                f"<li class=\"insight-item {tone}\">"
+                "<div>"
+                f"<strong>{_text(item.get('title') or item.get('label'))}</strong>"
+                f"<p>{_text(item.get('message') or item.get('detail'))}</p>"
+                "</div>"
+                f"<span class=\"status-badge {tone}\">{_text(_insight_level_label(item.get('level')))}</span>"
+                "</li>"
+            )
+        )
+    return "<ul class=\"insight-list\">" + "".join(rows) + "</ul>"
+
+
+def _render_insight_group(title: str, items: list[dict], empty_text: str, *, limit: int = 6) -> str:
+    return (
+        "<article class=\"insight-card\">"
+        f"<h3>{_text(title)}</h3>"
+        f"{_render_insight_items(items, empty_text, limit=limit)}"
+        "</article>"
+    )
+
+
+def _render_insights_panel(insights: dict | None) -> str:
+    insights = insights if isinstance(insights, dict) else {}
+    has_any = any(
+        insights.get(key)
+        for key in (
+            "summary",
+            "risk_badges",
+            "diagnostics",
+            "metric_notes",
+            "class_insights",
+            "confusion_insights",
+            "data_quality_insights",
+            "trend_insights",
+            "recommendations",
+        )
+    )
+    overall_tone = _insight_tone(insights.get("overall_level"))
+    if not has_any:
+        body = "<div class=\"chart-empty\">아직 해석할 학습 지표가 없습니다. 학습 history 또는 validation 결과가 생성되면 자동 진단이 표시됩니다.</div>"
+    else:
+        body = f"""
+          {_render_insight_badges(insights.get('risk_badges') or [])}
+          <div class="insight-grid">
+            {_render_insight_group("모델 상태 요약", insights.get('summary') or [], "요약할 진단 결과가 아직 없습니다.", limit=5)}
+            {_render_insight_group("지표별 짧은 해석", insights.get('metric_notes') or [], "표시할 핵심 지표 해석이 없습니다.", limit=5)}
+            {_render_insight_group("과적합 / 일반화 / 불균형", insights.get('diagnostics') or [], "감지된 구조적 위험 신호가 없습니다.", limit=6)}
+            {_render_insight_group("클래스별 성능 해석", insights.get('class_insights') or [], "class report가 없거나 감지된 class별 위험 신호가 없습니다.", limit=6)}
+            {_render_insight_group("Confusion Matrix 해석", insights.get('confusion_insights') or [], "confusion matrix가 없거나 뚜렷한 혼동 패턴이 없습니다.", limit=6)}
+            {_render_insight_group("데이터 품질 / 스킵 해석", insights.get('data_quality_insights') or [], "스킵/품질 통계에서 큰 위험 신호가 감지되지 않았습니다.", limit=6)}
+            {_render_insight_group("학습 추세 해석", insights.get('trend_insights') or [], "epoch history가 부족하거나 뚜렷한 추세 신호가 없습니다.", limit=5)}
+            {_render_insight_group("다음 개선 권장사항", insights.get('recommendations') or [], "현재 지표 기준으로 즉시 권장할 추가 조치가 없습니다.", limit=8)}
+          </div>
+        """
+    return f"""
+      <section class="panel insight-panel insight-panel-{overall_tone}" id="diagnosis">
+        <div class="panel-head">
+          <div>
+            <h2>AI Training Diagnosis Summary</h2>
+            <p>accuracy, macro F1, loss, class report, confusion matrix, skip 통계를 rule-based로 해석합니다.</p>
+          </div>
+          <span class="status-badge {overall_tone}">{_text(_insight_level_label(insights.get('overall_level')))}</span>
+        </div>
+        <div class="panel-body">
+          {body}
+        </div>
+      </section>
+    """
+
+
 def _render_main_live_sections(
     *,
     summary_cards: str,
+    insights: dict,
     performance_chart_html: str,
     loss_chart_html: str,
     distribution_chart_html: str,
@@ -497,6 +624,8 @@ def _render_main_live_sections(
           <section class="summary-grid" id="summary-grid">
             {summary_cards}
           </section>
+
+          {_render_insights_panel(insights)}
 
           <section class="chart-grid" id="training-charts">
             {performance_chart_html}
@@ -767,6 +896,159 @@ def _render_live_refresh_script() -> str:
     return entries.filter(isVisibleByViewFilter);
   }
 
+  function lookupTargetLabelOrder() {
+    var order = {};
+    var labels = latestFilekeyLookupPayload && latestFilekeyLookupPayload.target_labels;
+    if (!Array.isArray(labels)) {
+      return order;
+    }
+    labels.forEach(function (label, index) {
+      var key = String(label || '').trim();
+      if (key && !Object.prototype.hasOwnProperty.call(order, key)) {
+        order[key] = index;
+      }
+    });
+    return order;
+  }
+
+  function lookupClassSortValue(label) {
+    var key = String(label || '').trim();
+    var order = lookupTargetLabelOrder();
+    if (Object.prototype.hasOwnProperty.call(order, key)) {
+      return order[key];
+    }
+    if (key === 'unmapped') {
+      return 9000;
+    }
+    if (key === 'excluded') {
+      return 9001;
+    }
+    return 8000;
+  }
+
+  function lookupClassLabel(item) {
+    var value = item && item.target_label;
+    value = String(value || '').trim();
+    if (value) {
+      return value;
+    }
+    if (item && item.excluded_source_label) {
+      return 'excluded';
+    }
+    return 'unmapped';
+  }
+
+  function isSelectableTrainableLookupItem(item) {
+    return !!(
+      item &&
+      item.filekey &&
+      item.status === 'trainable' &&
+      item.selectable !== false
+    );
+  }
+
+  function renderFilekeyRow(item, selectedMap) {
+    var filekey = String(item.filekey || '');
+    var selectable = item.selectable !== false && item.status !== 'excluded' && item.status !== 'trained' && item.status !== 'queued' && item.status !== 'running';
+    var disabled = selectable ? '' : ' disabled';
+    var checked = selectable && selectedMap && selectedMap[filekey] ? ' checked' : '';
+    var title = item.name || item.source_label || item.source_alias || 'AIHub file';
+    var metaParts = [];
+    if (item.source_label) {
+      metaParts.push(item.source_label);
+    }
+    if (item.zip_group) {
+      metaParts.push(item.zip_group + (item.zip_number != null ? '_' + item.zip_number : ''));
+    }
+    if (item.target_label) {
+      metaParts.push('target ' + item.target_label);
+    }
+    if (item.excluded_source_label) {
+      metaParts.push('excluded ' + item.excluded_source_label);
+    }
+    if (item.trained_at) {
+      metaParts.push('trained ' + item.trained_at);
+    }
+    if (item.job_state === 'queued') {
+      metaParts.push('queue pending');
+    }
+    if (item.job_state === 'running') {
+      metaParts.push('currently running');
+    }
+    return '<label class="filekey-row">' +
+      '<input type="checkbox" data-filekey="' + escapeHtml(filekey) + '"' + checked + disabled + ' />' +
+      '<span class="filekey-main">' +
+      '<strong>' + escapeHtml(filekey) + ' · ' + escapeHtml(title) + '</strong>' +
+      '<span>' + escapeHtml(metaParts.join(' / ') || 'no label metadata') + '</span>' +
+      '</span>' +
+      '<span class="filekey-badges">' +
+      (item.zip_group ? '<span class="filekey-zip-badge">' + escapeHtml(item.zip_group) + '</span>' : '') +
+      '<span class="filekey-status ' + escapeHtml(item.status || 'unknown') + '">' + escapeHtml(statusLabel(item.status)) + '</span>' +
+      '</span>' +
+      '</label>';
+  }
+
+  function renderFilekeyClassList(entries, selectedMap) {
+    var groups = {};
+    entries.forEach(function (item) {
+      var label = lookupClassLabel(item);
+      if (!groups[label]) {
+        groups[label] = {
+          label: label,
+          total: 0,
+          trainable: 0,
+          trained: 0,
+          queued: 0,
+          running: 0,
+          excluded: 0,
+          unknown: 0,
+          items: []
+        };
+      }
+      groups[label].total += 1;
+      var status = String(item.status || 'unknown');
+      if (Object.prototype.hasOwnProperty.call(groups[label], status)) {
+        groups[label][status] += 1;
+      }
+      groups[label].items.push(item);
+    });
+
+    var labels = Object.keys(groups).sort(function (left, right) {
+      var a = groups[left];
+      var b = groups[right];
+      return (lookupClassSortValue(left) - lookupClassSortValue(right)) ||
+        (b.trainable - a.trainable) ||
+        (b.total - a.total) ||
+        left.localeCompare(right);
+    });
+    if (!labels.length) {
+      return '<div class="chart-empty">No filekeys to display.</div>';
+    }
+    return labels.map(function (label) {
+      var group = groups[label];
+      group.items.sort(function (left, right) {
+        return String(left.filekey || '').localeCompare(String(right.filekey || ''), undefined, { numeric: true });
+      });
+      return '<details class="filekey-class-section" open>' +
+        '<summary>' +
+        '<button type="button" class="filekey-class-select" data-filekey-class="' + escapeHtml(label) + '">' +
+        escapeHtml(label) +
+        '</button>' +
+        '<span class="filekey-class-meta">' +
+        'total ' + escapeHtml(group.total) +
+        ' / trainable ' + escapeHtml(group.trainable) +
+        ' / trained ' + escapeHtml(group.trained) +
+        ' / queued ' + escapeHtml(group.queued) +
+        ' / running ' + escapeHtml(group.running) +
+        '</span>' +
+        '</summary>' +
+        '<div class="filekey-class-body">' +
+        group.items.map(function (item) { return renderFilekeyRow(item, selectedMap); }).join('') +
+        '</div>' +
+        '</details>';
+    }).join('');
+  }
+
   function renderFilekeyViewFilters(payload) {
     var container = document.getElementById('filekey-lookup-filters');
     if (!container) {
@@ -830,58 +1112,26 @@ def _render_live_refresh_script() -> str:
 
     renderFilekeyViewFilters(payload);
 
-    var visibleGroupCounts = {};
+    var classGroupCounts = {};
     visibleEntries.forEach(function (item) {
-      var label = item.source_label || item.source_alias || item.matched_source_label || '미분류';
-      visibleGroupCounts[label] = (visibleGroupCounts[label] || 0) + 1;
+      var label = lookupClassLabel(item);
+      classGroupCounts[label] = (classGroupCounts[label] || 0) + 1;
     });
-    groups.innerHTML = Object.keys(visibleGroupCounts).sort().map(function (label) {
-      return '<div class="filekey-group">' +
-        '<span>' + escapeHtml(label) + '</span>' +
-        '<strong>' + escapeHtml(visibleGroupCounts[label]) + '개</strong>' +
+    groups.innerHTML = Object.keys(classGroupCounts).sort(function (left, right) {
+      return (lookupClassSortValue(left) - lookupClassSortValue(right)) || left.localeCompare(right);
+    }).map(function (label) {
+      return '<div class="filekey-group filekey-class-group">' +
+        '<span>class: ' + escapeHtml(label) + '</span>' +
+        '<strong>' + escapeHtml(classGroupCounts[label]) + '개</strong>' +
         '</div>';
     }).join('');
 
-    list.innerHTML = visibleEntries.map(function (item, index) {
-      var filekey = String(item.filekey || '');
-      var selectable = item.selectable !== false && item.status !== 'excluded' && item.status !== 'trained' && item.status !== 'queued' && item.status !== 'running';
-      var disabled = selectable ? '' : ' disabled';
-      var checked = '';
-      var title = item.name || item.source_label || item.source_alias || 'AIHub 파일';
-      var metaParts = [];
-      if (item.source_label) {
-        metaParts.push(item.source_label);
-      }
-      if (item.zip_group) {
-        metaParts.push(item.zip_group + (item.zip_number != null ? '_' + item.zip_number : ''));
-      }
-      if (item.target_label) {
-        metaParts.push('target ' + item.target_label);
-      }
-      if (item.excluded_source_label) {
-        metaParts.push('excluded ' + item.excluded_source_label);
-      }
-      if (item.trained_at) {
-        metaParts.push('trained ' + item.trained_at);
-      }
-      if (item.job_state === 'queued') {
-        metaParts.push('queue pending');
-      }
-      if (item.job_state === 'running') {
-        metaParts.push('currently running');
-      }
-      return '<label class="filekey-row">' +
-        '<input type="checkbox" data-filekey="' + escapeHtml(filekey) + '"' + checked + disabled + ' />' +
-        '<span class="filekey-main">' +
-        '<strong>' + escapeHtml(filekey) + ' · ' + escapeHtml(title) + '</strong>' +
-        '<span>' + escapeHtml(metaParts.join(' / ') || '라벨 정보 없음') + '</span>' +
-        '</span>' +
-        '<span class="filekey-badges">' +
-        (item.zip_group ? '<span class="filekey-zip-badge">' + escapeHtml(item.zip_group) + '</span>' : '') +
-        '<span class="filekey-status ' + escapeHtml(item.status || 'unknown') + '">' + escapeHtml(statusLabel(item.status)) + '</span>' +
-        '</span>' +
-        '</label>';
-    }).join('');
+    var selectedMap = {};
+    selectedLookupFilekeys().forEach(function (filekey) {
+      selectedMap[filekey] = true;
+    });
+
+    list.innerHTML = renderFilekeyClassList(visibleEntries, selectedMap);
 
     var sourceLabel = payload && payload.source === 'aihubshell' ? 'aihubshell' : 'AIHub API';
     var cacheLabel = payload && payload.cache && payload.cache.hit ? ' / cache' : '';
@@ -963,6 +1213,22 @@ def _render_live_refresh_script() -> str:
     var selected = selectedVisibleLookupFilekeys();
     writeFilekeys(selected);
     return selected;
+  }
+
+  function selectVisibleClassFilekeys(classLabel) {
+    var selected = {};
+    selectedLookupFilekeys().forEach(function (filekey) {
+      selected[filekey] = true;
+    });
+    filteredLookupEntries().forEach(function (item) {
+      if (lookupClassLabel(item) !== classLabel || !isSelectableTrainableLookupItem(item)) {
+        return;
+      }
+      selected[String(item.filekey)] = true;
+    });
+    setLookupCheckedByFilekeys(Object.keys(selected));
+    var values = syncSelectedFilekeysToForm();
+    setFilekeyLookupStatus(classLabel + ' 클래스의 학습 가능 filekey ' + values.length + '개 선택됨', values.length ? 'good' : 'warn');
   }
 
   async function lookupAiHubFilekeys(force) {
@@ -1076,8 +1342,10 @@ def _render_live_refresh_script() -> str:
     }
     if (selectTrainableButton) {
       selectTrainableButton.addEventListener('click', function () {
-        var values = latestFilekeyLookupPayload && latestFilekeyLookupPayload.trainable_filekeys;
-        values = Array.isArray(values) ? values : [];
+        var values = filteredLookupEntries()
+          .filter(isSelectableTrainableLookupItem)
+          .map(function (item) { return String(item.filekey || ''); })
+          .filter(Boolean);
         if (!values.length) {
           setFilekeyLookupStatus('선택할 학습 가능 filekey가 없습니다.', 'warn');
           return;
@@ -1093,6 +1361,15 @@ def _render_live_refresh_script() -> str:
       });
     }
     if (lookupList) {
+      lookupList.addEventListener('click', function (event) {
+        var target = event.target && event.target.closest ? event.target.closest('button[data-filekey-class]') : null;
+        if (!target) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        selectVisibleClassFilekeys(target.getAttribute('data-filekey-class') || '');
+      });
       lookupList.addEventListener('change', function (event) {
         if (!event.target || !event.target.matches('input[data-filekey]')) {
           return;
@@ -2244,6 +2521,141 @@ def _styles() -> str:
       color: var(--muted);
       font-size: 13px;
     }
+    .insight-panel {
+      border-color: rgba(15,111,255,0.18);
+    }
+    .insight-panel-good {
+      border-color: rgba(5,150,105,0.22);
+    }
+    .insight-panel-warn {
+      border-color: rgba(217,119,6,0.24);
+    }
+    .insight-panel-danger {
+      border-color: rgba(220,38,38,0.24);
+    }
+    .insight-badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .insight-badge {
+      display: inline-grid;
+      grid-template-columns: auto auto;
+      align-items: center;
+      gap: 4px 8px;
+      min-width: 160px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,0.18);
+      background: rgba(248,251,255,0.92);
+      box-shadow: var(--shadow-soft);
+    }
+    .insight-badge.good {
+      border-color: rgba(5,150,105,0.20);
+      background: rgba(5,150,105,0.08);
+    }
+    .insight-badge.warn {
+      border-color: rgba(217,119,6,0.20);
+      background: rgba(217,119,6,0.08);
+    }
+    .insight-badge.danger {
+      border-color: rgba(220,38,38,0.20);
+      background: rgba(220,38,38,0.08);
+    }
+    .insight-badge strong,
+    .insight-badge em,
+    .insight-badge small {
+      min-width: 0;
+    }
+    .insight-badge strong {
+      font-size: 12px;
+      font-weight: 900;
+      color: var(--ink);
+    }
+    .insight-badge em {
+      justify-self: end;
+      font-size: 11px;
+      font-style: normal;
+      font-weight: 900;
+      color: var(--accent);
+      text-transform: uppercase;
+    }
+    .insight-badge.good em { color: var(--good); }
+    .insight-badge.warn em { color: var(--warn); }
+    .insight-badge.danger em { color: var(--danger); }
+    .insight-badge small {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .insight-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .insight-card {
+      min-width: 0;
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(248,251,255,0.72);
+    }
+    .insight-card h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.3;
+      font-weight: 900;
+    }
+    .insight-list {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .insight-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      padding: 11px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(255,255,255,0.78);
+    }
+    .insight-item.good {
+      border-color: rgba(5,150,105,0.18);
+      background: rgba(5,150,105,0.06);
+    }
+    .insight-item.warn {
+      border-color: rgba(217,119,6,0.18);
+      background: rgba(217,119,6,0.06);
+    }
+    .insight-item.danger {
+      border-color: rgba(220,38,38,0.18);
+      background: rgba(220,38,38,0.06);
+    }
+    .insight-item strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 900;
+      line-height: 1.35;
+    }
+    .insight-item p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .insight-item .status-badge {
+      padding: 5px 8px;
+      font-size: 10px;
+      white-space: nowrap;
+    }
     .stack,
     .stack-form {
       display: grid;
@@ -2431,6 +2843,10 @@ def _styles() -> str:
       border-color: rgba(15,111,255,0.20);
       background: rgba(15,111,255,0.07);
     }
+    .filekey-class-group {
+      border-color: rgba(5,150,105,0.20);
+      background: rgba(5,150,105,0.06);
+    }
     .filekey-lookup-filters {
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
@@ -2470,6 +2886,56 @@ def _styles() -> str:
       max-height: 420px;
       overflow: auto;
       padding-right: 2px;
+    }
+    .filekey-class-section {
+      min-width: 0;
+      border-radius: 14px;
+      border: 1px solid rgba(148,163,184,0.18);
+      background: rgba(248,251,255,0.78);
+      overflow: hidden;
+    }
+    .filekey-class-section summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      cursor: pointer;
+      padding: 11px 12px;
+      border-bottom: 1px solid rgba(148,163,184,0.12);
+      background: rgba(255,255,255,0.72);
+      list-style: none;
+    }
+    .filekey-class-section summary::-webkit-details-marker {
+      display: none;
+    }
+    .filekey-class-select {
+      appearance: none;
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 900;
+      text-align: left;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+    }
+    .filekey-class-select:hover,
+    .filekey-class-select:focus-visible {
+      color: var(--accent);
+      text-decoration: underline;
+    }
+    .filekey-class-meta {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .filekey-class-body {
+      display: grid;
+      gap: 8px;
+      padding: 8px;
     }
     .filekey-row {
       display: grid;
@@ -3180,11 +3646,27 @@ def _styles() -> str:
       .confusion-summary,
       .content-row,
       .detail-grid,
+      .insight-grid,
       .key-metric-grid,
       .queue-summary-grid,
       .sidebar,
       .action-grid {
         grid-template-columns: 1fr;
+      }
+      .insight-item {
+        grid-template-columns: 1fr;
+      }
+      .filekey-class-section summary,
+      .filekey-row {
+        grid-template-columns: 1fr;
+      }
+      .filekey-class-meta {
+        white-space: normal;
+      }
+      .filekey-badges {
+        align-items: flex-start;
+        flex-direction: row;
+        flex-wrap: wrap;
       }
       .sidebar > .sidebar-panel:first-child {
         grid-row: auto;
@@ -3217,6 +3699,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     artifacts = overview.get("artifacts") or {}
     skip_report = overview.get("skip_report") or {}
     cumulative_skip_report = overview.get("cumulative_skip_report") or {}
+    insights = overview.get("insights") or {}
     labels = progress.get("labels") or metrics.get("labels") or []
     final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
     completed_jobs = launcher.get("completed_jobs") or []
@@ -3314,6 +3797,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
         ),
         "main_live_sections": _render_main_live_sections(
             summary_cards=_render_summary_cards(summary_cards),
+            insights=insights,
             performance_chart_html=performance_chart_html,
             loss_chart_html=loss_chart_html,
             distribution_chart_html=distribution_chart_html,
@@ -3372,6 +3856,7 @@ def render_dashboard_page(
     artifacts = overview.get("artifacts") or {}
     skip_report = overview.get("skip_report") or {}
     cumulative_skip_report = overview.get("cumulative_skip_report") or {}
+    insights = overview.get("insights") or {}
     labels = progress.get("labels") or metrics.get("labels") or []
     final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
     completed_jobs = launcher.get("completed_jobs") or []
@@ -3471,6 +3956,7 @@ def render_dashboard_page(
     )
     main_live_sections_html = _render_main_live_sections(
         summary_cards=summary_cards,
+        insights=insights,
         performance_chart_html=performance_chart_html,
         loss_chart_html=loss_chart_html,
         distribution_chart_html=distribution_chart_html,
