@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import signal
@@ -17,6 +18,9 @@ LIVE_URL_PATTERNS = (
     re.compile(r"^https://[A-Za-z0-9-]+\.trycloudflare\.com/?$"),
     re.compile(r"^https://[A-Za-z0-9.-]+\.workers\.dev/?$"),
 )
+TEMPORAL_POOLING_ENV = "DETECTWARNING_TEMPORAL_POOLING"
+TEMPORAL_POOLING_CHOICES = {"auto", "mean", "mean_max", "mean+max", "mean-max"}
+MEAN_MAX_POOLING_ALIASES = {"mean_max", "mean+max", "mean-max", "max_mean", "max+mean"}
 
 
 def configure_stdio_for_utf8() -> None:
@@ -58,7 +62,60 @@ def parse_args() -> argparse.Namespace:
         default="DETECTWARNING_LIVE_URL",
         help="training_dashboard에 전달할 live URL 환경변수 이름",
     )
+    parser.add_argument(
+        "--temporal-pooling",
+        default="auto",
+        choices=sorted(TEMPORAL_POOLING_CHOICES),
+        help=(
+            "학습 모델의 temporal pooling 방식. auto이면 config의 "
+            "training.temporal_pooling 또는 model.temporal_pooling 값을 사용합니다."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_config_path(config_arg: str, project_root: Path) -> Path:
+    config_path = Path(config_arg).expanduser()
+    if not config_path.is_absolute():
+        config_path = project_root / config_path
+    return config_path.resolve()
+
+
+def normalize_temporal_pooling(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in MEAN_MAX_POOLING_ALIASES:
+        return "mean_max"
+    if normalized in {"mean", "mean_only", "mean-only", "default", ""}:
+        return "mean"
+    return normalized
+
+
+def temporal_pooling_from_config(config_path: Path) -> str:
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception:
+        return "mean"
+    if not isinstance(config, dict):
+        return "mean"
+    training_config = config.get("training") if isinstance(config.get("training"), dict) else {}
+    model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
+    value = (
+        training_config.get("temporal_pooling")
+        or training_config.get("pooling")
+        or model_config.get("temporal_pooling")
+        or model_config.get("pooling")
+    )
+    return normalize_temporal_pooling(value)
+
+
+def resolve_temporal_pooling(args: argparse.Namespace, project_root: Path) -> tuple[str, str]:
+    requested = normalize_temporal_pooling(args.temporal_pooling)
+    if requested != "auto":
+        return requested, "cli"
+    config_path = resolve_config_path(args.config, project_root)
+    config_value = temporal_pooling_from_config(config_path)
+    return config_value, "config"
 
 
 def resolve_cloudflared_path(cloudflared_arg: str, project_root: Path) -> str:
@@ -174,6 +231,7 @@ Get-CimInstance Win32_Process |
     (
       $_.CommandLine -match 'training_dashboard\.py' -or
       $_.CommandLine -match 'action_training_pipeline\.py' -or
+      $_.CommandLine -match 'action_training_pipeline_mean_max\.py' -or
       $_.CommandLine -match 'run_training_share\.py'
     )
   }} |
@@ -296,6 +354,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent.parent
     dashboard_script = Path(__file__).resolve().with_name("training_dashboard.py")
     cloudflared_cmd = resolve_cloudflared_path(args.cloudflared, project_root)
+    temporal_pooling, temporal_pooling_source = resolve_temporal_pooling(args, project_root)
 
     tunnel_process: subprocess.Popen | None = None
     dashboard_process: subprocess.Popen | None = None
@@ -321,6 +380,7 @@ def main() -> None:
             time.sleep(1.0)
         clear_local_pycache(project_root)
         print(f"[launcher] cloudflared = {cloudflared_cmd}")
+        print(f"[launcher] temporal_pooling = {temporal_pooling} ({temporal_pooling_source})")
         print("[launcher] cloudflared tunnel을 시작합니다...")
         tunnel_process, live_url = start_tunnel(cloudflared_cmd, args.tunnel_url)
         print(f"[launcher] live_url = {live_url}")
@@ -329,6 +389,10 @@ def main() -> None:
         env[args.live_url_env] = live_url
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        if temporal_pooling == "mean_max":
+            env[TEMPORAL_POOLING_ENV] = "mean_max"
+        else:
+            env.pop(TEMPORAL_POOLING_ENV, None)
 
         dashboard_cmd = [
             sys.executable,
