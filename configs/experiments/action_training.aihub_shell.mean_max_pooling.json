@@ -1,6 +1,6 @@
 {
   "paths": {
-    "workspace_dir": "../training_data/action_pipeline_aihub",
+    "workspace_dir": "../training_data/action_pipeline_aihub_mean_max",
     "workspace_dir_env": "DETECTWARNING_WORKSPACE_DIR"
   },
   "dataset_source": "aihub_shell",
@@ -12,7 +12,7 @@
     "filekey": null,
     "api_key_env": "AIHUB_API_KEY",
     "api_key": "",
-    "note": "datasetkey는 AIHub 데이터셋 키이고, 대시보드에 입력하는 filekey는 분할 ZIP 목록의 key 값입니다."
+    "note": "Mean+max pooling experiment. Run with app/action_training_pipeline_mean_max.py."
   },
   "dataset": {
     "target_labels": [
@@ -131,7 +131,6 @@
     "learning_rate": 0.0005,
     "weight_decay": 0.005,
     "hidden_dim": 128,
-    "temporal_pooling": "mean_max",
     "num_layers": 2,
     "dropout": 0.45,
     "label_smoothing": 0.06,
@@ -185,22 +184,22 @@
   },
   "continual_learning": {
     "enabled": true,
-    "resume_from_best": true,
+    "resume_from_best": false,
     "cleanup_raw_after_job": true
   },
   "dashboard": {
     "allowed_origins": []
   },
   "pages_sync": {
-    "enabled": true,
-    "pages_dir": "C:/Users/Administrator/Documents/GitHub/detectWarning-pages",
+    "enabled": false,
+    "pages_dir": "",
     "project_name": "detectWarning",
     "report_title": "행동 학습 결과 리포트",
     "report_url": "",
     "live_url": "",
     "live_url_env": "DETECTWARNING_LIVE_URL",
     "redirect_delay_seconds": 3,
-    "git_auto_push": true,
+    "git_auto_push": false,
     "git_commit_prefix": "Update dashboard"
   }
 }
