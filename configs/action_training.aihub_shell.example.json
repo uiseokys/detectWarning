@@ -131,6 +131,7 @@
     "learning_rate": 0.0005,
     "weight_decay": 0.005,
     "hidden_dim": 128,
+    "temporal_pooling": "mean_max",
     "num_layers": 2,
     "dropout": 0.45,
     "label_smoothing": 0.06,
