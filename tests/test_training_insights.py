@@ -145,6 +145,61 @@ class TrainingInsightsTests(unittest.TestCase):
 
         self.assertIn("summary", insights)
 
+    def test_distribution_details_include_empty_labels_for_recommendations(self) -> None:
+        insights = interpret_training_results(
+            {"labels": ["violence", "loitering"], "latest": {"val_accuracy": 0.0, "val_macro_f1": 0.0}},
+            data_stats={
+                "train_distribution": {
+                    "severity": "critical",
+                    "covered": 1,
+                    "total": 2,
+                    "empty_labels": ["loitering"],
+                    "dominant_label": "violence",
+                    "dominant_count": 180,
+                    "minority_label": "violence",
+                    "minority_count": 180,
+                    "messages": ["비어 있는 클래스: loitering"],
+                }
+            },
+        )
+
+        distribution = next(
+            item for item in insights["diagnostics"] if item.get("title") == "학습 데이터 분포"
+        )
+        self.assertEqual(distribution["details"]["empty_labels"], ["loitering"])
+
+    def test_minority_signal_recommendation_mentions_active_methods(self) -> None:
+        insights = interpret_training_results(
+            {
+                "labels": ["violence", "loitering"],
+                "class_weight_mode": "balanced",
+                "balanced_sampler": "auto_on",
+                "loss_name": "cross_entropy",
+                "latest": {"val_accuracy": 0.2, "val_macro_f1": 0.1},
+            }
+        )
+
+        recommendations = _messages(insights, "recommendations")
+
+        self.assertIn("이미 적용", recommendations)
+        self.assertIn("focal", recommendations)
+
+    def test_minority_signal_recommendation_mentions_cost_sensitive_multipliers(self) -> None:
+        insights = interpret_training_results(
+            {
+                "labels": ["violence", "loitering"],
+                "class_weight_mode": "balanced+multipliers",
+                "balanced_sampler": True,
+                "loss_name": "focal",
+                "latest": {"val_accuracy": 0.2, "val_macro_f1": 0.1},
+            }
+        )
+
+        recommendations = _messages(insights, "recommendations")
+
+        self.assertIn("cost-sensitive class multipliers", recommendations)
+        self.assertIn("class threshold", recommendations)
+
 
 if __name__ == "__main__":
     unittest.main()

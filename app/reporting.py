@@ -118,6 +118,11 @@ def infer_job_message(job: dict | None) -> str:
             f"datasetkey {datasetkey} | filekey {filekey} 학습 결과는 생성됐지만 "
             f"종료 코드 {exit_code} 경고가 남았습니다."
         )
+    if state in {"data_ready", "deferred", "waiting_for_data"}:
+        return (
+            f"datasetkey {datasetkey} | filekey {filekey} 데이터 준비는 완료됐고, "
+            "클래스 수가 채워질 때까지 모델 학습은 대기 중입니다."
+        )
     if state == "aborted":
         return f"datasetkey {datasetkey} | filekey {filekey} 작업이 강제 중단되었습니다."
     if state == "error":

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 import numpy as np
 import requests
 
+from gpu_autotune import apply_gpu_auto_tune
 from reporting import write_json_atomic
 from training_config import load_action_training_config
 
@@ -88,11 +89,15 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
     validate_source_config(config, config_path)
+    config = apply_gpu_auto_tune(config, stage=args.stage, logger=print)
     paths = resolve_paths(config, config_path.parent)
     continual_config = get_continual_config(config)
     pipeline_started_at = current_timestamp_iso()
     stage_timings: dict[str, dict] = {}
     active_stage_started_at = pipeline_started_at
+    training_deferred = False
+    training_defer_message = ""
+    training_defer_coverage: dict | None = None
     write_pipeline_status(
         paths,
         stage="starting",
@@ -159,85 +164,134 @@ def main() -> None:
                     paths,
                     continual_enabled=continual_config["enabled"],
                 )
-            active_stage_started_at = current_timestamp_iso()
-            write_pipeline_status(
-                paths,
-                stage="train",
-                state="running",
-                message="행동 분류 모델을 학습하는 중입니다.",
-                stage_progress=0.8,
-                pipeline_started_at=pipeline_started_at,
-                stage_started_at=active_stage_started_at,
-                stage_timings=stage_timings,
-            )
             labels = get_target_labels(config)
             train_manifest = training_manifests["train"]
             val_manifest = training_manifests["val"]
-            resume_from = None
-            if continual_config["enabled"] and continual_config["resume_from_best"]:
-                candidate_checkpoint = paths["artifacts_dir"] / "best_action_model.pt"
-                if candidate_checkpoint.exists():
-                    resume_from = candidate_checkpoint
-            from action_model import train_action_classifier
+            coverage_report = training_class_coverage_report(config, training_manifests, labels=labels)
 
-            artifacts = train_action_classifier(
-                train_manifest=train_manifest,
-                val_manifest=val_manifest,
-                output_dir=paths["artifacts_dir"],
-                labels=labels,
-                epochs=int(config.get("training", {}).get("epochs", 20)),
-                batch_size=int(config.get("training", {}).get("batch_size", 16)),
-                eval_batch_size=int(config.get("training", {}).get("eval_batch_size", 0) or 0),
-                learning_rate=float(config.get("training", {}).get("learning_rate", 1e-3)),
-                weight_decay=float(config.get("training", {}).get("weight_decay", 1e-3)),
-                hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
-                num_layers=int(config.get("training", {}).get("num_layers", 2)),
-                dropout=float(config.get("training", {}).get("dropout", 0.2)),
-                label_smoothing=float(config.get("training", {}).get("label_smoothing", 0.05)),
-                loss_name=str(config.get("training", {}).get("loss", "cross_entropy")),
-                focal_gamma=float(config.get("training", {}).get("focal_gamma", 2.0)),
-                class_weight=config.get("training", {}).get("class_weight", "balanced"),
-                balanced_sampler=config.get("training", {}).get("balanced_sampler", "auto"),
-                grad_clip_norm=float(config.get("training", {}).get("grad_clip_norm", 1.0)),
-                seed=config.get("training", {}).get("seed", config.get("split", {}).get("seed", 42)),
-                deterministic=bool(config.get("training", {}).get("deterministic", False)),
-                num_workers=config.get("training", {}).get("num_workers", "auto"),
-                device=str(config.get("training", {}).get("device", "cuda")),
-                amp=bool(config.get("training", {}).get("amp", True)),
-                amp_dtype=str(config.get("training", {}).get("amp_dtype", "auto")),
-                compile_model=bool(config.get("training", {}).get("compile_model", True)),
-                compile_backend=str(config.get("training", {}).get("compile_backend", "auto")),
-                dataset_cache_size=int(config.get("training", {}).get("dataset_cache_size", 2048)),
-                prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
-                persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
-                pin_memory=config.get("training", {}).get("pin_memory", "auto"),
-                early_stopping_patience=int(config.get("training", {}).get("early_stopping_patience", 5)),
-                early_stopping_min_delta=float(config.get("training", {}).get("early_stopping_min_delta", 0.001)),
-                imbalance_warn_min_samples=int(config.get("training", {}).get("imbalance_warn_min_samples", 8)),
-                imbalance_warn_ratio=float(config.get("training", {}).get("imbalance_warn_ratio", 5.0)),
-                progress_path=paths["training_progress"],
-                resume_from=resume_from,
-            )
-            stage_timings["train"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
-            print(f"[train] best model: {artifacts.best_model_path}")
-            print(f"[train] metrics: {artifacts.metrics_path}")
-            print(f"[train] labels: {artifacts.labels_path}")
+            if should_defer_training_for_class_coverage(config, coverage_report, stage=args.stage):
+                active_stage_started_at = current_timestamp_iso()
+                stage_timings["data_ready"] = build_stage_timing_entry(
+                    active_stage_started_at,
+                    current_timestamp_iso(),
+                )
+                training_deferred = True
+                training_defer_message = build_training_class_coverage_message(
+                    coverage_report,
+                    prefix="현재 filekey 데이터는 누적했지만 학습은 아직 시작하지 않았습니다.",
+                    suffix=(
+                        "다음 outside filekey를 계속 누적하고, train/val에 최소 클래스 수가 채워지면 "
+                        "자동으로 모델 학습을 시작합니다."
+                    ),
+                )
+                print(f"[train] deferred: {training_defer_message}")
+                training_defer_coverage = coverage_report
+                if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
+                    cleanup_transient_job_data(paths)
+            else:
+                active_stage_started_at = current_timestamp_iso()
+                write_pipeline_status(
+                    paths,
+                    stage="train",
+                    state="running",
+                    message="행동 분류 모델을 학습하는 중입니다.",
+                    stage_progress=0.8,
+                    pipeline_started_at=pipeline_started_at,
+                    stage_started_at=active_stage_started_at,
+                    stage_timings=stage_timings,
+                    class_coverage=coverage_report,
+                )
+                validate_training_class_coverage(config, training_manifests, labels=labels)
+                adaptive_class_weight_multipliers = resolve_adaptive_class_weight_multipliers(
+                    config,
+                    paths,
+                    labels=labels,
+                )
+                config.setdefault("training", {})["class_weight_multipliers"] = adaptive_class_weight_multipliers
+                if adaptive_class_weight_multipliers:
+                    print(f"[train] adaptive class weight multipliers: {adaptive_class_weight_multipliers}")
+                resume_from = None
+                if continual_config["enabled"] and continual_config["resume_from_best"]:
+                    candidate_checkpoint = paths["artifacts_dir"] / "best_action_model.pt"
+                    if candidate_checkpoint.exists() and checkpoint_is_safe_for_resume(config, paths, labels=labels):
+                        resume_from = candidate_checkpoint
+                    elif candidate_checkpoint.exists():
+                        print("[train] 기존 best checkpoint는 단일/부족 클래스 학습 결과라 resume을 건너뜁니다.")
+                from action_model import train_action_classifier
 
-            if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
-                cleanup_transient_job_data(paths)
+                artifacts = train_action_classifier(
+                    train_manifest=train_manifest,
+                    val_manifest=val_manifest,
+                    output_dir=paths["artifacts_dir"],
+                    labels=labels,
+                    epochs=int(config.get("training", {}).get("epochs", 20)),
+                    batch_size=int(config.get("training", {}).get("batch_size", 16)),
+                    eval_batch_size=int(config.get("training", {}).get("eval_batch_size", 0) or 0),
+                    learning_rate=float(config.get("training", {}).get("learning_rate", 1e-3)),
+                    weight_decay=float(config.get("training", {}).get("weight_decay", 1e-3)),
+                    hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
+                    num_layers=int(config.get("training", {}).get("num_layers", 2)),
+                    dropout=float(config.get("training", {}).get("dropout", 0.2)),
+                    label_smoothing=float(config.get("training", {}).get("label_smoothing", 0.05)),
+                    loss_name=str(config.get("training", {}).get("loss", "cross_entropy")),
+                    focal_gamma=float(config.get("training", {}).get("focal_gamma", 2.0)),
+                    class_weight=config.get("training", {}).get("class_weight", "balanced"),
+                    class_weight_multipliers=adaptive_class_weight_multipliers,
+                    balanced_sampler=config.get("training", {}).get("balanced_sampler", "auto"),
+                    grad_clip_norm=float(config.get("training", {}).get("grad_clip_norm", 1.0)),
+                    seed=config.get("training", {}).get("seed", config.get("split", {}).get("seed", 42)),
+                    deterministic=bool(config.get("training", {}).get("deterministic", False)),
+                    num_workers=config.get("training", {}).get("num_workers", "auto"),
+                    device=str(config.get("training", {}).get("device", "cuda")),
+                    amp=bool(config.get("training", {}).get("amp", True)),
+                    amp_dtype=str(config.get("training", {}).get("amp_dtype", "auto")),
+                    compile_model=bool(config.get("training", {}).get("compile_model", True)),
+                    compile_backend=str(config.get("training", {}).get("compile_backend", "auto")),
+                    dataset_cache_size=int(config.get("training", {}).get("dataset_cache_size", 2048)),
+                    prefetch_factor=int(config.get("training", {}).get("prefetch_factor", 2)),
+                    persistent_workers=bool(config.get("training", {}).get("persistent_workers", True)),
+                    pin_memory=config.get("training", {}).get("pin_memory", "auto"),
+                    early_stopping_patience=int(config.get("training", {}).get("early_stopping_patience", 5)),
+                    early_stopping_min_delta=float(config.get("training", {}).get("early_stopping_min_delta", 0.001)),
+                    imbalance_warn_min_samples=int(config.get("training", {}).get("imbalance_warn_min_samples", 8)),
+                    imbalance_warn_ratio=float(config.get("training", {}).get("imbalance_warn_ratio", 5.0)),
+                    progress_path=paths["training_progress"],
+                    resume_from=resume_from,
+                )
+                stage_timings["train"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
+                print(f"[train] best model: {artifacts.best_model_path}")
+                print(f"[train] metrics: {artifacts.metrics_path}")
+                print(f"[train] labels: {artifacts.labels_path}")
+
+                if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
+                    cleanup_transient_job_data(paths)
 
         stage_timings["total"] = build_stage_timing_entry(pipeline_started_at, current_timestamp_iso())
-        write_pipeline_status(
-            paths,
-            stage="completed",
-            state="completed",
-            message="학습 파이프라인이 완료되었습니다.",
-            stage_progress=1.0,
-            pipeline_started_at=pipeline_started_at,
-            stage_started_at=active_stage_started_at,
-            stage_timings=stage_timings,
-            total_duration_seconds=stage_timings["total"]["duration_seconds"],
-        )
+        if training_deferred:
+            write_pipeline_status(
+                paths,
+                stage="data_ready",
+                state="data_ready",
+                message=training_defer_message,
+                stage_progress=1.0,
+                pipeline_started_at=pipeline_started_at,
+                stage_started_at=active_stage_started_at,
+                stage_timings=stage_timings,
+                total_duration_seconds=stage_timings["total"]["duration_seconds"],
+                class_coverage=training_defer_coverage,
+            )
+        else:
+            write_pipeline_status(
+                paths,
+                stage="completed",
+                state="completed",
+                message="학습 파이프라인이 완료되었습니다.",
+                stage_progress=1.0,
+                pipeline_started_at=pipeline_started_at,
+                stage_started_at=active_stage_started_at,
+                stage_timings=stage_timings,
+                total_duration_seconds=stage_timings["total"]["duration_seconds"],
+            )
     except Exception as exc:
         stage_timings["total"] = build_stage_timing_entry(pipeline_started_at, current_timestamp_iso())
         write_pipeline_status(
@@ -437,6 +491,244 @@ def read_json_file(path: Path) -> dict | None:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def resolve_adaptive_class_weight_multipliers(config: dict, paths: dict, *, labels: list[str]) -> dict[str, float]:
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    base_multipliers = normalize_class_weight_multiplier_map(
+        training_config.get("class_weight_multipliers"),
+        labels=labels,
+    )
+    adaptive_config = training_config.get("adaptive_class_weighting", {})
+    if isinstance(adaptive_config, bool):
+        adaptive_config = {"enabled": adaptive_config}
+    if not isinstance(adaptive_config, dict) or not bool(adaptive_config.get("enabled", False)):
+        return base_multipliers
+
+    payloads = []
+    artifacts_dir = paths.get("artifacts_dir")
+    metric_paths = [paths.get("training_progress")]
+    if isinstance(artifacts_dir, Path):
+        metric_paths.append(artifacts_dir / "metrics.json")
+    for path in metric_paths:
+        payload = read_json_file(path) if isinstance(path, Path) else None
+        if isinstance(payload, dict):
+            payloads.append(payload)
+
+    return build_adaptive_class_weight_multipliers(
+        config,
+        labels=labels,
+        metric_payloads=payloads,
+        base_multipliers=base_multipliers,
+    )
+
+
+def build_adaptive_class_weight_multipliers(
+    config: dict,
+    *,
+    labels: list[str],
+    metric_payloads: list[dict] | tuple[dict, ...] | None = None,
+    base_multipliers: dict[str, float] | None = None,
+) -> dict[str, float]:
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    adaptive_config = training_config.get("adaptive_class_weighting", {})
+    if isinstance(adaptive_config, bool):
+        adaptive_config = {"enabled": adaptive_config}
+    if not isinstance(adaptive_config, dict) or not bool(adaptive_config.get("enabled", False)):
+        return normalize_class_weight_multiplier_map(base_multipliers or training_config.get("class_weight_multipliers"), labels=labels)
+
+    multipliers = normalize_class_weight_multiplier_map(
+        base_multipliers or training_config.get("class_weight_multipliers"),
+        labels=labels,
+    )
+    payload = select_metric_payload_for_adaptive_weights(metric_payloads or [])
+    if not payload:
+        return multipliers
+
+    min_multiplier = safe_float(adaptive_config.get("min_multiplier"), 1.0)
+    max_multiplier = safe_float(adaptive_config.get("max_multiplier"), 2.5)
+    if max_multiplier < min_multiplier:
+        min_multiplier, max_multiplier = max_multiplier, min_multiplier
+    min_multiplier = max(min_multiplier, 0.25)
+    max_multiplier = min(max(max_multiplier, min_multiplier), 8.0)
+    target_recall = max(safe_float(adaptive_config.get("target_recall"), 0.55), 1e-6)
+    target_f1 = max(safe_float(adaptive_config.get("target_f1"), 0.45), 1e-6)
+    low_recall_multiplier = clamp_float(
+        safe_float(adaptive_config.get("low_recall_multiplier"), 2.0),
+        min_multiplier,
+        max_multiplier,
+    )
+    low_f1_multiplier = clamp_float(
+        safe_float(adaptive_config.get("low_f1_multiplier"), 1.6),
+        min_multiplier,
+        max_multiplier,
+    )
+    missing_prediction_multiplier = clamp_float(
+        safe_float(adaptive_config.get("missing_prediction_multiplier"), max_multiplier),
+        min_multiplier,
+        max_multiplier,
+    )
+    minority_count_multiplier = clamp_float(
+        safe_float(adaptive_config.get("minority_count_multiplier"), 1.25),
+        min_multiplier,
+        max_multiplier,
+    )
+    min_validation_support = max(int(safe_float(adaptive_config.get("min_validation_support"), 1)), 0)
+
+    final_validation = payload.get("final_validation") if isinstance(payload.get("final_validation"), dict) else {}
+    rows_by_label = class_report_by_label(final_validation.get("per_class"), labels=labels)
+    analysis = payload.get("validation_error_analysis") if isinstance(payload.get("validation_error_analysis"), dict) else {}
+    missing_prediction_classes = {str(label) for label in analysis.get("missing_prediction_classes") or []}
+    confusion_supports, confusion_predictions = confusion_support_and_prediction_counts(
+        final_validation.get("confusion_matrix"),
+        labels=labels,
+    )
+    missing_prediction_classes.update(
+        infer_missing_prediction_classes_from_confusion(
+            final_validation.get("confusion_matrix"),
+            labels=labels,
+        )
+    )
+    train_counts = distribution_counts_by_label(payload.get("train_distribution"))
+    max_train_count = max(train_counts.values()) if train_counts else 0
+
+    for label in labels:
+        label_key = str(label)
+        current_multiplier = multipliers.get(label_key, 1.0)
+        row = rows_by_label.get(label_key, {})
+        support = int(safe_float(row.get("support"), float(confusion_supports.get(label_key, 0))))
+        predicted = int(safe_float(row.get("predicted"), float(confusion_predictions.get(label_key, 1))))
+        if support >= min_validation_support:
+            recall = safe_optional_float(row.get("recall"))
+            f1 = safe_optional_float(row.get("f1"))
+            if label_key in missing_prediction_classes or predicted <= 0:
+                current_multiplier = max(current_multiplier, missing_prediction_multiplier)
+            if recall is not None and recall < target_recall:
+                severity = clamp_float((target_recall - recall) / target_recall, 0.0, 1.0)
+                current_multiplier = max(
+                    current_multiplier,
+                    1.0 + severity * (low_recall_multiplier - 1.0),
+                )
+            if f1 is not None and f1 < target_f1:
+                severity = clamp_float((target_f1 - f1) / target_f1, 0.0, 1.0)
+                current_multiplier = max(
+                    current_multiplier,
+                    1.0 + severity * (low_f1_multiplier - 1.0),
+                )
+
+        train_count = int(train_counts.get(label_key, 0) or 0)
+        if max_train_count > 0 and train_count > 0 and train_count < max_train_count:
+            count_ratio = max_train_count / max(train_count, 1)
+            if count_ratio >= 1.25:
+                current_multiplier = max(
+                    current_multiplier,
+                    min(minority_count_multiplier, math.sqrt(count_ratio)),
+                )
+
+        current_multiplier = clamp_float(current_multiplier, min_multiplier, max_multiplier)
+        if abs(current_multiplier - 1.0) > 1e-6:
+            multipliers[label_key] = round(current_multiplier, 6)
+        else:
+            multipliers.pop(label_key, None)
+
+    return dict(sorted(multipliers.items(), key=lambda item: labels.index(item[0]) if item[0] in labels else len(labels)))
+
+
+def select_metric_payload_for_adaptive_weights(metric_payloads: list[dict] | tuple[dict, ...]) -> dict | None:
+    for payload in metric_payloads:
+        if not isinstance(payload, dict):
+            continue
+        final_validation = payload.get("final_validation")
+        if isinstance(final_validation, dict) and final_validation.get("per_class"):
+            return payload
+    return None
+
+
+def normalize_class_weight_multiplier_map(value, *, labels: list[str]) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    label_set = {str(label) for label in labels}
+    normalized: dict[str, float] = {}
+    for label, raw_multiplier in value.items():
+        label_key = str(label or "").strip()
+        if label_key not in label_set:
+            continue
+        multiplier = safe_optional_float(raw_multiplier)
+        if multiplier is None:
+            continue
+        multiplier = clamp_float(multiplier, 0.25, 8.0)
+        if abs(multiplier - 1.0) > 1e-6:
+            normalized[label_key] = round(multiplier, 6)
+    return normalized
+
+
+def class_report_by_label(class_report, *, labels: list[str]) -> dict[str, dict]:
+    if not isinstance(class_report, list):
+        return {}
+    rows: dict[str, dict] = {}
+    for row in class_report:
+        if not isinstance(row, dict):
+            continue
+        label = row.get("label")
+        if label in (None, ""):
+            class_index = int(safe_float(row.get("class_index"), -1.0))
+            if 0 <= class_index < len(labels):
+                label = labels[class_index]
+        if label in (None, ""):
+            continue
+        rows[str(label)] = row
+    return rows
+
+
+def distribution_counts_by_label(distribution) -> dict[str, int]:
+    if not isinstance(distribution, dict):
+        return {}
+    counts = distribution.get("counts")
+    if isinstance(counts, list):
+        result = {}
+        for row in counts:
+            if isinstance(row, dict) and row.get("label") not in (None, ""):
+                result[str(row.get("label"))] = int(safe_float(row.get("count"), 0.0))
+        return result
+    by_label = distribution.get("by_label")
+    if isinstance(by_label, dict):
+        return {str(label): int(safe_float(count, 0.0)) for label, count in by_label.items()}
+    return {}
+
+
+def confusion_support_and_prediction_counts(confusion_matrix, *, labels: list[str]) -> tuple[dict[str, int], dict[str, int]]:
+    supports = {str(label): 0 for label in labels}
+    predictions = {str(label): 0 for label in labels}
+    if not isinstance(confusion_matrix, list):
+        return supports, predictions
+    for row_index, row in enumerate(confusion_matrix):
+        if not isinstance(row, list):
+            continue
+        if row_index < len(labels):
+            supports[str(labels[row_index])] = sum(int(safe_float(value, 0.0)) for value in row)
+        for column_index, value in enumerate(row):
+            if column_index < len(labels):
+                predictions[str(labels[column_index])] += int(safe_float(value, 0.0))
+    return supports, predictions
+
+
+def safe_optional_float(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def safe_float(value, default: float) -> float:
+    result = safe_optional_float(value)
+    return default if result is None else result
+
+
+def clamp_float(value: float, low: float, high: float) -> float:
+    return min(max(float(value), float(low)), float(high))
 
 
 def write_skip_reports(paths: dict, report: dict) -> None:
@@ -2203,6 +2495,204 @@ def load_training_manifests(config: dict, paths: dict, *, continual_enabled: boo
             "test": paths["current_prepared_test"],
         }
     return materialize_training_manifests(config, paths, base_manifests)
+
+
+def count_manifest_labels(path: Path) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for entry in iter_jsonl_entries(path):
+        label = str(entry.get("target_label") or "").strip()
+        if label:
+            counts[label] += 1
+    return counts
+
+
+def training_class_coverage_report(
+    config: dict,
+    training_manifests: dict[str, Path],
+    *,
+    labels: list[str] | None = None,
+) -> dict:
+    target_labels = [str(label) for label in (labels or get_target_labels(config))]
+    train_counts = count_manifest_labels(training_manifests["train"])
+    val_counts = count_manifest_labels(training_manifests["val"])
+    train_labels = [label for label in target_labels if train_counts.get(label, 0) > 0]
+    val_labels = [label for label in target_labels if val_counts.get(label, 0) > 0]
+    min_train_classes, min_val_classes = required_training_class_counts(config, target_labels)
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    allow_single_class_training = bool(training_config.get("allow_single_class_training", False))
+    ok = (
+        len(target_labels) <= 1
+        or allow_single_class_training
+        or (len(train_labels) >= min_train_classes and len(val_labels) >= min_val_classes)
+    )
+    return {
+        "ok": ok,
+        "target_labels": target_labels,
+        "target_class_count": len(target_labels),
+        "allow_single_class_training": allow_single_class_training,
+        "min_train_classes": min_train_classes,
+        "min_val_classes": min_val_classes,
+        "train_class_count": len(train_labels),
+        "val_class_count": len(val_labels),
+        "train_labels": train_labels,
+        "val_labels": val_labels,
+        "missing_train_labels": [label for label in target_labels if label not in train_labels],
+        "missing_val_labels": [label for label in target_labels if label not in val_labels],
+        "train_counts": dict(train_counts),
+        "val_counts": dict(val_counts),
+    }
+
+
+def build_training_class_coverage_message(
+    report: dict,
+    *,
+    prefix: str = "학습 manifest의 클래스 수가 부족해 모델 학습을 중단했습니다.",
+    suffix: str = "",
+) -> str:
+    target_count = int(report.get("target_class_count", 0) or 0)
+    train_labels = [str(label) for label in report.get("train_labels") or []]
+    val_labels = [str(label) for label in report.get("val_labels") or []]
+    min_train = int(report.get("min_train_classes", 0) or 0)
+    min_val = int(report.get("min_val_classes", 0) or 0)
+    segments = [
+        prefix,
+        (
+            f"train 클래스={len(train_labels)}/{target_count} {train_labels} "
+            f"(필요 최소 {min_train}), "
+            f"val 클래스={len(val_labels)}/{target_count} {val_labels} "
+            f"(필요 최소 {min_val})."
+        ),
+        "단일 클래스만으로 fine-tuning하면 기존 모델이 특정 클래스로 무너질 수 있습니다.",
+    ]
+    if suffix:
+        segments.append(suffix)
+    return " ".join(segment for segment in segments if segment)
+
+
+def should_defer_training_for_class_coverage(config: dict, report: dict, *, stage: str) -> bool:
+    if bool(report.get("ok")):
+        return False
+    if str(stage or "").strip().lower() != "all":
+        return False
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    return bool(training_config.get("defer_until_min_classes", True))
+
+
+def validate_training_class_coverage(
+    config: dict,
+    training_manifests: dict[str, Path],
+    *,
+    labels: list[str] | None = None,
+) -> None:
+    report = training_class_coverage_report(config, training_manifests, labels=labels)
+    if bool(report.get("ok")):
+        return
+
+    raise RuntimeError(
+        build_training_class_coverage_message(
+            report,
+            suffix=(
+                "outside 자동 추천이 비어 있는 다른 클래스 filekey를 먼저 누적하도록 한 뒤 다시 학습하세요. "
+                "정말 단일 클래스 실험이 필요하면 training.allow_single_class_training=true로 명시하세요."
+            ),
+        )
+    )
+
+
+def required_training_class_counts(config: dict, labels: list[str]) -> tuple[int, int]:
+    if len(labels) <= 1:
+        return 1, 1
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    min_train_classes = max(int(training_config.get("min_active_train_classes", 2)), 1)
+    min_val_classes = max(int(training_config.get("min_active_val_classes", min_train_classes)), 1)
+    return min_train_classes, min_val_classes
+
+
+def distribution_covered_count(payload) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    covered = payload.get("covered")
+    try:
+        if covered is not None:
+            return int(covered)
+    except (TypeError, ValueError):
+        return None
+    counts = payload.get("counts")
+    if isinstance(counts, list):
+        return sum(
+            1
+            for row in counts
+            if isinstance(row, dict) and int(row.get("count", 0) or 0) > 0
+        )
+    by_label = payload.get("by_label")
+    if isinstance(by_label, dict):
+        return sum(1 for count in by_label.values() if int(count or 0) > 0)
+    return None
+
+
+def checkpoint_is_safe_for_resume(config: dict, paths: dict, *, labels: list[str]) -> bool:
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    if bool(training_config.get("allow_single_class_training", False)):
+        return True
+
+    block_missing_predictions = bool(training_config.get("block_resume_on_missing_predictions", True))
+    target_label_set = {str(label) for label in labels}
+    min_train_classes, min_val_classes = required_training_class_counts(config, labels)
+    artifacts_dir = paths.get("artifacts_dir")
+    metrics_path = (artifacts_dir / "metrics.json") if isinstance(artifacts_dir, Path) else None
+    for path in (paths.get("training_progress"), metrics_path):
+        payload = read_json_file(path) if isinstance(path, Path) else None
+        if not isinstance(payload, dict):
+            continue
+        if block_missing_predictions:
+            final_validation = payload.get("final_validation") if isinstance(payload.get("final_validation"), dict) else {}
+            missing_prediction_classes = []
+            analysis = payload.get("validation_error_analysis")
+            if isinstance(analysis, dict):
+                missing_prediction_classes = [
+                    str(label)
+                    for label in (analysis.get("missing_prediction_classes") or [])
+                    if str(label) in target_label_set
+                ]
+            if not missing_prediction_classes:
+                missing_prediction_classes = infer_missing_prediction_classes_from_confusion(
+                    final_validation.get("confusion_matrix"),
+                    labels=labels,
+                )
+            if missing_prediction_classes:
+                print(
+                    "[train] previous checkpoint is skipped because it never predicted "
+                    f"these validation classes: {missing_prediction_classes}"
+                )
+                return False
+        train_covered = distribution_covered_count(payload.get("train_distribution"))
+        val_covered = distribution_covered_count(payload.get("val_distribution"))
+        if train_covered is None and val_covered is None:
+            continue
+        return (
+            (train_covered is None or train_covered >= min_train_classes)
+            and (val_covered is None or val_covered >= min_val_classes)
+        )
+    return True
+
+
+def infer_missing_prediction_classes_from_confusion(confusion_matrix, *, labels: list[str]) -> list[str]:
+    if not isinstance(confusion_matrix, list):
+        return []
+    missing: list[str] = []
+    for class_index, label in enumerate(labels):
+        support = 0
+        predicted = 0
+        for row_index, row in enumerate(confusion_matrix):
+            if not isinstance(row, list):
+                continue
+            if row_index == class_index:
+                support = sum(int(value or 0) for value in row)
+            if class_index < len(row):
+                predicted += int(row[class_index] or 0)
+        if support > 0 and predicted <= 0:
+            missing.append(str(label))
+    return missing
 
 
 def update_cumulative_manifests(

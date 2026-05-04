@@ -173,12 +173,20 @@ def collect_result_summary(paths: dict) -> dict:
 
 
 def classify_job_exit(paths: dict, current_job: dict | None, exit_code: int) -> tuple[str, str]:
-    if exit_code == 0:
-        return "completed", "현재 작업이 정상 완료되었습니다."
-
     pipeline_status = read_json(paths["pipeline_status"]) or {}
     pipeline_state = str(pipeline_status.get("state", "")).strip().lower()
     pipeline_stage = str(pipeline_status.get("stage", "")).strip().lower()
+    deferred_states = {"data_ready", "deferred", "waiting_for_data"}
+    if exit_code == 0:
+        if pipeline_state in deferred_states or pipeline_stage in deferred_states:
+            message = str(pipeline_status.get("message") or "").strip()
+            return (
+                "data_ready",
+                message
+                or "현재 filekey 데이터는 준비됐지만 클래스 수가 부족해 모델 학습은 다음 누적 작업까지 대기합니다.",
+            )
+        return "completed", "현재 작업이 정상 완료되었습니다."
+
     training_progress_path = paths.get("training_progress")
     if training_progress_path:
         training_progress = read_json(training_progress_path) or {}

@@ -10,18 +10,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from action_training_pipeline import (
     DownloadedItem,
+    build_adaptive_class_weight_multipliers,
     build_prepared_quality_rules,
     check_prepared_entry_quality,
     compute_split_counts,
     create_prepare_stats,
     decide_prepare_sample_usage,
     finalize_prepare_stats,
+    infer_missing_prediction_classes_from_confusion,
     iter_jsonl_entries,
     materialize_training_manifests,
     register_prepare_input,
     register_prepare_skip,
     register_prepare_used,
+    should_defer_training_for_class_coverage,
     split_dataset,
+    training_class_coverage_report,
+    validate_training_class_coverage,
     write_downloaded_items_manifest,
 )
 
@@ -277,6 +282,115 @@ class ActionTrainingPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["item_id"], "one")
         self.assertEqual(rows[0]["target_label"], "normal")
         self.assertIn("metadata", rows[0])
+
+    def test_stage_all_can_defer_when_only_one_class_is_ready(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            train_manifest = workspace / "train.jsonl"
+            val_manifest = workspace / "val.jsonl"
+            for path in (train_manifest, val_manifest):
+                path.write_text(
+                    json.dumps({"item_id": path.stem, "target_label": "normal"}, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+            config = {
+                "dataset": {"target_labels": ["normal", "violence"]},
+                "training": {"min_active_train_classes": 2, "min_active_val_classes": 2},
+            }
+            manifests = {"train": train_manifest, "val": val_manifest}
+
+            report = training_class_coverage_report(config, manifests)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(should_defer_training_for_class_coverage(config, report, stage="all"))
+            self.assertFalse(should_defer_training_for_class_coverage(config, report, stage="train"))
+            with self.assertRaisesRegex(RuntimeError, "클래스 수가 부족"):
+                validate_training_class_coverage(config, manifests)
+
+    def test_infer_missing_prediction_classes_from_confusion(self) -> None:
+        missing = infer_missing_prediction_classes_from_confusion(
+            [
+                [0, 2, 1],
+                [0, 3, 0],
+                [0, 1, 2],
+            ],
+            labels=["violence", "collapse", "abduction"],
+        )
+
+        self.assertEqual(missing, ["violence"])
+
+    def test_adaptive_class_weighting_boosts_all_low_performing_classes(self) -> None:
+        multipliers = build_adaptive_class_weight_multipliers(
+            {
+                "training": {
+                    "class_weight_multipliers": {},
+                    "adaptive_class_weighting": {
+                        "enabled": True,
+                        "target_recall": 0.55,
+                        "target_f1": 0.45,
+                        "max_multiplier": 2.5,
+                    },
+                }
+            },
+            labels=["violence", "collapse", "abduction", "loitering"],
+            metric_payloads=[
+                {
+                    "final_validation": {
+                        "per_class": [
+                            {"class_index": 0, "label": "violence", "recall": 0.2, "f1": 0.2, "support": 5, "predicted": 5},
+                            {"class_index": 1, "label": "collapse", "recall": 0.67, "f1": 0.57, "support": 9, "predicted": 12},
+                            {"class_index": 2, "label": "abduction", "recall": 0.17, "f1": 0.22, "support": 6, "predicted": 3},
+                            {"class_index": 3, "label": "loitering", "recall": 0.64, "f1": 0.64, "support": 11, "predicted": 11},
+                        ]
+                    },
+                    "train_distribution": {
+                        "counts": [
+                            {"label": "violence", "count": 29},
+                            {"label": "collapse", "count": 44},
+                            {"label": "abduction", "count": 40},
+                            {"label": "loitering", "count": 51},
+                        ]
+                    },
+                }
+            ],
+        )
+
+        self.assertGreater(multipliers["violence"], 1.0)
+        self.assertGreater(multipliers["abduction"], 1.0)
+        self.assertNotIn("collapse", multipliers)
+        self.assertNotIn("loitering", multipliers)
+
+    def test_adaptive_class_weighting_uses_missing_prediction_cap(self) -> None:
+        multipliers = build_adaptive_class_weight_multipliers(
+            {
+                "training": {
+                    "class_weight_multipliers": {},
+                    "adaptive_class_weighting": {
+                        "enabled": True,
+                        "missing_prediction_multiplier": 2.5,
+                        "max_multiplier": 2.5,
+                    },
+                }
+            },
+            labels=["violence", "collapse"],
+            metric_payloads=[
+                {
+                    "final_validation": {
+                        "confusion_matrix": [
+                            [0, 5],
+                            [0, 10],
+                        ],
+                        "per_class": [
+                            {"class_index": 0, "label": "violence", "recall": 0.0, "f1": 0.0, "support": 5},
+                            {"class_index": 1, "label": "collapse", "recall": 0.9, "f1": 0.75, "support": 10},
+                        ]
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(multipliers["violence"], 2.5)
+        self.assertNotIn("collapse", multipliers)
 
 
 if __name__ == "__main__":

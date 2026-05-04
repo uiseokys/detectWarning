@@ -34,6 +34,10 @@ class TrainingConfigTests(unittest.TestCase):
             self.assertEqual(config["dataset"]["target_labels"], ["violence", "normal"])
             self.assertIn("training", config)
             self.assertEqual(config["training"]["batch_size"], 16)
+            self.assertEqual(config["training"]["loss"], "focal")
+            self.assertTrue(config["training"]["balanced_sampler"])
+            self.assertEqual(config["training"]["class_weight_multipliers"], {})
+            self.assertTrue(config["training"]["adaptive_class_weighting"]["enabled"])
 
     def test_resolve_pages_sync_config_resolves_relative_pages_dir(self) -> None:
         with TemporaryDirectory() as tmpdir:

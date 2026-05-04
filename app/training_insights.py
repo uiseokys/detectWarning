@@ -239,7 +239,7 @@ def interpret_training_results(
             "validation macro F1이 낮아 일부 클래스가 거의 맞지 않거나 클래스 불균형 영향을 받고 있을 수 있습니다.",
             details={"val_macro_f1": val_macro_f1},
         )
-        recommend("macro_f1_class_weight", "warning", "class weight, WeightedRandomSampler, focal loss 중 하나를 실험해 minority class 학습 신호를 키우세요.")
+        recommend("macro_f1_class_weight", "warning", _minority_signal_recommendation(metrics))
         recommend("macro_f1_confusion", "watch", "confusion matrix에서 recall이 낮은 클래스와 자주 섞이는 클래스 쌍을 먼저 확인하세요.")
     if balanced_accuracy is not None and balanced_accuracy < 0.5:
         performance_level = _max_level(performance_level, "warning")
@@ -595,7 +595,12 @@ def _add_confusion_insights(add, recommend, matrix: list[list[int]], labels: lis
             f"{', '.join(missing_predictions[:4])} 클래스가 validation에서 거의 예측되지 않았습니다.",
             details={"labels": missing_predictions},
         )
-        recommend("missing_predictions", "critical", "거의 예측되지 않는 클래스의 train 샘플 수, label mapping, augmentation 적용 여부를 먼저 확인하세요.")
+        recommend(
+            "missing_predictions",
+            "critical",
+            "거의 예측되지 않는 클래스의 train 샘플 수, label mapping, augmentation 적용 여부를 먼저 확인하고 "
+            "이전 checkpoint를 그대로 이어받기보다 focal loss, sampler, false negative 샘플 검토를 함께 실험하세요.",
+        )
 
     return level
 
@@ -899,6 +904,34 @@ def _summary_item(level: str, title: str, message: str) -> dict:
     }
 
 
+def _minority_signal_recommendation(metrics: dict) -> str:
+    class_weight_mode = str(metrics.get("class_weight_mode") or "").strip().lower()
+    sampler_mode = str(metrics.get("balanced_sampler") or "").strip().lower()
+    loss_name = str(metrics.get("loss_name") or "").strip().lower()
+    off_values = {"", "off", "none", "false", "disabled", "0", "auto_off"}
+    active = []
+    if class_weight_mode not in off_values:
+        active.append("class weight")
+    if "multiplier" in class_weight_mode:
+        active.append("cost-sensitive class multipliers")
+    if sampler_mode not in off_values and not sampler_mode.endswith("_unavailable"):
+        active.append("WeightedRandomSampler")
+    if loss_name in {"focal", "focal_loss"}:
+        active.append("focal loss")
+
+    if not active:
+        return "class weight, WeightedRandomSampler, focal loss 중 하나를 실험해 minority class 학습 신호를 키우세요."
+    if loss_name not in {"focal", "focal_loss"}:
+        return (
+            f"{', '.join(active)}는 이미 적용 중입니다. "
+            "다음 비교 실험은 loss를 focal로 바꿔 minority class의 어려운 샘플 학습 신호가 커지는지 확인하세요."
+        )
+    return (
+        f"{', '.join(active)}가 이미 적용 중입니다. "
+        "추가 개선은 부족 클래스 데이터 추가, 라벨 품질 점검, false negative 샘플 검토, class threshold/cost-sensitive 설정 비교를 우선하세요."
+    )
+
+
 def _distribution_findings(data_stats: dict) -> list[dict]:
     findings = []
     for key, title in (
@@ -919,9 +952,15 @@ def _distribution_findings(data_stats: dict) -> list[dict]:
                     "message": " ".join(str(message) for message in messages[:2]) or "클래스 분포가 불균형합니다.",
                     "details": {
                         "severity": severity,
+                        "covered": payload.get("covered"),
+                        "total": payload.get("total"),
+                        "empty_labels": payload.get("empty_labels") or [],
+                        "low_sample_labels": payload.get("low_sample_labels") or [],
                         "imbalance_ratio": payload.get("imbalance_ratio"),
                         "dominant_label": payload.get("dominant_label"),
+                        "dominant_count": payload.get("dominant_count"),
                         "minority_label": payload.get("minority_label"),
+                        "minority_count": payload.get("minority_count"),
                     },
                 }
             )

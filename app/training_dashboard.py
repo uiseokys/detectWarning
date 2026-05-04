@@ -121,14 +121,23 @@ AIHUB_FILEKEY_LOOKUP_TEXT_KEYS = (
 AIHUB_FILEKEY_LOOKUP_STATUS_KEYS = (
     "trainable",
     "trained",
+    "prepared",
     "excluded",
     "queued",
     "running",
     "unknown",
 )
 AIHUB_TRAINED_JOB_STATES = {"completed", "completed_warning"}
+AIHUB_PREPARED_JOB_STATES = {"data_ready", "deferred", "waiting_for_data"}
 AIHUB_ZIP_GROUP_ORDER = ("outsidedoor", "insidedoor", "inside_croki")
 AIHUB_AUTO_RECOMMEND_ZIP_GROUPS = ("outsidedoor",)
+AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS = ("insidedoor",)
+AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS = ("inside_croki",)
+AIHUB_AUTO_RECOMMEND_INSIDE_FALLBACK_LABELS = {
+    "abduction": "minority_or_diagnosed",
+    "collapse": "diagnosed",
+}
+AIHUB_AUTO_RECOMMEND_MAX_CLASS_RATIO = 1.5
 AIHUB_AUTO_RECOMMEND_MAX_PENDING = 1
 AIHUB_ZIP_GROUP_PATTERN = re.compile(
     r"^(?P<group>outsidedoor|insidedoor|inside_croki)(?:[_-](?P<number>\d+))?",
@@ -143,6 +152,7 @@ DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS = {
     "normal": 0.0,
     "improving": 0.0,
 }
+DIAGNOSIS_EMPTY_CLASS_PRIORITY = 5000.0
 
 
 def optional_aihub_api_key(shell_config: dict, override: str = "") -> str:
@@ -209,6 +219,48 @@ def aihub_entry_matches_zip_groups(entry: dict, allowed_zip_groups: set[str]) ->
     if not allowed_zip_groups:
         return True
     return aihub_entry_zip_group(entry) in allowed_zip_groups
+
+
+def normalize_recommendation_zip_groups(values) -> set[str]:
+    return {
+        str(value).strip().lower()
+        for value in (values or [])
+        if str(value).strip()
+    }
+
+
+def build_auto_recommendation_policy() -> dict:
+    return {
+        "primary_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
+        "fallback_zip_groups": list(AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS),
+        "excluded_zip_groups": list(AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS),
+        "inside_fallback_labels": dict(AIHUB_AUTO_RECOMMEND_INSIDE_FALLBACK_LABELS),
+        "max_class_ratio": AIHUB_AUTO_RECOMMEND_MAX_CLASS_RATIO,
+    }
+
+
+def normalize_auto_recommendation_policy(policy: dict | None) -> dict:
+    if not isinstance(policy, dict):
+        return {}
+    max_ratio = policy.get("max_class_ratio", 0)
+    try:
+        max_ratio = float(max_ratio or 0)
+    except (TypeError, ValueError):
+        max_ratio = 0.0
+    fallback_labels = policy.get("inside_fallback_labels")
+    if not isinstance(fallback_labels, dict):
+        fallback_labels = {}
+    return {
+        "primary_zip_groups": normalize_recommendation_zip_groups(policy.get("primary_zip_groups")),
+        "fallback_zip_groups": normalize_recommendation_zip_groups(policy.get("fallback_zip_groups")),
+        "excluded_zip_groups": normalize_recommendation_zip_groups(policy.get("excluded_zip_groups")),
+        "inside_fallback_labels": {
+            normalize_recommendation_label(label): str(mode or "").strip().lower()
+            for label, mode in fallback_labels.items()
+            if normalize_recommendation_label(label)
+        },
+        "max_class_ratio": max_ratio,
+    }
 
 
 def normalize_recommendation_label(value) -> str:
@@ -327,9 +379,9 @@ def build_diagnosis_label_priorities(insights: dict | None) -> dict[str, dict]:
             add_diagnosis_label_priority(
                 priorities,
                 label,
-                weight=base_weight,
+                weight=DIAGNOSIS_EMPTY_CLASS_PRIORITY + base_weight,
                 reason=title or "empty class",
-                level=level,
+                level="critical",
             )
         for row in details.get("low_sample_labels") or []:
             if isinstance(row, dict) and row.get("label"):
@@ -366,14 +418,210 @@ def diagnosis_priority_for_label(label, priorities: dict[str, dict]) -> dict:
     )
 
 
+def normalize_label_count_map(counts: dict | None) -> Counter[str]:
+    normalized: Counter[str] = Counter()
+    if not isinstance(counts, dict):
+        return normalized
+    for label, count in counts.items():
+        label_key = str(label or "").strip()
+        if not label_key:
+            continue
+        try:
+            normalized[label_key] += max(int(count or 0), 0)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def normalize_split_label_counts(
+    prepared_label_counts: dict[str, int] | None,
+    prepared_split_label_counts: dict[str, dict[str, int]] | None,
+) -> dict[str, Counter[str]]:
+    if isinstance(prepared_split_label_counts, dict) and prepared_split_label_counts:
+        return {
+            str(split_name): normalize_label_count_map(counts if isinstance(counts, dict) else {})
+            for split_name, counts in prepared_split_label_counts.items()
+        }
+    fallback_counts = normalize_label_count_map(prepared_label_counts)
+    if not fallback_counts:
+        return {}
+    return {"train": Counter(fallback_counts), "val": Counter(fallback_counts)}
+
+
+def recommendation_coverage_score(
+    label: str,
+    *,
+    prepared_counts: Counter[str],
+    split_counts: dict[str, Counter[str]],
+    planned_count: int = 0,
+) -> dict:
+    train_count = int(split_counts.get("train", Counter()).get(label, 0) or 0)
+    val_count = int(split_counts.get("val", Counter()).get(label, 0) or 0)
+    total_count = int(prepared_counts.get(label, 0) or 0)
+    effective_train_count = train_count + max(int(planned_count or 0), 0)
+    effective_val_count = val_count + max(int(planned_count or 0), 0)
+    if effective_train_count <= 0 and effective_val_count <= 0:
+        coverage_rank = 0
+        coverage_state = "missing"
+    elif effective_train_count <= 0 or effective_val_count <= 0:
+        coverage_rank = 1
+        coverage_state = "split_incomplete"
+    else:
+        coverage_rank = 2
+        coverage_state = "covered"
+    return {
+        "coverage_rank": coverage_rank,
+        "coverage_state": coverage_state,
+        "train_count": train_count,
+        "val_count": val_count,
+        "prepared_count": total_count,
+        "train_balance_bucket": recommendation_count_bucket(train_count, 16),
+        "val_balance_bucket": recommendation_count_bucket(val_count, 4),
+        "prepared_balance_bucket": recommendation_count_bucket(total_count, 20),
+        "effective_train_count": effective_train_count,
+        "effective_val_count": effective_val_count,
+    }
+
+
+def recommendation_count_bucket(count: int, bucket_size: int) -> int:
+    return max(int(count or 0), 0) // max(int(bucket_size or 1), 1)
+
+
+def recommendation_effective_label_counts(
+    *,
+    prepared_counts: Counter[str],
+    planned_counts: Counter[str],
+    candidate_labels: set[str],
+) -> Counter[str]:
+    labels = {
+        str(label or "").strip()
+        for label in (*prepared_counts.keys(), *planned_counts.keys(), *candidate_labels)
+        if str(label or "").strip()
+    }
+    return Counter(
+        {
+            label: max(int(prepared_counts.get(label, 0) or 0), 0)
+            + max(int(planned_counts.get(label, 0) or 0), 0)
+            for label in labels
+        }
+    )
+
+
+def recommendation_minority_state(label: str, label_counts: Counter[str]) -> dict:
+    normalized_label = str(label or "").strip()
+    if not normalized_label or not label_counts:
+        return {"is_minority": False, "min_count": 0, "label_count": 0}
+    label_count = int(label_counts.get(normalized_label, 0) or 0)
+    min_count = min(int(count or 0) for count in label_counts.values())
+    return {
+        "is_minority": label_count <= min_count,
+        "min_count": min_count,
+        "label_count": label_count,
+    }
+
+
+def recommendation_balance_limit_state(
+    label: str,
+    label_counts: Counter[str],
+    *,
+    max_ratio: float,
+) -> dict:
+    normalized_label = str(label or "").strip()
+    if not normalized_label or max_ratio <= 0 or len(label_counts) < 2:
+        return {
+            "allowed": True,
+            "max_ratio": max_ratio,
+            "min_count": 0,
+            "label_count": int(label_counts.get(normalized_label, 0) or 0),
+            "projected_count": int(label_counts.get(normalized_label, 0) or 0) + 1,
+            "limit": None,
+            "reason": "",
+        }
+    label_count = int(label_counts.get(normalized_label, 0) or 0)
+    min_count = min(int(count or 0) for count in label_counts.values())
+    projected_count = label_count + 1
+    if label_count <= min_count:
+        allowed = True
+    elif min_count <= 0:
+        allowed = False
+    else:
+        allowed = label_count <= (float(min_count) * float(max_ratio))
+    return {
+        "allowed": allowed,
+        "max_ratio": max_ratio,
+        "min_count": min_count,
+        "label_count": label_count,
+        "projected_count": projected_count,
+        "limit": round(float(min_count) * float(max_ratio), 6) if min_count > 0 else 0,
+        "reason": "" if allowed else "class_ratio_limit",
+    }
+
+
+def recommendation_zip_scope_state(
+    entry: dict,
+    *,
+    allowed_groups: set[str],
+    policy: dict,
+    label: str,
+    primary_candidate_labels: set[str],
+    diagnosis_priority: dict,
+    label_counts: Counter[str],
+    strict_fallback: bool,
+) -> dict:
+    zip_group = aihub_entry_zip_group(entry) or str(entry.get("zip_group") or "").strip().lower()
+    if not policy:
+        return {
+            "allowed": aihub_entry_matches_zip_groups(entry, allowed_groups),
+            "zip_group": zip_group,
+            "scope_reason": "allowed_zip_group",
+        }
+
+    primary_groups = policy.get("primary_zip_groups") or allowed_groups
+    fallback_groups = policy.get("fallback_zip_groups") or set()
+    excluded_groups = policy.get("excluded_zip_groups") or set()
+    fallback_labels = policy.get("inside_fallback_labels") or {}
+    normalized_label = normalize_recommendation_label(label)
+    insight_priority = float(diagnosis_priority.get("priority", 0.0) or 0.0)
+    minority_state = recommendation_minority_state(label, label_counts)
+
+    if zip_group in excluded_groups:
+        return {"allowed": False, "zip_group": zip_group, "scope_reason": "excluded_zip_group"}
+    if not zip_group:
+        return {"allowed": False, "zip_group": zip_group, "scope_reason": "missing_zip_group"}
+    if not primary_groups or zip_group in primary_groups:
+        return {"allowed": True, "zip_group": zip_group, "scope_reason": "primary_zip_group"}
+    if zip_group not in fallback_groups:
+        return {"allowed": False, "zip_group": zip_group, "scope_reason": "unsupported_zip_group"}
+    fallback_mode = str(fallback_labels.get(normalized_label) or "").strip().lower()
+    if not fallback_mode:
+        return {"allowed": False, "zip_group": zip_group, "scope_reason": "fallback_label_not_allowed"}
+    if normalized_label in {normalize_recommendation_label(item) for item in primary_candidate_labels}:
+        return {"allowed": False, "zip_group": zip_group, "scope_reason": "primary_candidate_available"}
+    if not strict_fallback:
+        return {"allowed": True, "zip_group": zip_group, "scope_reason": "fallback_zip_group"}
+    if fallback_mode == "diagnosed" and insight_priority > 0:
+        return {"allowed": True, "zip_group": zip_group, "scope_reason": "diagnosed_fallback"}
+    if fallback_mode == "minority_or_diagnosed" and (
+        insight_priority > 0 or minority_state.get("is_minority")
+    ):
+        return {"allowed": True, "zip_group": zip_group, "scope_reason": "minority_or_diagnosed_fallback"}
+    return {"allowed": False, "zip_group": zip_group, "scope_reason": "fallback_condition_not_met"}
+
+
 def normalize_aihub_lookup_entries(
     entries: list[dict],
     *,
     label_mapping: dict,
     excluded_source_labels: list,
+    target_labels: list[str] | None = None,
 ) -> list[dict]:
     label_matchers = build_source_label_matchers(label_mapping.keys())
     excluded_matchers = build_source_label_matchers(excluded_source_labels)
+    target_label_set = {
+        str(label).strip()
+        for label in (target_labels or [])
+        if str(label).strip()
+    }
     normalized_entries: list[dict] = []
 
     for entry in sorted(entries, key=aihub_filekey_sort_key):
@@ -386,7 +634,13 @@ def normalize_aihub_lookup_entries(
         entry_text = aihub_entry_text(entry)
         matched_source_label = match_source_label_text(entry_text, matchers=label_matchers)
         excluded_source_label = match_source_label_text(entry_text, matchers=excluded_matchers)
-        target_label = str(label_mapping.get(matched_source_label) or "").strip()
+        mapped_target_label = str(label_mapping.get(matched_source_label) or "").strip()
+        out_of_scope_target_label = ""
+        if mapped_target_label and target_label_set and mapped_target_label not in target_label_set:
+            out_of_scope_target_label = mapped_target_label
+            target_label = ""
+        else:
+            target_label = mapped_target_label
         source_label = str(entry.get("source_label") or entry.get("sourceLabel") or "").strip()
         source_alias = str(entry.get("source_alias") or entry.get("sourceAlias") or "").strip()
         name = str(
@@ -398,7 +652,7 @@ def normalize_aihub_lookup_entries(
             or ""
         ).strip()
         zip_info = classify_aihub_zip_name(name)
-        if excluded_source_label:
+        if excluded_source_label or out_of_scope_target_label:
             status = "excluded"
         elif target_label:
             status = "trainable"
@@ -414,6 +668,7 @@ def normalize_aihub_lookup_entries(
                 "matched_source_label": matched_source_label,
                 "target_label": target_label,
                 "excluded_source_label": excluded_source_label,
+                "out_of_scope_target_label": out_of_scope_target_label,
                 **zip_info,
                 "status": status,
                 "trainable": status == "trainable",
@@ -450,6 +705,7 @@ def build_aihub_lookup_result(
         "trainable_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trainable"],
         "selectable_filekeys": [entry["filekey"] for entry in entries if entry.get("selectable")],
         "trained_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trained"],
+        "prepared_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "prepared"],
         "excluded_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "excluded"],
         "unknown_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "unknown"],
         "cache": {
@@ -464,40 +720,92 @@ def find_next_trainable_aihub_entry(
     *,
     existing_filekeys: set[str] | None = None,
     prepared_label_counts: dict[str, int] | None = None,
+    prepared_split_label_counts: dict[str, dict[str, int]] | None = None,
     allowed_zip_groups: list[str] | tuple[str, ...] | set[str] | None = None,
     insights: dict | None = None,
+    recommendation_policy: dict | None = None,
 ) -> dict | None:
     blocked = {str(filekey).strip() for filekey in (existing_filekeys or set()) if str(filekey).strip()}
-    allowed_groups = {
-        str(group).strip().lower()
-        for group in (allowed_zip_groups or [])
-        if str(group).strip()
-    }
-    prepared_counts = Counter(
-        {
-            str(label): int(count or 0)
-            for label, count in (prepared_label_counts or {}).items()
-        }
-    )
+    allowed_groups = normalize_recommendation_zip_groups(allowed_zip_groups)
+    policy = normalize_auto_recommendation_policy(recommendation_policy)
+    prepared_counts = normalize_label_count_map(prepared_label_counts)
+    split_counts = normalize_split_label_counts(prepared_label_counts, prepared_split_label_counts)
     diagnosis_priorities = build_diagnosis_label_priorities(insights)
+    primary_groups = policy.get("primary_zip_groups") or allowed_groups
+    excluded_groups = policy.get("excluded_zip_groups") or set()
+    primary_candidate_labels: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        filekey = str(entry.get("filekey") or "").strip()
+        if not filekey or filekey in blocked:
+            continue
+        if entry.get("status") != "trainable" or entry.get("selectable") is False:
+            continue
+        zip_group = aihub_entry_zip_group(entry)
+        if zip_group in excluded_groups:
+            continue
+        if aihub_entry_matches_zip_groups(entry, primary_groups):
+            primary_candidate_labels.add(recommendation_label(entry))
+
     planned_counts: Counter[str] = Counter()
     trained_counts: Counter[str] = Counter()
     active_zip_counts: Counter[str] = Counter()
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if not aihub_entry_matches_zip_groups(entry, allowed_groups):
-            continue
         label = recommendation_label(entry)
-        zip_group = str(entry.get("zip_group") or "기타")
-        zip_group = aihub_entry_zip_group(entry) or zip_group or "기타"
+        priority_payload = diagnosis_priority_for_label(label, diagnosis_priorities)
+        zip_scope = recommendation_zip_scope_state(
+            entry,
+            allowed_groups=allowed_groups,
+            policy=policy,
+            label=label,
+            primary_candidate_labels=primary_candidate_labels,
+            diagnosis_priority=priority_payload,
+            label_counts=Counter(),
+            strict_fallback=False,
+        )
+        if not zip_scope.get("allowed"):
+            continue
+        zip_group = str(zip_scope.get("zip_group") or entry.get("zip_group") or "기타")
         status = str(entry.get("status") or "unknown")
         if status in {"queued", "running"}:
             planned_counts[label] += 1
             active_zip_counts[zip_group] += 1
-        elif status == "trained":
+        elif status in {"trained", "prepared"}:
             trained_counts[label] += 1
             active_zip_counts[zip_group] += 1
+
+    candidate_labels: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        filekey = str(entry.get("filekey") or "").strip()
+        if not filekey or filekey in blocked:
+            continue
+        if entry.get("status") != "trainable" or entry.get("selectable") is False:
+            continue
+        label = recommendation_label(entry)
+        priority_payload = diagnosis_priority_for_label(label, diagnosis_priorities)
+        broad_scope = recommendation_zip_scope_state(
+            entry,
+            allowed_groups=allowed_groups,
+            policy=policy,
+            label=label,
+            primary_candidate_labels=primary_candidate_labels,
+            diagnosis_priority=priority_payload,
+            label_counts=Counter(),
+            strict_fallback=False,
+        )
+        if broad_scope.get("allowed"):
+            candidate_labels.add(label)
+    effective_label_counts = recommendation_effective_label_counts(
+        prepared_counts=prepared_counts,
+        planned_counts=planned_counts,
+        candidate_labels=candidate_labels,
+    )
+    max_class_ratio = float(policy.get("max_class_ratio", 0.0) or 0.0)
 
     best: tuple[tuple, dict] | None = None
     for order, entry in enumerate(entries):
@@ -506,23 +814,49 @@ def find_next_trainable_aihub_entry(
         filekey = str(entry.get("filekey") or "").strip()
         if not filekey or filekey in blocked:
             continue
-        if not aihub_entry_matches_zip_groups(entry, allowed_groups):
-            continue
         if entry.get("status") == "trainable" and entry.get("selectable") is not False:
             label = recommendation_label(entry)
-            zip_group = str(entry.get("zip_group") or "기타")
-            zip_group = aihub_entry_zip_group(entry) or zip_group or "기타"
             diagnosis_priority = diagnosis_priority_for_label(label, diagnosis_priorities)
             insight_priority = float(diagnosis_priority.get("priority", 0.0) or 0.0)
-            prepared_count = int(prepared_counts[label])
+            zip_scope = recommendation_zip_scope_state(
+                entry,
+                allowed_groups=allowed_groups,
+                policy=policy,
+                label=label,
+                primary_candidate_labels=primary_candidate_labels,
+                diagnosis_priority=diagnosis_priority,
+                label_counts=effective_label_counts,
+                strict_fallback=True,
+            )
+            if not zip_scope.get("allowed"):
+                continue
+            balance_limit = recommendation_balance_limit_state(
+                label,
+                effective_label_counts,
+                max_ratio=max_class_ratio,
+            )
+            if not balance_limit.get("allowed"):
+                continue
+            zip_group = str(zip_scope.get("zip_group") or entry.get("zip_group") or "기타")
             planned_count = int(planned_counts[label])
             trained_count = int(trained_counts[label])
             active_zip_count = int(active_zip_counts[zip_group])
+            coverage_score = recommendation_coverage_score(
+                label,
+                prepared_counts=prepared_counts,
+                split_counts=split_counts,
+                planned_count=planned_count,
+            )
+            prepared_count = int(coverage_score["prepared_count"])
             score = (
+                coverage_score["coverage_rank"],
+                planned_count,
+                coverage_score["val_balance_bucket"],
+                coverage_score["train_balance_bucket"],
+                coverage_score["prepared_balance_bucket"],
                 -insight_priority,
                 prepared_count + planned_count,
                 prepared_count,
-                planned_count,
                 trained_count,
                 active_zip_count,
                 aihub_filekey_sort_key(entry),
@@ -534,6 +868,10 @@ def find_next_trainable_aihub_entry(
                 "recommendation_scope": {
                     "allowed_zip_groups": sorted(allowed_groups),
                     "zip_group": zip_group,
+                    "scope_reason": zip_scope.get("scope_reason") or "",
+                    "primary_zip_groups": sorted(policy.get("primary_zip_groups") or allowed_groups),
+                    "fallback_zip_groups": sorted(policy.get("fallback_zip_groups") or []),
+                    "excluded_zip_groups": sorted(policy.get("excluded_zip_groups") or []),
                 },
                 "recommendation_score": {
                     "target_label": label,
@@ -544,6 +882,17 @@ def find_next_trainable_aihub_entry(
                     "planned_count": planned_count,
                     "trained_count": trained_count,
                     "active_zip_count": active_zip_count,
+                    "coverage_state": coverage_score["coverage_state"],
+                    "train_count": coverage_score["train_count"],
+                    "val_count": coverage_score["val_count"],
+                    "train_balance_bucket": coverage_score["train_balance_bucket"],
+                    "val_balance_bucket": coverage_score["val_balance_bucket"],
+                    "prepared_balance_bucket": coverage_score["prepared_balance_bucket"],
+                    "balance_max_ratio": balance_limit.get("max_ratio"),
+                    "balance_min_count": balance_limit.get("min_count"),
+                    "balance_label_count": balance_limit.get("label_count"),
+                    "balance_projected_count": balance_limit.get("projected_count"),
+                    "balance_limit": balance_limit.get("limit"),
                     "sort_order": order,
                 },
             }
@@ -568,6 +917,7 @@ def summarize_aihub_zip_groups(entries: list[dict]) -> list[dict]:
             "total": 0,
             "selectable": 0,
             "trained": 0,
+            "prepared": 0,
             "queued": 0,
             "running": 0,
             "excluded": 0,
@@ -584,6 +934,7 @@ def summarize_aihub_zip_groups(entries: list[dict]) -> list[dict]:
                 "total": 0,
                 "selectable": 0,
                 "trained": 0,
+                "prepared": 0,
                 "queued": 0,
                 "running": 0,
                 "excluded": 0,
@@ -594,7 +945,7 @@ def summarize_aihub_zip_groups(entries: list[dict]) -> list[dict]:
         if entry.get("selectable"):
             group["selectable"] += 1
         status = str(entry.get("status") or "unknown")
-        if status in {"trained", "queued", "running", "excluded", "unknown"}:
+        if status in {"trained", "prepared", "queued", "running", "excluded", "unknown"}:
             group[status] += 1
 
     ordered_labels = [*AIHUB_ZIP_GROUP_ORDER, *sorted(label for label in groups if label not in AIHUB_ZIP_GROUP_ORDER)]
@@ -616,13 +967,17 @@ def summarize_aihub_lookup_groups(entries: list[dict]) -> list[dict]:
                 "label": str(label),
                 "total": 0,
                 "trainable": 0,
+                "trained": 0,
+                "prepared": 0,
+                "queued": 0,
+                "running": 0,
                 "excluded": 0,
                 "unknown": 0,
             },
         )
         group["total"] += 1
         status = str(entry.get("status") or "unknown")
-        if status in {"trainable", "excluded", "unknown"}:
+        if status in {"trainable", "trained", "prepared", "queued", "running", "excluded", "unknown"}:
             group[status] += 1
     return sorted(groups.values(), key=lambda item: item["label"])
 
@@ -1184,9 +1539,13 @@ def infer_job_state_from_log(log_path: Path) -> str:
         return "aborted"
     if "traceback" in lowered or "[pipeline][error][error]" in lowered or "runtimeerror:" in lowered:
         return "error"
+    if "[pipeline][data_ready][data_ready]" in lowered or "[train] deferred:" in lowered:
+        return "data_ready"
     if "[pipeline][completed][completed]" in lowered or "정상 완료" in tail:
         return "completed"
-    return "completed_warning"
+    if "[pipeline][" in lowered or "[launcher]" in lowered:
+        return "running"
+    return "unknown"
 
 
 def restore_completed_jobs_from_logs(job_logs_dir: Path, runtime_config_dir: Path, limit: int = 30) -> list[dict]:
@@ -1200,6 +1559,9 @@ def restore_completed_jobs_from_logs(job_logs_dir: Path, runtime_config_dir: Pat
         reverse=True,
     )
     for log_path in log_paths[:limit]:
+        inferred_state = infer_job_state_from_log(log_path)
+        if inferred_state not in {"completed", "completed_warning", "data_ready", "error", "aborted"}:
+            continue
         job_id = log_path.stem
         runtime_config_path = runtime_config_dir / f"{job_id}.json"
         runtime_payload = read_json(runtime_config_path) if runtime_config_path.exists() else {}
@@ -1224,7 +1586,7 @@ def restore_completed_jobs_from_logs(job_logs_dir: Path, runtime_config_dir: Pat
                 "queued_at": inferred_started_at,
                 "started_at": inferred_started_at,
                 "finished_at": finished_at,
-                "state": infer_job_state_from_log(log_path),
+                "state": inferred_state,
                 "exit_code": None,
                 "runtime_config_path": str(runtime_config_path) if runtime_config_path.exists() else None,
                 "log_path": str(log_path),
@@ -1610,11 +1972,12 @@ def create_app(config_path: Path) -> FastAPI:
                 launcher_state["process"] = None
                 launcher_state["current_job"] = None
                 launcher_state["last_exit_code"] = exit_code
-                if isinstance(current_job, dict) and current_job.get("state") == "completed":
-                    launcher_state["last_state"] = "completed"
-                    launcher_state["last_message"] = final_message
-                elif isinstance(current_job, dict) and current_job.get("state") == "completed_warning":
-                    launcher_state["last_state"] = "completed_warning"
+                if isinstance(current_job, dict) and current_job.get("state") in {
+                    "completed",
+                    "completed_warning",
+                    "data_ready",
+                }:
+                    launcher_state["last_state"] = current_job.get("state")
                     launcher_state["last_message"] = final_message
                 else:
                     launcher_state["last_state"] = "error"
@@ -1702,7 +2065,7 @@ def create_app(config_path: Path) -> FastAPI:
         normalized = str(state or "").strip().lower()
         if normalized in {"completed", "completed_warning", "online"}:
             return "tone-good"
-        if normalized in {"running", "queued"}:
+        if normalized in {"running", "queued", "data_ready"}:
             return "tone-accent"
         if normalized in {"paused", "warning"}:
             return "tone-warn"
@@ -4035,6 +4398,7 @@ def create_app(config_path: Path) -> FastAPI:
     function toneClass(state) {
       if (state === 'completed') return 'tone-good';
       if (state === 'completed_warning') return 'tone-warn';
+      if (state === 'data_ready') return 'tone-accent';
       if (state === 'running') return 'tone-accent';
       if (state === 'paused') return 'tone-warn';
       if (state === 'aborted') return 'tone-danger';
@@ -4078,6 +4442,7 @@ def create_app(config_path: Path) -> FastAPI:
         const state =
           job.state === 'completed' ? '완료' :
           job.state === 'completed_warning' ? '경고 종료' :
+          job.state === 'data_ready' ? '데이터 준비' :
           job.state === 'aborted' ? '강제 중단' :
           '실패';
         return `${job.filekey} ${state}`;
@@ -4090,6 +4455,7 @@ def create_app(config_path: Path) -> FastAPI:
       if (state === 'paused') return '자동 시작 중지';
       if (state === 'completed') return '완료';
       if (state === 'completed_warning') return '경고 종료';
+      if (state === 'data_ready') return '데이터 준비';
       if (state === 'aborted') return '강제 중단';
       if (state === 'error') return '오류';
       return state || '대기 중';
@@ -5106,6 +5472,7 @@ def create_app(config_path: Path) -> FastAPI:
         const stateLabel =
           job.state === 'completed' ? '완료' :
           job.state === 'completed_warning' ? '경고 종료' :
+          job.state === 'data_ready' ? '데이터 준비' :
           job.state === 'aborted' ? '강제 중단' :
           '실패';
         const logPreview = job.log_preview || job.log_path || '-';
@@ -5816,19 +6183,30 @@ def create_app(config_path: Path) -> FastAPI:
                     remember(snapshot_job(job) or job, "queued", 30)
             if isinstance(completed_jobs, list):
                 for job in completed_jobs:
-                    if str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+                    job_state = str(job.get("state") or "").strip().lower()
+                    if job_state in AIHUB_TRAINED_JOB_STATES:
                         remember(snapshot_job(job) or job, "trained", 20)
+                    elif job_state in AIHUB_PREPARED_JOB_STATES:
+                        remember(snapshot_job(job) or job, "prepared", 15)
 
         history_payload = read_json(launcher_history_path) or {}
         history_jobs = history_payload.get("completed_jobs", []) if isinstance(history_payload, dict) else []
         if isinstance(history_jobs, list):
             for job in history_jobs:
-                if isinstance(job, dict) and str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+                if not isinstance(job, dict):
+                    continue
+                job_state = str(job.get("state") or "").strip().lower()
+                if job_state in AIHUB_TRAINED_JOB_STATES:
                     remember(job, "trained", 20)
+                elif job_state in AIHUB_PREPARED_JOB_STATES:
+                    remember(job, "prepared", 15)
 
         for job in restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir, limit=1000):
-            if str(job.get("state") or "").strip().lower() in AIHUB_TRAINED_JOB_STATES:
+            job_state = str(job.get("state") or "").strip().lower()
+            if job_state in AIHUB_TRAINED_JOB_STATES:
                 remember(job, "trained", 10)
+            elif job_state in AIHUB_PREPARED_JOB_STATES:
+                remember(job, "prepared", 8)
 
         return marks
 
@@ -5846,12 +6224,16 @@ def create_app(config_path: Path) -> FastAPI:
             mark = marks.get(filekey)
             item["base_status"] = item.get("status") or "unknown"
             if mark:
-                item["status"] = mark.get("status") or item["base_status"]
+                mark_status = mark.get("status") or item["base_status"]
+                item["status"] = mark_status
                 item["trainable"] = False
                 item["selectable"] = False
-                item["job_state"] = mark.get("status")
+                item["job_state"] = mark_status
                 item["job_id"] = mark.get("job_id")
-                item["trained_at"] = mark.get("finished_at")
+                if mark_status == "trained":
+                    item["trained_at"] = mark.get("finished_at")
+                elif mark_status == "prepared":
+                    item["prepared_at"] = mark.get("finished_at")
                 item["started_at"] = mark.get("started_at")
                 item["log_path"] = mark.get("log_path")
             else:
@@ -5910,6 +6292,7 @@ def create_app(config_path: Path) -> FastAPI:
             collected_entries,
             label_mapping=label_mapping,
             excluded_source_labels=excluded_source_labels,
+            target_labels=get_target_labels(config),
         )
         result = build_aihub_lookup_result(
             datasetkey=datasetkey,
@@ -5968,11 +6351,35 @@ def create_app(config_path: Path) -> FastAPI:
                 filekey = str(job.get("filekey") or "").strip()
                 if filekey:
                     filekeys.add(filekey)
+        completed_jobs = launcher_state.get("completed_jobs", [])
+        terminal_blocking_states = AIHUB_TRAINED_JOB_STATES | AIHUB_PREPARED_JOB_STATES
+        if isinstance(completed_jobs, list):
+            for job in completed_jobs:
+                if not isinstance(job, dict):
+                    continue
+                job_datasetkey = str(job.get("datasetkey") or "").strip()
+                if job_datasetkey != normalized_datasetkey:
+                    continue
+                if str(job.get("state") or "").strip().lower() not in terminal_blocking_states:
+                    continue
+                filekey = str(job.get("filekey") or "").strip()
+                if filekey:
+                    filekeys.add(filekey)
         return filekeys
 
     def collect_prepared_label_counts() -> dict[str, int]:
         counts: Counter[str] = Counter()
-        for path_key in ("prepared_train", "prepared_val", "prepared_test"):
+        for by_label in collect_prepared_label_counts_by_split().values():
+            counts.update(by_label)
+        return dict(counts)
+
+    def collect_prepared_label_counts_by_split() -> dict[str, dict[str, int]]:
+        split_counts: dict[str, dict[str, int]] = {}
+        for split_name, path_key in (
+            ("train", "prepared_train"),
+            ("val", "prepared_val"),
+            ("test", "prepared_test"),
+        ):
             manifest_path = paths.get(path_key)
             if not manifest_path:
                 continue
@@ -5980,9 +6387,10 @@ def create_app(config_path: Path) -> FastAPI:
             by_label = summary.get("by_label") if isinstance(summary, dict) else {}
             if not isinstance(by_label, dict):
                 continue
-            for label, count in by_label.items():
-                counts[str(label)] += int(count or 0)
-        return dict(counts)
+            normalized_counts = normalize_label_count_map(by_label)
+            if normalized_counts:
+                split_counts[split_name] = dict(normalized_counts)
+        return split_counts
 
     def build_auto_recommendation_insights() -> dict:
         target_labels = get_target_labels(config)
@@ -6040,31 +6448,45 @@ def create_app(config_path: Path) -> FastAPI:
             and str(job.get("datasetkey") or "").strip() == normalized_datasetkey
         )
 
-    def optimize_auto_recommended_queue_locked(datasetkey: str, entries: list[dict], insights: dict) -> dict:
+    def optimize_auto_recommended_queue_locked(
+        datasetkey: str,
+        entries: list[dict],
+        insights: dict,
+        *,
+        prepared_label_counts: dict[str, int] | None = None,
+        prepared_split_label_counts: dict[str, dict[str, int]] | None = None,
+    ) -> dict:
         pending_jobs = launcher_state.get("queued_jobs", [])
         if not isinstance(pending_jobs, list) or not pending_jobs:
             return {"removed": [], "retained_auto_count": 0, "targeted_available": False}
 
         normalized_datasetkey = str(datasetkey or "").strip()
-        allowed_groups = {
-            str(group).strip().lower()
-            for group in AIHUB_AUTO_RECOMMEND_ZIP_GROUPS
-            if str(group).strip()
-        }
+        recommendation_policy = build_auto_recommendation_policy()
+        normalized_policy = normalize_auto_recommendation_policy(recommendation_policy)
+        allowed_groups = normalize_recommendation_zip_groups(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS)
         diagnosis_priorities = build_diagnosis_label_priorities(insights)
         entry_by_filekey = {
             str(entry.get("filekey") or "").strip(): entry
             for entry in entries
             if isinstance(entry, dict) and str(entry.get("filekey") or "").strip()
         }
-        targeted_available = any(
-            isinstance(entry, dict)
-            and entry.get("status") == "trainable"
-            and entry.get("selectable") is not False
-            and aihub_entry_matches_zip_groups(entry, allowed_groups)
-            and float(diagnosis_priority_for_label(recommendation_label(entry), diagnosis_priorities).get("priority", 0.0) or 0.0) > 0
-            for entry in entries
+        current_best = find_next_trainable_aihub_entry(
+            entries,
+            existing_filekeys=set(),
+            prepared_label_counts=prepared_label_counts,
+            prepared_split_label_counts=prepared_split_label_counts,
+            allowed_zip_groups=AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
+            insights=insights,
+            recommendation_policy=recommendation_policy,
         )
+        current_best_label = recommendation_label(current_best) if isinstance(current_best, dict) else ""
+        current_best_score = current_best.get("recommendation_score") if isinstance(current_best, dict) else {}
+        try:
+            targeted_available = float(
+                current_best_score.get("insight_priority", 0.0) if isinstance(current_best_score, dict) else 0.0
+            ) > 0
+        except (TypeError, ValueError):
+            targeted_available = False
 
         retained_jobs: list = []
         removed_jobs: list[dict] = []
@@ -6088,8 +6510,21 @@ def create_app(config_path: Path) -> FastAPI:
                 remove_reason = "missing_filekey"
             elif filekey in seen_auto_filekeys:
                 remove_reason = "duplicate_auto_recommendation"
-            elif not aihub_entry_matches_zip_groups(entry, allowed_groups):
+            elif current_best is None:
+                remove_reason = "recommendation_unavailable"
+            elif not recommendation_zip_scope_state(
+                entry,
+                allowed_groups=allowed_groups,
+                policy=normalized_policy,
+                label=label,
+                primary_candidate_labels=set(),
+                diagnosis_priority=priority_payload,
+                label_counts=Counter(),
+                strict_fallback=False,
+            ).get("allowed"):
                 remove_reason = "outside_scope_changed"
+            elif current_best_label and normalize_recommendation_label(label) != normalize_recommendation_label(current_best_label):
+                remove_reason = "recommendation_balance_changed"
             elif targeted_available and insight_priority <= 0:
                 remove_reason = "diagnosis_priority_changed"
 
@@ -6104,6 +6539,9 @@ def create_app(config_path: Path) -> FastAPI:
             job["recommendation_scope"] = {
                 "allowed_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
                 "zip_group": aihub_entry_zip_group(entry),
+                "primary_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
+                "fallback_zip_groups": list(AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS),
+                "excluded_zip_groups": list(AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS),
             }
             score = job.setdefault("recommendation_score", {})
             if isinstance(score, dict):
@@ -6177,9 +6615,18 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_state["last_state"] = "error"
             return {"ok": False, "message": message, "job": None}
 
-        prepared_label_counts = collect_prepared_label_counts()
+        prepared_split_label_counts = collect_prepared_label_counts_by_split()
+        prepared_label_counts: Counter[str] = Counter()
+        for by_label in prepared_split_label_counts.values():
+            prepared_label_counts.update(normalize_label_count_map(by_label))
         insights = build_auto_recommendation_insights()
-        queue_plan = optimize_auto_recommended_queue_locked(datasetkey, lookup.get("entries") or [], insights)
+        queue_plan = optimize_auto_recommended_queue_locked(
+            datasetkey,
+            lookup.get("entries") or [],
+            insights,
+            prepared_label_counts=dict(prepared_label_counts),
+            prepared_split_label_counts=prepared_split_label_counts,
+        )
         if count_auto_recommended_pending_jobs_locked(datasetkey) >= AIHUB_AUTO_RECOMMEND_MAX_PENDING:
             message = "진단 기준으로 기존 자동 추천 큐를 유지합니다. 현재 대기 중인 자동 추천 작업이 먼저 실행됩니다."
             if queue_plan.get("removed"):
@@ -6203,12 +6650,18 @@ def create_app(config_path: Path) -> FastAPI:
         recommended = find_next_trainable_aihub_entry(
             lookup.get("entries") or [],
             existing_filekeys=existing_filekeys,
-            prepared_label_counts=prepared_label_counts,
+            prepared_label_counts=dict(prepared_label_counts),
+            prepared_split_label_counts=prepared_split_label_counts,
             allowed_zip_groups=AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
             insights=insights,
+            recommendation_policy=build_auto_recommendation_policy(),
         )
         if not recommended:
             message = "outside(outsidedoor)에서 더 이상 학습 가능한 추천 filekey가 없어 자동 큐 추가를 멈췄습니다."
+            message = (
+                "Auto recommendation stopped because no filekey matched the current policy. "
+                "Policy: outside first, no inside_croki, and no class above 1.5x the smallest class."
+            )
             disable_auto_enqueue_locked(message)
             launcher_state["last_state"] = launcher_state.get("last_state") or "completed"
             return {"ok": False, "message": message, "job": None}
@@ -6242,6 +6695,19 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_message"] = (
             f"outside 추천 filekey {filekey}를 자동으로 큐에 추가했습니다. "
             f"기준: {'진단 우선순위' if insight_priority > 0 else '클래스 균형'} / {reason_text}"
+        )
+        scope = job["recommendation_scope"] if isinstance(job.get("recommendation_scope"), dict) else {}
+        zip_group = scope.get("zip_group") or aihub_entry_zip_group(recommended) or "-"
+        reason_text = ", ".join(insight_reasons[:2]) if insight_reasons else f"부족한 클래스 {target_label}"
+        if queue_plan.get("removed"):
+            reason_text = f"{len(queue_plan.get('removed') or [])}개 자동 추천 큐 정리 후 {reason_text}"
+        launcher_state["last_message"] = (
+            f"추천 filekey {filekey}를 자동으로 큐에 추가했습니다. "
+            f"범위: {zip_group} / 기준: {'진단 우선순위' if insight_priority > 0 else '클래스 균형'} / {reason_text}"
+        )
+        launcher_state["last_message"] = (
+            f"Auto recommendation queued filekey {filekey}. "
+            f"scope={zip_group}, basis={'diagnosis' if insight_priority > 0 else 'class_balance'}, target={target_label}"
         )
         return {"ok": True, "message": launcher_state["last_message"], "job": job, "queue_plan": queue_plan}
 
@@ -6823,12 +7289,26 @@ def build_overview_diagnostics(
             )
     if not (training_progress.get("history") or metrics.get("history")):
         warnings.append("history가 비어 있어 epoch 추이를 표시할 수 없습니다.")
-    if completed_jobs and not any(
+    has_success_job = any(
         str(job.get("state") or "").strip().lower() in {"completed", "completed_warning"}
         for job in completed_jobs
         if isinstance(job, dict)
-    ):
-        warnings.append("완료 이력에는 성공 작업이 없고 중단/실패 작업만 있습니다.")
+    )
+    has_prepared_job = any(
+        str(job.get("state") or "").strip().lower() in AIHUB_PREPARED_JOB_STATES
+        for job in completed_jobs
+        if isinstance(job, dict)
+    )
+    has_failed_job = any(
+        str(job.get("state") or "").strip().lower() in {"error", "aborted"}
+        for job in completed_jobs
+        if isinstance(job, dict)
+    )
+    if completed_jobs and not has_success_job:
+        if has_prepared_job and not has_failed_job:
+            warnings.append("데이터 준비 작업은 완료됐지만 아직 모델 학습 완료 작업은 없습니다.")
+        elif has_failed_job:
+            warnings.append("완료 이력에는 성공 학습 작업이 없고 중단/실패 작업이 포함되어 있습니다.")
     return {
         "warnings": warnings,
         "pipeline": pipeline_diagnostics,
@@ -6956,11 +7436,15 @@ def build_overview(
         job for job in completed_jobs
         if isinstance(job, dict) and job.get("state") in {"completed", "completed_warning"}
     ])
+    prepared_count = len([
+        job for job in completed_jobs
+        if isinstance(job, dict) and str(job.get("state") or "").strip().lower() in AIHUB_PREPARED_JOB_STATES
+    ])
     failed_count = len([job for job in completed_jobs if isinstance(job, dict) and job.get("state") == "error"])
     pending_count = len(pending_jobs) if isinstance(pending_jobs, list) else 0
     active_count = 1 if current_job else 0
-    total_count = completed_count + failed_count + pending_count + active_count
-    progress_ratio = ((completed_count + failed_count) / total_count) if total_count > 0 else 0.0
+    total_count = completed_count + prepared_count + failed_count + pending_count + active_count
+    progress_ratio = ((completed_count + prepared_count + failed_count) / total_count) if total_count > 0 else 0.0
     current_job_progress = build_current_job_progress(pipeline_status, training_progress, effective_launcher_status)
     eta = estimate_eta(current_job_progress, effective_launcher_status)
     dataset_summary = (
@@ -7062,6 +7546,7 @@ def build_overview(
         "queue_progress": {
             "total": total_count,
             "completed": completed_count,
+            "prepared": prepared_count,
             "failed": failed_count,
             "pending": pending_count,
             "active": active_count,

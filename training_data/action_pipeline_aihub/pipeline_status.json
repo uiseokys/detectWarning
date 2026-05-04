@@ -1,27 +1,33 @@
 {
-  "stage": "prepare",
-  "state": "running",
-  "message": "train split pose 추출이 완료되었습니다.",
+  "stage": "completed",
+  "state": "completed",
+  "message": "학습 파이프라인이 완료되었습니다.",
   "workspace_dir": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub",
-  "updated_at": "2026-04-30T01:29:40.614976+09:00",
-  "pipeline_started_at": "2026-04-30T00:35:09.022854+09:00",
-  "stage_started_at": "2026-04-30T00:57:38.512844+09:00",
+  "updated_at": "2026-05-03T13:18:27.857515+09:00",
+  "pipeline_started_at": "2026-05-03T12:24:27.578348+09:00",
+  "stage_started_at": "2026-05-03T13:18:07.760304+09:00",
   "stage_timings": {
     "download": {
-      "started_at": "2026-04-30T00:35:09.023855+09:00",
-      "finished_at": "2026-04-30T00:57:38.512339+09:00",
-      "duration_seconds": 1349.488484
+      "started_at": "2026-05-03T12:24:27.578348+09:00",
+      "finished_at": "2026-05-03T12:35:57.002980+09:00",
+      "duration_seconds": 689.424632
+    },
+    "prepare": {
+      "started_at": "2026-05-03T12:35:57.013064+09:00",
+      "finished_at": "2026-05-03T13:18:07.713432+09:00",
+      "duration_seconds": 2530.700368
+    },
+    "train": {
+      "started_at": "2026-05-03T13:18:07.760304+09:00",
+      "finished_at": "2026-05-03T13:18:27.821887+09:00",
+      "duration_seconds": 20.061583
+    },
+    "total": {
+      "started_at": "2026-05-03T12:24:27.578348+09:00",
+      "finished_at": "2026-05-03T13:18:27.857515+09:00",
+      "duration_seconds": 3240.279167
     }
   },
-  "total_duration_seconds": null,
-  "stage_progress": 0.7231,
-  "processed_items": 36,
-  "total_items": 52,
-  "current_split": "train",
-  "split_index": 36,
-  "split_total": 36,
-  "kept_items": 29,
-  "skipped_items": 7,
-  "broken_videos": 0,
-  "skipped_videos": 7
+  "total_duration_seconds": 3240.279167,
+  "stage_progress": 1.0
 }

@@ -6,6 +6,9 @@ from html import escape
 STATE_LABELS = {
     "completed": "완료",
     "completed_warning": "경고 포함 완료",
+    "data_ready": "데이터 준비",
+    "deferred": "학습 대기",
+    "waiting_for_data": "데이터 누적 대기",
     "online": "온라인",
     "running": "실행 중",
     "queued": "대기 중",
@@ -95,7 +98,7 @@ def _state_tone(state: str | None) -> str:
     normalized = str(state or "").strip().lower()
     if normalized in {"completed", "online"}:
         return "good"
-    if normalized in {"running", "queued"}:
+    if normalized in {"running", "queued", "data_ready", "deferred", "waiting_for_data"}:
         return "accent"
     if normalized in {"completed_warning", "paused", "prepare", "download", "train", "warning"}:
         return "warn"
@@ -172,13 +175,14 @@ def _build_summary_card_items(
     prepared_total: int,
 ) -> list[tuple[str, str, str, str]]:
     latest = progress.get("latest") or {}
+    finished_jobs = int(queue_progress.get("completed") or 0) + int(queue_progress.get("prepared") or 0)
     return [
         (_state_tone(pipeline.get("state")), "파이프라인", _state_label(pipeline.get("state")), _text(pipeline.get("message"))),
         (_state_tone(launcher.get("state")), "런처", _state_label(launcher.get("state")), _text(launcher.get("message"))),
         ("accent", "최고 F1", _float_text(progress.get("best_val_macro_f1")), f"최고 epoch {_text(progress.get('best_epoch'))}"),
         ("accent", "최근 epoch", _text(latest.get("epoch")), f"정확도 {_float_text(latest.get('val_accuracy'))} / F1 {_float_text(latest.get('val_macro_f1'))}"),
         ("neutral", "데이터셋", f"원본 {raw_total} / 전처리 {prepared_total}", f"workspace {_text(overview.get('workspace_name'))}"),
-        ("neutral", "대기열", f"{_int_text(queue_progress.get('completed'))} / {_int_text(queue_progress.get('total'))}", f"대기 {_int_text(queue_progress.get('pending'))} / 실행 {_int_text(queue_progress.get('active'))}"),
+        ("neutral", "대기열", f"{_int_text(finished_jobs)} / {_int_text(queue_progress.get('total'))}", f"준비 {_int_text(queue_progress.get('prepared'))} / 대기 {_int_text(queue_progress.get('pending'))} / 실행 {_int_text(queue_progress.get('active'))}"),
         ("warn", "현재 작업", _text(current_job_progress.get("label")), f"{_int_text(current_job_progress.get('percent'))}% / 예상 {_text(eta.get('label'))}"),
         ("accent", "GPU", _text(gpu.get("summary")), _text(gpu.get("detail"))),
     ]
@@ -863,6 +867,9 @@ def _render_live_refresh_script() -> str:
     if (status === 'trained') {
       return '학습됨';
     }
+    if (status === 'prepared') {
+      return '준비됨';
+    }
     if (status === 'excluded') {
       return '제외됨';
     }
@@ -949,7 +956,7 @@ def _render_live_refresh_script() -> str:
 
   function renderFilekeyRow(item, selectedMap) {
     var filekey = String(item.filekey || '');
-    var selectable = item.selectable !== false && item.status !== 'excluded' && item.status !== 'trained' && item.status !== 'queued' && item.status !== 'running';
+    var selectable = item.selectable !== false && item.status !== 'excluded' && item.status !== 'trained' && item.status !== 'prepared' && item.status !== 'queued' && item.status !== 'running';
     var disabled = selectable ? '' : ' disabled';
     var checked = selectable && selectedMap && selectedMap[filekey] ? ' checked' : '';
     var title = item.name || item.source_label || item.source_alias || 'AIHub file';
@@ -968,6 +975,9 @@ def _render_live_refresh_script() -> str:
     }
     if (item.trained_at) {
       metaParts.push('trained ' + item.trained_at);
+    }
+    if (item.prepared_at) {
+      metaParts.push('prepared ' + item.prepared_at);
     }
     if (item.job_state === 'queued') {
       metaParts.push('queue pending');
@@ -998,6 +1008,7 @@ def _render_live_refresh_script() -> str:
           total: 0,
           trainable: 0,
           trained: 0,
+          prepared: 0,
           queued: 0,
           running: 0,
           excluded: 0,
@@ -1029,8 +1040,8 @@ def _render_live_refresh_script() -> str:
       group.items.sort(function (left, right) {
         return String(left.filekey || '').localeCompare(String(right.filekey || ''), undefined, { numeric: true });
       });
-      return '<details class="filekey-class-section" open>' +
-        '<summary>' +
+      return '<section class="filekey-class-section" data-filekey-class-section="' + escapeHtml(label) + '">' +
+        '<div class="filekey-class-header">' +
         '<button type="button" class="filekey-class-select" data-filekey-class="' + escapeHtml(label) + '">' +
         escapeHtml(label) +
         '</button>' +
@@ -1038,14 +1049,15 @@ def _render_live_refresh_script() -> str:
         'total ' + escapeHtml(group.total) +
         ' / trainable ' + escapeHtml(group.trainable) +
         ' / trained ' + escapeHtml(group.trained) +
+        ' / prepared ' + escapeHtml(group.prepared) +
         ' / queued ' + escapeHtml(group.queued) +
         ' / running ' + escapeHtml(group.running) +
         '</span>' +
-        '</summary>' +
+        '</div>' +
         '<div class="filekey-class-body">' +
         group.items.map(function (item) { return renderFilekeyRow(item, selectedMap); }).join('') +
         '</div>' +
-        '</details>';
+        '</section>';
     }).join('');
   }
 
@@ -1093,6 +1105,7 @@ def _render_live_refresh_script() -> str:
       '<div class="filekey-chip"><span>전체 filekey</span><strong>' + escapeHtml(stats.total || 0) + '</strong></div>' +
       '<div class="filekey-chip filekey-chip-trainable"><span>학습 가능</span><strong>' + escapeHtml(stats.selectable || 0) + '</strong></div>' +
       '<div class="filekey-chip filekey-chip-trained"><span>학습됨</span><strong>' + escapeHtml(stats.trained || 0) + '</strong></div>' +
+      '<div class="filekey-chip filekey-chip-prepared"><span>준비됨</span><strong>' + escapeHtml(stats.prepared || 0) + '</strong></div>' +
       '<div class="filekey-chip"><span>학습중</span><strong>' + escapeHtml(stats.running || 0) + '</strong></div>' +
       '<div class="filekey-chip"><span>대기중</span><strong>' + escapeHtml(stats.queued || 0) + '</strong></div>' +
       '<div class="filekey-chip"><span>제외</span><strong>' + escapeHtml(stats.excluded || 0) + '</strong></div>' +
@@ -1104,6 +1117,7 @@ def _render_live_refresh_script() -> str:
         '<strong>' + escapeHtml(item.total || 0) + '개</strong>' +
         '<em>선택 ' + escapeHtml(item.selectable || 0) +
         ' / 학습됨 ' + escapeHtml(item.trained || 0) +
+        ' / 준비됨 ' + escapeHtml(item.prepared || 0) +
         ' / 학습중 ' + escapeHtml(item.running || 0) +
         ' / 대기 ' + escapeHtml(item.queued || 0) +
         ' / 제외 ' + escapeHtml(item.excluded || 0) + '</em>' +
@@ -2831,6 +2845,14 @@ def _styles() -> str:
     .filekey-chip-trained strong {
       color: #4338ca;
     }
+    .filekey-chip-prepared {
+      border-color: rgba(15,111,255,0.22);
+      background: rgba(15,111,255,0.08);
+    }
+    .filekey-chip-prepared span,
+    .filekey-chip-prepared strong {
+      color: var(--accent);
+    }
     .filekey-group em {
       display: block;
       margin-top: 3px;
@@ -2892,21 +2914,16 @@ def _styles() -> str:
       border-radius: 14px;
       border: 1px solid rgba(148,163,184,0.18);
       background: rgba(248,251,255,0.78);
-      overflow: hidden;
+      overflow: visible;
     }
-    .filekey-class-section summary {
+    .filekey-class-header {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 10px;
       align-items: center;
-      cursor: pointer;
       padding: 11px 12px;
       border-bottom: 1px solid rgba(148,163,184,0.12);
       background: rgba(255,255,255,0.72);
-      list-style: none;
-    }
-    .filekey-class-section summary::-webkit-details-marker {
-      display: none;
     }
     .filekey-class-select {
       appearance: none;
@@ -3005,6 +3022,10 @@ def _styles() -> str:
     .filekey-status.trained {
       color: #4338ca;
       background: rgba(67,56,202,0.12);
+    }
+    .filekey-status.prepared {
+      color: var(--accent);
+      background: rgba(15,111,255,0.12);
     }
     .filekey-status.queued,
     .filekey-status.running {
@@ -3656,7 +3677,7 @@ def _styles() -> str:
       .insight-item {
         grid-template-columns: 1fr;
       }
-      .filekey-class-section summary,
+      .filekey-class-header,
       .filekey-row {
         grid-template-columns: 1fr;
       }

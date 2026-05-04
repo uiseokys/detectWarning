@@ -16,15 +16,12 @@
   },
   "dataset": {
     "target_labels": [
-      "normal",
       "violence",
       "collapse",
       "abduction",
       "loitering"
     ],
     "label_mapping": {
-      "일반행동": "normal",
-      "normal": "normal",
       "폭행": "violence",
       "폭행(assault)": "violence",
       "assault": "violence",
@@ -57,6 +54,8 @@
       "wandering": "loitering"
     },
     "excluded_source_labels": [
+      "일반행동",
+      "normal",
       "주취행동",
       "주취행동(drunken)",
       "drunken",
@@ -134,11 +133,29 @@
     "hidden_dim": 128,
     "num_layers": 2,
     "dropout": 0.35,
-    "label_smoothing": 0.08,
-    "loss": "cross_entropy",
+    "label_smoothing": 0.03,
+    "loss": "focal",
     "focal_gamma": 2.0,
     "class_weight": "balanced",
-    "balanced_sampler": "auto",
+    "balanced_sampler": true,
+    "class_weight_multipliers": {},
+    "adaptive_class_weighting": {
+      "enabled": true,
+      "target_recall": 0.55,
+      "target_f1": 0.45,
+      "low_recall_multiplier": 2.0,
+      "low_f1_multiplier": 1.6,
+      "missing_prediction_multiplier": 2.5,
+      "minority_count_multiplier": 1.25,
+      "min_multiplier": 1.0,
+      "max_multiplier": 2.5,
+      "min_validation_support": 1
+    },
+    "block_resume_on_missing_predictions": true,
+    "min_active_train_classes": 2,
+    "min_active_val_classes": 2,
+    "allow_single_class_training": false,
+    "defer_until_min_classes": true,
     "grad_clip_norm": 1.0,
     "seed": 42,
     "deterministic": false,
@@ -146,6 +163,22 @@
     "pin_memory": "auto",
     "prefetch_factor": 4,
     "persistent_workers": true
+  },
+  "gpu_auto_tune": {
+    "enabled": true,
+    "reserve_memory_mb": 1536,
+    "preprocess": {
+      "enabled": true,
+      "max_detector_batch_size": 64,
+      "max_video_prefetch_workers": 4,
+      "max_person_imgsz": 960,
+      "max_frames_to_scan": 240
+    },
+    "training": {
+      "enabled": true,
+      "max_batch_size": 96,
+      "max_eval_batch_size": 192
+    }
   },
   "continual_learning": {
     "enabled": true,

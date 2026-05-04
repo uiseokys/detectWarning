@@ -24,6 +24,8 @@ from reporting import analyze_class_balance, write_json_atomic
 DATALOADER_SUPPORTS_PIN_MEMORY_DEVICE = "pin_memory_device" in inspect.signature(DataLoader).parameters
 POSE_COORD_CLIP_RANGE = (-0.5, 1.5)
 POSE_CONFIDENCE_CLIP_RANGE = (0.0, 1.0)
+MAX_MISCLASSIFIED_EXAMPLES = 200
+MAX_ERROR_EXAMPLES_PER_GROUP = 20
 
 
 @dataclass
@@ -285,6 +287,7 @@ def train_action_classifier(
     loss_name: str = "cross_entropy",
     focal_gamma: float = 2.0,
     class_weight: bool | str = "balanced",
+    class_weight_multipliers: dict | None = None,
     balanced_sampler: bool | str = "auto",
     grad_clip_norm: float = 1.0,
     seed: int | None = 42,
@@ -359,6 +362,10 @@ def train_action_classifier(
     val_sample_count = len(val_dataset)
 
     _configure_training_acceleration(device=device, use_cuda=use_cuda, deterministic=deterministic)
+    class_weight_multiplier_tensor, class_weight_multiplier_payload = _resolve_class_weight_multipliers(
+        labels,
+        class_weight_multipliers,
+    )
 
     train_generator = _build_torch_generator(effective_seed)
     sampler_generator = _build_torch_generator(None if effective_seed is None else effective_seed + 1)
@@ -369,6 +376,7 @@ def train_action_classifier(
         requested=balanced_sampler,
         distribution=train_distribution,
         generator=sampler_generator,
+        class_weight_multipliers=class_weight_multiplier_tensor,
     )
 
     train_loader = _build_dataloader(
@@ -450,6 +458,13 @@ def train_action_classifier(
         num_classes=len(labels),
         requested=class_weight,
     )
+    if class_weight_multiplier_tensor is not None:
+        if class_weights is None:
+            class_weights = torch.ones(len(labels), dtype=torch.float32)
+            class_weight_mode = "multipliers"
+        else:
+            class_weight_mode = f"{class_weight_mode}+multipliers"
+        class_weights = class_weights * class_weight_multiplier_tensor
     class_weights_for_loss = class_weights.to(device) if class_weights is not None else None
     criterion, resolved_loss_name = _build_loss_function(
         loss_name=loss_name,
@@ -479,6 +494,7 @@ def train_action_classifier(
         "loss_name": resolved_loss_name,
         "class_weight_mode": class_weight_mode,
         "class_weights": _tensor_to_float_list(class_weights),
+        "class_weight_multipliers": class_weight_multiplier_payload,
         "balanced_sampler": sampler_mode,
         "label_smoothing": max(0.0, min(float(label_smoothing), 0.999)),
         "focal_gamma": max(float(focal_gamma), 0.0),
@@ -504,6 +520,7 @@ def train_action_classifier(
         f"persistent={'on' if use_persistent_workers else 'off'} "
         f"loss={resolved_loss_name} "
         f"class_weight={class_weight_mode} "
+        f"class_weight_multipliers={class_weight_multiplier_payload or 'none'} "
         f"sampler={sampler_mode} "
         f"weight_decay={max(float(weight_decay), 0.0):.6g} "
         f"grad_clip={effective_grad_clip_norm:.4g} "
@@ -715,11 +732,22 @@ def train_action_classifier(
         use_amp=use_amp,
         amp_dtype=resolved_amp_dtype,
     )
+    error_analysis_path = output_dir / "validation_error_analysis.json"
+    false_negative_path = output_dir / "false_negative_examples.json"
+    confusion_pair_path = output_dir / "confusion_pair_examples.json"
+    error_analysis = _build_validation_error_analysis(final_metrics, labels=labels)
+    write_json_atomic(error_analysis_path, error_analysis)
+    write_json_atomic(false_negative_path, error_analysis.get("false_negative_examples", {}))
+    write_json_atomic(confusion_pair_path, error_analysis.get("confusion_pair_examples", []))
     write_json_atomic(
         metrics_path,
         {
             "history": history,
             "final_validation": final_metrics,
+            "validation_error_analysis": error_analysis.get("summary", {}),
+            "validation_error_analysis_path": str(error_analysis_path),
+            "false_negative_examples_path": str(false_negative_path),
+            "confusion_pair_examples_path": str(confusion_pair_path),
             "labels": labels,
             "best_epoch": best_epoch,
             "best_val_macro_f1": round(best_val_f1, 6),
@@ -753,6 +781,9 @@ def train_action_classifier(
             },
         },
     )
+    print(f"[train] validation error analysis: {error_analysis_path}")
+    print(f"[train] false negatives: {false_negative_path}")
+    print(f"[train] confusion pairs: {confusion_pair_path}")
 
     if progress_path is not None:
         _write_progress(
@@ -768,6 +799,10 @@ def train_action_classifier(
                 "history": history,
                 "labels": labels,
                 "final_validation": final_metrics,
+                "validation_error_analysis": error_analysis.get("summary", {}),
+                "validation_error_analysis_path": str(error_analysis_path),
+                "false_negative_examples_path": str(false_negative_path),
+                "confusion_pair_examples_path": str(confusion_pair_path),
                 "resumed_from_checkpoint": resumed_from_checkpoint,
                 "resume_mode": resume_mode,
                 "train_samples": train_sample_count,
@@ -950,6 +985,34 @@ def _resolve_class_weights(
     return _build_class_weights(samples, num_classes), mode if mode != "true" else "balanced"
 
 
+def _resolve_class_weight_multipliers(
+    labels: list[str],
+    requested: dict | None,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    if not isinstance(requested, dict) or not requested:
+        return None, {}
+    values = np.ones(len(labels), dtype=np.float32)
+    payload: dict[str, float] = {}
+    label_to_index = {str(label): index for index, label in enumerate(labels)}
+    for label, raw_multiplier in requested.items():
+        label_key = str(label or "").strip()
+        if label_key not in label_to_index:
+            continue
+        try:
+            multiplier = float(raw_multiplier)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(multiplier):
+            continue
+        multiplier = float(np.clip(multiplier, 0.25, 8.0))
+        values[label_to_index[label_key]] = multiplier
+        if abs(multiplier - 1.0) > 1e-6:
+            payload[label_key] = round(multiplier, 6)
+    if not payload:
+        return None, {}
+    return torch.tensor(values, dtype=torch.float32), payload
+
+
 def _build_loss_function(
     *,
     loss_name: str,
@@ -985,6 +1048,7 @@ def _build_balanced_sampler(
     requested: bool | str,
     distribution: dict,
     generator: torch.Generator | None,
+    class_weight_multipliers: torch.Tensor | None = None,
 ) -> tuple[WeightedRandomSampler | None, str]:
     enabled = False
     mode = "off"
@@ -1009,7 +1073,11 @@ def _build_balanced_sampler(
     if not enabled:
         return None, mode
 
-    sample_weights = _build_sample_weights(samples, num_classes=num_classes)
+    sample_weights = _build_sample_weights(
+        samples,
+        num_classes=num_classes,
+        class_weight_multipliers=class_weight_multipliers,
+    )
     if sample_weights is None:
         return None, f"{mode}_unavailable"
     sampler = WeightedRandomSampler(
@@ -1021,7 +1089,12 @@ def _build_balanced_sampler(
     return sampler, mode
 
 
-def _build_sample_weights(samples: list[dict], *, num_classes: int) -> torch.Tensor | None:
+def _build_sample_weights(
+    samples: list[dict],
+    *,
+    num_classes: int,
+    class_weight_multipliers: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     counts = np.zeros(num_classes, dtype=np.float64)
     label_indices: list[int] = []
     for sample in samples:
@@ -1037,6 +1110,10 @@ def _build_sample_weights(samples: list[dict], *, num_classes: int) -> torch.Ten
     for class_index, count in enumerate(counts):
         if count > 0:
             class_weights[class_index] = total / (count * nonzero_classes)
+    if class_weight_multipliers is not None:
+        multiplier_values = class_weight_multipliers.detach().cpu().numpy().astype(np.float64, copy=False)
+        if multiplier_values.shape[0] >= num_classes:
+            class_weights = class_weights * multiplier_values[:num_classes]
     sample_weights = [
         class_weights[label_idx] if label_idx >= 0 else 0.0
         for label_idx in label_indices
@@ -1172,7 +1249,7 @@ def _evaluate(
         pred_np = preds.detach().cpu().numpy()
         for batch_index, (true_label, pred_label) in enumerate(zip(true_np, pred_np, strict=False)):
             confusion[int(true_label), int(pred_label)] += 1
-            if int(true_label) == int(pred_label) or len(misclassified) >= 50:
+            if int(true_label) == int(pred_label) or len(misclassified) >= MAX_MISCLASSIFIED_EXAMPLES:
                 continue
             sample_index = sample_offset + batch_index
             sample = dataset_samples[sample_index] if sample_index < len(dataset_samples) else {}
@@ -1206,6 +1283,112 @@ def _evaluate(
         "confusion_matrix": confusion.tolist(),
         "per_class": per_class,
         "misclassified_examples": misclassified,
+    }
+
+
+def _build_validation_error_analysis(final_metrics: dict, *, labels: list[str]) -> dict:
+    confusion = np.asarray(final_metrics.get("confusion_matrix") or [], dtype=np.int64)
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1]:
+        confusion = np.zeros((len(labels), len(labels)), dtype=np.int64)
+    label_names = list(labels)
+    per_class = final_metrics.get("per_class") if isinstance(final_metrics.get("per_class"), list) else []
+    examples = [
+        dict(example)
+        for example in final_metrics.get("misclassified_examples", [])
+        if isinstance(example, dict)
+    ]
+
+    class_summary = []
+    for index, label in enumerate(label_names):
+        if index >= confusion.shape[0]:
+            break
+        tp = int(confusion[index, index])
+        support = int(confusion[index, :].sum())
+        predicted = int(confusion[:, index].sum())
+        row = per_class[index] if index < len(per_class) and isinstance(per_class[index], dict) else {}
+        class_summary.append(
+            {
+                "label": label,
+                "class_index": index,
+                "support": support,
+                "predicted": predicted,
+                "correct": tp,
+                "false_negatives": max(support - tp, 0),
+                "false_positives": max(predicted - tp, 0),
+                "precision": row.get("precision"),
+                "recall": row.get("recall"),
+                "f1": row.get("f1"),
+            }
+        )
+
+    pair_examples: dict[tuple[int, int], list[dict]] = {}
+    false_negative_examples: dict[str, list[dict]] = {label: [] for label in label_names}
+    for example in examples:
+        true_index = _safe_label_index(example.get("true_index"), num_classes=len(label_names))
+        predicted_index = _safe_label_index(example.get("predicted_index"), num_classes=len(label_names))
+        if true_index < 0 or predicted_index < 0 or true_index == predicted_index:
+            continue
+        pair_key = (true_index, predicted_index)
+        pair_bucket = pair_examples.setdefault(pair_key, [])
+        if len(pair_bucket) < MAX_ERROR_EXAMPLES_PER_GROUP:
+            pair_bucket.append(example)
+        true_label = _label_name(label_names, true_index)
+        label_bucket = false_negative_examples.setdefault(true_label, [])
+        if len(label_bucket) < MAX_ERROR_EXAMPLES_PER_GROUP:
+            label_bucket.append(example)
+
+    confusion_pairs = []
+    for true_index in range(confusion.shape[0]):
+        for predicted_index in range(confusion.shape[1]):
+            if true_index == predicted_index:
+                continue
+            count = int(confusion[true_index, predicted_index])
+            if count <= 0:
+                continue
+            pair_key = (true_index, predicted_index)
+            confusion_pairs.append(
+                {
+                    "true_label": _label_name(label_names, true_index),
+                    "predicted_label": _label_name(label_names, predicted_index),
+                    "true_index": true_index,
+                    "predicted_index": predicted_index,
+                    "count": count,
+                    "examples": pair_examples.get(pair_key, []),
+                }
+            )
+    confusion_pairs.sort(key=lambda item: (-int(item["count"]), item["true_label"], item["predicted_label"]))
+
+    low_recall_classes = sorted(
+        [
+            row
+            for row in class_summary
+            if int(row.get("support") or 0) > 0 and float(row.get("recall") or 0.0) < 0.3
+        ],
+        key=lambda row: (float(row.get("recall") or 0.0), -int(row.get("support") or 0)),
+    )
+    missing_prediction_classes = [
+        row["label"]
+        for row in class_summary
+        if int(row.get("support") or 0) > 0 and int(row.get("predicted") or 0) == 0
+    ]
+    filtered_false_negatives = {
+        label: rows
+        for label, rows in false_negative_examples.items()
+        if rows
+    }
+    return {
+        "summary": {
+            "low_recall_classes": low_recall_classes[:8],
+            "top_confusion_pairs": [
+                {key: value for key, value in pair.items() if key != "examples"}
+                for pair in confusion_pairs[:8]
+            ],
+            "missing_prediction_classes": missing_prediction_classes,
+            "misclassified_example_count": len(examples),
+        },
+        "class_summary": class_summary,
+        "false_negative_examples": filtered_false_negatives,
+        "confusion_pair_examples": confusion_pairs[:20],
     }
 
 
