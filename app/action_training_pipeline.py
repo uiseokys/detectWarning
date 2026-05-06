@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage",
         default="all",
-        choices=("all", "download", "prepare", "train"),
+        choices=("all", "download", "prepare", "extract", "train"),
         help="실행할 단계",
     )
     return parser.parse_args()
@@ -115,7 +115,7 @@ def main() -> None:
         split_manifests: dict[str, Path] | None = None
         training_manifests: dict[str, Path] | None = None
 
-        if args.stage in {"all", "download"}:
+        if args.stage in {"all", "download", "extract"}:
             active_stage_started_at = current_timestamp_iso()
             write_pipeline_status(
                 paths,
@@ -133,7 +133,7 @@ def main() -> None:
         elif args.stage == "prepare":
             split_manifests = load_existing_current_split_manifests(paths)
 
-        if args.stage in {"all", "prepare"}:
+        if args.stage in {"all", "prepare", "extract"}:
             if split_manifests is None:
                 split_manifests = load_existing_current_split_manifests(paths)
             active_stage_started_at = current_timestamp_iso()
@@ -1902,6 +1902,12 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         "val": paths["current_prepared_val"],
         "test": paths["current_prepared_test"],
     }
+    shell_config = config.get("aihub_shell", {})
+    pose_job_parts = [
+        str(shell_config.get("datasetkey") or "local"),
+        "_".join(normalize_requested_filekeys(shell_config.get("filekey"))) or "manual",
+    ]
+    pose_job_dir = slugify("__".join(pose_job_parts))
 
     manifest_rows: dict[str, list[dict]] = {}
     overall_total = 0
@@ -2109,9 +2115,12 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                         recovery_actions=recovery_actions,
                     )
 
-                    pose_output_dir = paths["prepared_dir"] / split_name / slugify(target_label)
+                    pose_output_dir = paths["prepared_dir"] / pose_job_dir / split_name / slugify(target_label)
                     pose_output_dir.mkdir(parents=True, exist_ok=True)
-                    pose_path = pose_output_dir / f"{video_path.stem}_{sample['item_id']}.npz"
+                    pose_id = hashlib.sha1(
+                        f"{video_path}|{sample.get('item_id', '')}".encode("utf-8", errors="ignore")
+                    ).hexdigest()[:16]
+                    pose_path = pose_output_dir / f"{slugify(video_path.stem)[:48]}_{pose_id}.npz"
                     save_npz = np.savez_compressed if compress_prepared_pose else np.savez
                     save_npz(
                         pose_path,

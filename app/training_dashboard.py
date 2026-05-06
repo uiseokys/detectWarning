@@ -773,8 +773,10 @@ def find_next_trainable_aihub_entry(
         if status in {"queued", "running"}:
             planned_counts[label] += 1
             active_zip_counts[zip_group] += 1
-        elif status in {"trained", "prepared"}:
+        elif status == "trained":
             trained_counts[label] += 1
+            active_zip_counts[zip_group] += 1
+        elif status == "prepared":
             active_zip_counts[zip_group] += 1
 
     candidate_labels: set[str] = set()
@@ -1629,6 +1631,7 @@ def create_app(config_path: Path) -> FastAPI:
         "completed_jobs": [],
         "auto_start_enabled": True,
         "auto_enqueue_enabled": False,
+        "auto_extract_enabled": False,
         "auto_enqueue_datasetkey": None,
         "auto_enqueue_api_key": "",
         "last_state": "idle",
@@ -1796,6 +1799,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["completed_jobs"] = []
         launcher_state["auto_start_enabled"] = True
         launcher_state["auto_enqueue_enabled"] = False
+        launcher_state["auto_extract_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = None
         launcher_state["auto_enqueue_api_key"] = ""
         launcher_state["last_state"] = "idle"
@@ -1904,7 +1908,7 @@ def create_app(config_path: Path) -> FastAPI:
                     "--config",
                     str(runtime_config_path),
                     "--stage",
-                    "all",
+                    str(job.get("stage") or "all"),
                 ],
                 cwd=str(project_root),
                 stdout=log_handle,
@@ -1985,6 +1989,15 @@ def create_app(config_path: Path) -> FastAPI:
 
         active_process = launcher_state.get("process")
         queued_jobs = launcher_state.get("queued_jobs", [])
+        if (
+            active_process is None
+            and bool(launcher_state.get("auto_start_enabled", True))
+            and bool(launcher_state.get("auto_extract_enabled", False))
+            and isinstance(queued_jobs, list)
+            and not queued_jobs
+        ):
+            enqueue_next_extract_recommended_job_locked()
+            queued_jobs = launcher_state.get("queued_jobs", [])
         if (
             active_process is None
             and bool(launcher_state.get("auto_start_enabled", True))
@@ -6330,7 +6343,7 @@ def create_app(config_path: Path) -> FastAPI:
     def queue_key(datasetkey: str, filekey: str) -> str:
         return f"{str(datasetkey or '').strip()}:{str(filekey or '').strip()}"
 
-    def collect_active_queue_filekeys_locked(datasetkey: str) -> set[str]:
+    def collect_active_queue_filekeys_locked(datasetkey: str, *, include_prepared: bool = True) -> set[str]:
         normalized_datasetkey = str(datasetkey or "").strip()
         filekeys: set[str] = set()
         current_job = launcher_state.get("current_job")
@@ -6352,7 +6365,9 @@ def create_app(config_path: Path) -> FastAPI:
                 if filekey:
                     filekeys.add(filekey)
         completed_jobs = launcher_state.get("completed_jobs", [])
-        terminal_blocking_states = AIHUB_TRAINED_JOB_STATES | AIHUB_PREPARED_JOB_STATES
+        terminal_blocking_states = set(AIHUB_TRAINED_JOB_STATES)
+        if include_prepared:
+            terminal_blocking_states |= AIHUB_PREPARED_JOB_STATES
         if isinstance(completed_jobs, list):
             for job in completed_jobs:
                 if not isinstance(job, dict):
@@ -6581,15 +6596,59 @@ def create_app(config_path: Path) -> FastAPI:
 
     def enable_auto_enqueue_locked(datasetkey: str, api_key: str) -> None:
         launcher_state["auto_enqueue_enabled"] = True
+        launcher_state["auto_extract_enabled"] = False
+        launcher_state["auto_enqueue_datasetkey"] = str(datasetkey or "").strip()
+        launcher_state["auto_enqueue_api_key"] = str(api_key or "").strip()
+        launcher_state["auto_start_enabled"] = True
+
+    def enable_auto_extract_locked(datasetkey: str, api_key: str) -> None:
+        launcher_state["auto_extract_enabled"] = True
+        launcher_state["auto_enqueue_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = str(datasetkey or "").strip()
         launcher_state["auto_enqueue_api_key"] = str(api_key or "").strip()
         launcher_state["auto_start_enabled"] = True
 
     def disable_auto_enqueue_locked(message: str) -> None:
         launcher_state["auto_enqueue_enabled"] = False
+        launcher_state["auto_extract_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = None
         launcher_state["auto_enqueue_api_key"] = ""
         launcher_state["last_message"] = message
+
+    def enqueue_next_extract_recommended_job_locked() -> dict:
+        datasetkey = str(launcher_state.get("auto_enqueue_datasetkey") or config.get("aihub_shell", {}).get("datasetkey") or "").strip()
+        api_key = str(launcher_state.get("auto_enqueue_api_key") or "").strip()
+        if not datasetkey:
+            message = "자동 추출을 위한 datasetkey가 없습니다."
+            disable_auto_enqueue_locked(message)
+            return {"ok": False, "message": message, "job": None}
+        lookup = build_aihub_filekey_lookup_for_dashboard(datasetkey=datasetkey, api_key=api_key, refresh_process=False)
+        prepared_split_label_counts = collect_prepared_label_counts_by_split()
+        prepared_label_counts: Counter[str] = Counter()
+        for by_label in prepared_split_label_counts.values():
+            prepared_label_counts.update(normalize_label_count_map(by_label))
+        recommended = find_next_trainable_aihub_entry(
+            lookup.get("entries") or [],
+            existing_filekeys=collect_active_queue_filekeys_locked(datasetkey, include_prepared=True),
+            prepared_label_counts=dict(prepared_label_counts),
+            prepared_split_label_counts=prepared_split_label_counts,
+            allowed_zip_groups=AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
+            insights=build_auto_recommendation_insights(),
+            recommendation_policy=build_auto_recommendation_policy(),
+        )
+        if not isinstance(recommended, dict) or not recommended.get("filekey"):
+            message = "분포 기준에 맞는 자동 추출 추천 filekey가 없습니다."
+            disable_auto_enqueue_locked(message)
+            return {"ok": False, "message": message, "job": None}
+        filekey = str(recommended["filekey"])
+        job = build_job(filekey, datasetkey=datasetkey, api_key=api_key, stage="extract")
+        job["auto_recommended"] = True
+        job["target_label"] = recommended.get("target_label")
+        job["recommendation_reason"] = recommended.get("recommendation_reason") or "class_balance"
+        launcher_state.setdefault("queued_jobs", []).append(job)
+        launcher_state["last_state"] = "queued"
+        launcher_state["last_message"] = f"분포 기준 자동 추출 filekey {filekey}를 큐에 추가했습니다."
+        return {"ok": True, "message": launcher_state["last_message"], "job": job}
 
     def enqueue_next_recommended_job_locked() -> dict:
         datasetkey = str(
@@ -6598,6 +6657,21 @@ def create_app(config_path: Path) -> FastAPI:
             or ""
         ).strip()
         api_key = str(launcher_state.get("auto_enqueue_api_key") or "").strip()
+        if not paths["prepared_train"].exists() or not paths["prepared_val"].exists():
+            message = "추출된 prepared 데이터가 없어 학습을 시작할 수 없습니다."
+            disable_auto_enqueue_locked(message)
+            launcher_state["last_state"] = launcher_state.get("last_state") or "completed"
+            return {"ok": False, "message": message, "job": None}
+        pending_jobs = launcher_state.setdefault("queued_jobs", [])
+        job = build_job("prepared_pose", datasetkey=datasetkey or "prepared", api_key=api_key, stage="train")
+        job["auto_recommended"] = True
+        job["recommendation_reason"] = "prepared_data_training"
+        if isinstance(pending_jobs, list):
+            pending_jobs.append(job)
+        launcher_state["auto_enqueue_enabled"] = False
+        launcher_state["last_state"] = "queued"
+        launcher_state["last_message"] = "추출된 prepared 데이터 학습을 큐에 추가했습니다."
+        return {"ok": True, "message": launcher_state["last_message"], "job": job, "queue_plan": {}}
         if not datasetkey:
             message = "추천 자동 시작을 할 datasetkey가 없습니다."
             disable_auto_enqueue_locked(message)
@@ -6646,7 +6720,7 @@ def create_app(config_path: Path) -> FastAPI:
             )
             return {"ok": True, "message": message, "job": kept_job, "queue_plan": queue_plan}
 
-        existing_filekeys = collect_active_queue_filekeys_locked(datasetkey)
+        existing_filekeys = collect_active_queue_filekeys_locked(datasetkey, include_prepared=False)
         recommended = find_next_trainable_aihub_entry(
             lookup.get("entries") or [],
             existing_filekeys=existing_filekeys,
@@ -6727,12 +6801,22 @@ def create_app(config_path: Path) -> FastAPI:
         resume_only_raw = payload.get("resume_only", False)
         resume_only = payload_bool(resume_only_raw)
         auto_enqueue_next = payload_bool(payload.get("auto_enqueue_next", False))
-        if not filekeys and not resume_only and not auto_enqueue_next:
+        auto_extract_next = payload_bool(payload.get("auto_extract_next", False))
+        requested_stage = str(payload.get("stage") or "all").strip().lower()
+        if requested_stage not in {"all", "extract"}:
+            requested_stage = "all"
+        if auto_enqueue_next:
+            filekeys = []
+            requested_stage = "train"
+        if auto_extract_next:
+            filekeys = []
+            requested_stage = "extract"
+        if not filekeys and not resume_only and not auto_enqueue_next and not auto_extract_next:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
         if not datasetkey:
             datasetkey = str(config.get("aihub_shell", {}).get("datasetkey", "")).strip()
-        if (not resume_only or auto_enqueue_next) and datasetkey in (None, ""):
+        if not resume_only and not auto_enqueue_next and datasetkey in (None, ""):
             raise HTTPException(
                 status_code=400,
                 detail="datasetkey를 입력해 주세요. datasetkey는 filekey가 아니라 AIHub 데이터셋 키입니다.",
@@ -6774,10 +6858,10 @@ def create_app(config_path: Path) -> FastAPI:
 
             existing_keys = set()
             if isinstance(current_job, dict) and current_job.get("filekey"):
-                existing_keys.add(f"{current_job.get('datasetkey', '')}:{current_job['filekey']}")
+                existing_keys.add(f"{current_job.get('datasetkey', '')}:{current_job['filekey']}:{current_job.get('stage', 'all')}")
             if isinstance(pending_jobs, list):
                 existing_keys.update(
-                    f"{job.get('datasetkey', '')}:{job.get('filekey')}"
+                    f"{job.get('datasetkey', '')}:{job.get('filekey')}:{job.get('stage', 'all')}"
                     for job in pending_jobs
                     if isinstance(job, dict) and job.get("filekey")
                 )
@@ -6786,18 +6870,25 @@ def create_app(config_path: Path) -> FastAPI:
             skipped = []
             if auto_enqueue_next:
                 enable_auto_enqueue_locked(datasetkey, api_key)
+            if auto_extract_next:
+                enable_auto_extract_locked(datasetkey, api_key)
 
             if filekeys:
                 for filekey in filekeys:
-                    unique_key = queue_key(datasetkey, filekey)
+                    unique_key = f"{queue_key(datasetkey, filekey)}:{requested_stage}"
                     if unique_key in existing_keys:
                         skipped.append(filekey)
                         continue
-                    job = build_job(filekey, datasetkey=datasetkey, api_key=api_key)
+                    job = build_job(filekey, datasetkey=datasetkey, api_key=api_key, stage=requested_stage)
                     if isinstance(pending_jobs, list):
                         pending_jobs.append(job)
                     appended.append(filekey)
                     existing_keys.add(unique_key)
+            elif auto_extract_next:
+                recommendation = enqueue_next_extract_recommended_job_locked()
+                job = recommendation.get("job")
+                if isinstance(job, dict) and job.get("filekey"):
+                    appended.append(str(job["filekey"]))
             elif auto_enqueue_next:
                 recommendation = enqueue_next_recommended_job_locked()
                 job = recommendation.get("job")
@@ -6843,6 +6934,7 @@ def create_app(config_path: Path) -> FastAPI:
 
             launcher_state["auto_start_enabled"] = False
             launcher_state["auto_enqueue_enabled"] = False
+            launcher_state["auto_extract_enabled"] = False
             if current_job:
                 launcher_state["last_state"] = "running"
                 launcher_state["last_message"] = "현재 작업까지만 진행하고, 완료 후 다음 큐 자동 시작을 멈춥니다."
@@ -6907,6 +6999,7 @@ def create_app(config_path: Path) -> FastAPI:
 
             launcher_state["auto_start_enabled"] = False
             launcher_state["auto_enqueue_enabled"] = False
+            launcher_state["auto_extract_enabled"] = False
 
             stop_process_tree(active_process)
 
@@ -6973,6 +7066,7 @@ def create_app(config_path: Path) -> FastAPI:
             if isinstance(active_process, subprocess.Popen) and active_process.poll() is None:
                 launcher_state["auto_start_enabled"] = False
                 launcher_state["auto_enqueue_enabled"] = False
+                launcher_state["auto_extract_enabled"] = False
                 stop_process_tree(active_process)
                 launcher_state["process"] = None
                 launcher_state["started_at"] = None
@@ -7316,6 +7410,39 @@ def build_overview_diagnostics(
     }
 
 
+def build_prepared_pose_items(paths: dict, *, limit: int = 100) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for split_name, path_key in (
+        ("train", "prepared_train"),
+        ("val", "prepared_val"),
+        ("test", "prepared_test"),
+    ):
+        manifest_path = paths.get(path_key)
+        if not isinstance(manifest_path, Path) or not manifest_path.exists():
+            continue
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw_filekey = entry.get("job_filekey") or entry.get("filekey") or "-"
+                filekey = ",".join(str(value) for value in raw_filekey) if isinstance(raw_filekey, list) else str(raw_filekey)
+                item = grouped.setdefault(filekey, {"filekey": filekey, "total": 0, "splits": Counter(), "labels": Counter()})
+                item["total"] += 1
+                item["splits"][split_name] += 1
+                item["labels"][str(entry.get("target_label") or "-")] += 1
+    return [
+        {
+            "filekey": key,
+            "total": value["total"],
+            "splits": dict(value["splits"]),
+            "labels": dict(value["labels"]),
+        }
+        for key, value in list(grouped.items())[:limit]
+    ]
+
+
 def build_overview(
     paths: dict,
     config_path: Path,
@@ -7579,6 +7706,7 @@ def build_overview(
         } if not lite else {},
         "dataset": dataset_summary,
         "current_dataset": current_dataset_summary,
+        "prepared_pose_items": build_prepared_pose_items(paths, limit=100) if not lite else [],
         "continual_state": read_json(paths["continual_state"]),
         "artifacts": {
             "has_model": (paths["artifacts_dir"] / "best_action_model.pt").exists(),

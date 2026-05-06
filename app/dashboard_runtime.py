@@ -76,7 +76,7 @@ def read_log_preview(path_value: str | Path | None, *, max_lines: int = 6, max_c
     return read_log_tail(path_value, max_lines=max_lines, max_chars=max_chars)
 
 
-def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = "") -> dict:
+def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = "", stage: str = "all") -> dict:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", filekey).strip("_") or "filekey"
     return {
@@ -84,6 +84,7 @@ def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = 
         "filekey": filekey,
         "datasetkey": str(datasetkey).strip() if datasetkey not in (None, "") else None,
         "api_key": api_key,
+        "stage": stage,
         "queued_at": current_timestamp(),
         "started_at": None,
         "finished_at": None,

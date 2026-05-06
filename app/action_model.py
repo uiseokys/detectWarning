@@ -526,6 +526,13 @@ def train_action_classifier(
         f"grad_clip={effective_grad_clip_norm:.4g} "
         f"seed={effective_seed if effective_seed is not None else 'none'}"
     )
+    print(
+        "[train][start] "
+        f"epochs={epochs} "
+        f"samples(train/val)={train_sample_count}/{val_sample_count} "
+        f"labels={len(labels)} "
+        f"resume={resume_mode}"
+    )
     if train_distribution.get("messages"):
         print(
             "[train] class-balance "
@@ -625,15 +632,17 @@ def train_action_classifier(
         }
         history.append(epoch_metrics)
         epoch_progress = epoch / max(epochs, 1)
+        progress_width = 24
+        progress_filled = min(progress_width, max(0, round(epoch_progress * progress_width)))
+        progress_bar = "#" * progress_filled + "-" * (progress_width - progress_filled)
         print(
-            "[train] "
-            f"{epoch_progress * 100:.1f}% "
-            f"(epoch {epoch}/{epochs}) "
-            f"train_loss={train_loss:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val_ce={val_metrics['cross_entropy_loss']:.4f} "
-            f"val_acc={val_metrics['accuracy']:.4f} "
-            f"val_f1={val_metrics['macro_f1']:.4f}"
+            "[train][epoch] "
+            f"{epoch:03d}/{epochs:03d} "
+            f"{epoch_progress * 100:6.1f}% "
+            f"[{progress_bar}] "
+            f"loss train={train_loss:.4f} val={val_metrics['loss']:.4f} ce={val_metrics['cross_entropy_loss']:.4f} "
+            f"score acc={val_metrics['accuracy']:.4f} f1={val_metrics['macro_f1']:.4f} "
+            f"best_f1={max(best_val_f1, val_metrics['macro_f1']):.4f}"
         )
 
         improved = val_metrics["macro_f1"] > (best_val_f1 + effective_min_delta)

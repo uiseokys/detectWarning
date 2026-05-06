@@ -120,7 +120,7 @@
     "amp_dtype": "auto",
     "compile_model": true,
     "compile_backend": "auto",
-    "epochs": 30,
+    "epochs": 25,
     "early_stopping_patience": 4,
     "early_stopping_min_delta": 0.003,
     "imbalance_warn_min_samples": 8,

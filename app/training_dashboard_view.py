@@ -94,6 +94,12 @@ def _join_label_counts(payload: dict | None) -> str:
     return ", ".join(f"{label} {count}" for label, count in sorted(items.items()))
 
 
+def _join_count_map(items: dict | None) -> str:
+    if not isinstance(items, dict) or not items:
+        return "-"
+    return ", ".join(f"{key} {value}" for key, value in sorted(items.items()))
+
+
 def _state_tone(state: str | None) -> str:
     normalized = str(state or "").strip().lower()
     if normalized in {"completed", "online"}:
@@ -311,7 +317,11 @@ def _render_actions_panel(
         "<div class=\"filekey-lookup-list\" id=\"filekey-lookup-list\"></div>"
         "</div>"
         "<input type=\"hidden\" id=\"filekeys-input\" name=\"filekeys\" value=\"\" />"
+        "<div class=\"action-grid\">"
+        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_extract_next\" value=\"1\">분포 맞춰 자동 추출</button>"
         "<button type=\"submit\" class=\"primary-button\">선택한 filekey 큐 시작 / 추가</button>"
+        "<button type=\"submit\" class=\"secondary-button\" name=\"stage\" value=\"extract\">데이터 추출만</button>"
+        "</div>"
         "<button type=\"submit\" class=\"secondary-button\" name=\"auto_enqueue_next\" value=\"1\">outside 추천 자동 시작</button>"
         "</form>"
         "<div class=\"action-grid\">"
@@ -615,6 +625,7 @@ def _render_main_live_sections(
     cumulative_skip_report: dict,
     dataset_rows: list[dict[str, str]],
     current_dataset_rows: list[dict[str, str]],
+    prepared_pose_rows: list[dict[str, str]],
     history_rows: list[dict[str, str]],
     per_class_rows: list[dict[str, str]],
     confusion_matrix_html: str,
@@ -680,6 +691,13 @@ def _render_main_live_sections(
                 {_render_table(["split", "total", "labels"], current_dataset_rows, "현재 작업 데이터셋이 없습니다.")}
               </div>
             </article>
+          </section>
+
+          <section class="panel" id="prepared-pose-list">
+            <div class="panel-head"><div><h2>추출된 데이터 목록</h2><p>prepared pose manifest 기준입니다.</p></div></div>
+            <div class="panel-body">
+              {_render_table(["filekey", "total", "splits", "labels"], prepared_pose_rows, "추출된 데이터가 없습니다.", compact=True)}
+            </div>
           </section>
 
           <section class="panel" id="epoch-history">
@@ -1602,9 +1620,10 @@ def _render_live_refresh_script() -> str:
       return;
     }
     var autoRecommendedStart = !!(submitter && submitter.name === 'auto_enqueue_next');
+    var autoExtractStart = !!(submitter && submitter.name === 'auto_extract_next');
     if (form.id === 'start-job-form') {
       var selectedFilekeys = syncSelectedFilekeysToForm();
-      if (!selectedFilekeys.length && !autoRecommendedStart) {
+      if (!selectedFilekeys.length && !autoRecommendedStart && !autoExtractStart) {
         showActionNotice('큐에 넣을 filekey를 먼저 선택해 주세요.', 'warn');
         return;
       }
@@ -1712,6 +1731,22 @@ def _build_dataset_rows(dataset_summary: dict) -> list[list[str]]:
                 _split_label(key),
                 _int_text(info.get("total"), "0"),
                 _text(_join_label_counts(info), "-"),
+            ]
+        )
+    return rows
+
+
+def _build_prepared_pose_rows(items: list[dict]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            [
+                _text(item.get("filekey")),
+                _int_text(item.get("total"), "0"),
+                _text(_join_count_map(item.get("splits")), "-"),
+                _text(_join_count_map(item.get("labels")), "-"),
             ]
         )
     return rows
@@ -3715,6 +3750,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     gpu = overview.get("gpu") or {}
     dataset = overview.get("dataset") or {}
     current_dataset = overview.get("current_dataset") or {}
+    prepared_pose_items = overview.get("prepared_pose_items") or []
     logs = overview.get("logs") or {}
     continual_state = overview.get("continual_state") or {}
     artifacts = overview.get("artifacts") or {}
@@ -3735,6 +3771,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     latest_loss = _float_text(latest.get("val_loss"))
     dataset_rows = _build_dataset_rows(dataset)
     current_dataset_rows = _build_dataset_rows(current_dataset)
+    prepared_pose_rows = _build_prepared_pose_rows(prepared_pose_items)
     history_bundle = _build_history_bundle(progress, metrics)
     history_rows = history_bundle["rows"]
     confusion = final_validation.get("confusion_matrix") or []
@@ -3832,6 +3869,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
             cumulative_skip_report=cumulative_skip_report,
             dataset_rows=dataset_rows,
             current_dataset_rows=current_dataset_rows,
+            prepared_pose_rows=prepared_pose_rows,
             history_rows=history_rows,
             per_class_rows=per_class_rows,
             confusion_matrix_html=confusion_matrix_html,
@@ -3871,6 +3909,7 @@ def render_dashboard_page(
     gpu = overview.get("gpu") or {}
     dataset = overview.get("dataset") or {}
     current_dataset = overview.get("current_dataset") or {}
+    prepared_pose_items = overview.get("prepared_pose_items") or []
     diagnostics = overview.get("diagnostics") or {}
     logs = overview.get("logs") or {}
     continual_state = overview.get("continual_state") or {}
@@ -3925,6 +3964,7 @@ def render_dashboard_page(
     )
     dataset_rows = _build_dataset_rows(dataset)
     current_dataset_rows = _build_dataset_rows(current_dataset)
+    prepared_pose_rows = _build_prepared_pose_rows(prepared_pose_items)
 
     history_bundle = _build_history_bundle(progress, metrics)
     history_rows = history_bundle["rows"]
@@ -3991,6 +4031,7 @@ def render_dashboard_page(
         cumulative_skip_report=cumulative_skip_report,
         dataset_rows=dataset_rows,
         current_dataset_rows=current_dataset_rows,
+        prepared_pose_rows=prepared_pose_rows,
         history_rows=history_rows,
         per_class_rows=per_class_rows,
         confusion_matrix_html=confusion_matrix_html,
