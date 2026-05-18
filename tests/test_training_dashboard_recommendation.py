@@ -390,7 +390,34 @@ class TrainingDashboardRecommendationTests(unittest.TestCase):
         self.assertEqual(selected["filekey"], "61")
         self.assertEqual(selected["recommendation_score"]["target_label"], "loitering")
 
-    def test_auto_policy_returns_none_when_only_dominant_class_is_available(self) -> None:
+    def test_auto_policy_selects_missing_violence_before_more_existing_classes(self) -> None:
+        selected = find_next_trainable_aihub_entry(
+            [
+                {
+                    "filekey": "v1",
+                    "status": "trainable",
+                    "target_label": "violence",
+                    "selectable": True,
+                    "zip_group": "outsidedoor",
+                },
+                {
+                    "filekey": "c1",
+                    "status": "trainable",
+                    "target_label": "collapse",
+                    "selectable": True,
+                    "zip_group": "outsidedoor",
+                },
+            ],
+            prepared_label_counts={"collapse": 10769, "loitering": 7531, "abduction": 1166},
+            allowed_zip_groups={"outsidedoor"},
+            recommendation_policy=build_auto_recommendation_policy(),
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["filekey"], "v1")
+        self.assertEqual(selected["recommendation_score"]["target_label"], "violence")
+
+    def test_auto_policy_keeps_extracting_when_only_non_abduction_class_is_available(self) -> None:
         selected = find_next_trainable_aihub_entry(
             [
                 {
@@ -406,9 +433,10 @@ class TrainingDashboardRecommendationTests(unittest.TestCase):
             recommendation_policy=build_auto_recommendation_policy(),
         )
 
-        self.assertIsNone(selected)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["filekey"], "62")
 
-    def test_auto_policy_allows_abduction_insidedoor_when_outside_is_missing(self) -> None:
+    def test_auto_policy_excludes_abduction_from_new_auto_extraction(self) -> None:
         selected = find_next_trainable_aihub_entry(
             [
                 {
@@ -432,11 +460,10 @@ class TrainingDashboardRecommendationTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(selected)
-        self.assertEqual(selected["filekey"], "63")
-        self.assertEqual(selected["recommendation_scope"]["zip_group"], "insidedoor")
-        self.assertEqual(selected["recommendation_scope"]["scope_reason"], "minority_or_diagnosed_fallback")
+        self.assertEqual(selected["filekey"], "64")
+        self.assertEqual(selected["recommendation_score"]["target_label"], "violence")
 
-    def test_auto_policy_allows_collapse_insidedoor_only_when_diagnosed(self) -> None:
+    def test_auto_policy_allows_collapse_insidedoor_after_outside_is_exhausted(self) -> None:
         entries = [
             {
                 "filekey": "65",
@@ -468,10 +495,12 @@ class TrainingDashboardRecommendationTests(unittest.TestCase):
             },
         )
 
-        self.assertIsNone(without_diagnosis)
+        self.assertIsNotNone(without_diagnosis)
+        self.assertEqual(without_diagnosis["filekey"], "65")
+        self.assertEqual(without_diagnosis["recommendation_scope"]["scope_reason"], "always_fallback")
         self.assertIsNotNone(with_diagnosis)
         self.assertEqual(with_diagnosis["filekey"], "65")
-        self.assertEqual(with_diagnosis["recommendation_scope"]["scope_reason"], "diagnosed_fallback")
+        self.assertEqual(with_diagnosis["recommendation_scope"]["scope_reason"], "always_fallback")
 
     def test_auto_policy_prefers_outside_collapse_before_insidedoor(self) -> None:
         selected = find_next_trainable_aihub_entry(

@@ -1,3 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 *.pyd filter=lfs diff=lfs merge=lfs -text
+C:/Users/Administrator/Documents/GitHub/detectWarning filter=lfs diff=lfs merge=lfs -text
+C:/Users/Administrator/Documents/GitHub/detectWarninggit filter=lfs diff=lfs merge=lfs -text
+add filter=lfs diff=lfs merge=lfs -text

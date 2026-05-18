@@ -95,14 +95,76 @@ def build_job(filekey: str, datasetkey: str | int | None = None, api_key: str = 
     }
 
 
+def infer_dashboard_job_kind(job: dict) -> str:
+    job_kind = str(job.get("job_kind") or "").strip().lower()
+    if job_kind:
+        return job_kind
+    filekey = str(job.get("filekey") or "").strip().lower()
+    if filekey == "guideline_clips":
+        return "guideline"
+    if filekey == "rgb_i3d_features":
+        return "rgb"
+    if filekey == "cleanup_raw_after_features":
+        return "cleanup"
+    if filekey in {"guideline_features", "prepared_pose"}:
+        return "train_guideline"
+    return "aihub"
+
+
 def build_retry_job_from(job: dict) -> dict:
+    job_kind = infer_dashboard_job_kind(job)
+    stage = str(job.get("stage") or "").strip()
+    if not stage:
+        stage = "extract" if job_kind == "aihub" else "all"
     retry_job = build_job(
         str(job.get("filekey", "")),
         datasetkey=job.get("datasetkey"),
         api_key=str(job.get("api_key", "") or ""),
+        stage=stage,
     )
     retry_job["retry_of"] = job.get("job_id")
     retry_job["retry_count"] = int(job.get("retry_count", 0) or 0) + 1
+    for key in (
+        "job_kind",
+        "display_name",
+        "running_message",
+        "success_message",
+        "source",
+        "include_rgb",
+        "start_train",
+        "cleanup_after",
+        "rgb_model",
+        "device",
+        "notification_step",
+        "source_filekey",
+        "source_datasetkey",
+        "auto_recommended",
+        "target_label",
+        "source_label",
+        "recommendation_reason",
+        "recommendation_scope",
+        "recommendation_score",
+        "predownload_cache",
+        "reuse_existing_only",
+        "reextract_filekey_only",
+    ):
+        if key in job:
+            retry_job[key] = job.get(key)
+    if "job_kind" not in retry_job and job_kind != "aihub":
+        retry_job["job_kind"] = job_kind
+    if job_kind == "rgb":
+        retry_job.setdefault("display_name", "RGB/I3D feature 추출")
+        retry_job.setdefault("running_message", "RGB/I3D feature를 clip별로 추출 중입니다.")
+        retry_job.setdefault("success_message", "RGB/I3D feature 추출이 완료되었습니다.")
+        retry_job.setdefault("rgb_model", "i3d_r50")
+        retry_job.setdefault("device", "cuda")
+    elif job_kind == "guideline":
+        retry_job.setdefault("display_name", "guideline_clips")
+        retry_job.setdefault("source", "cumulative")
+    elif job_kind == "cleanup":
+        retry_job.setdefault("display_name", "원본/임시 파일 정리")
+    elif job_kind == "train_guideline":
+        retry_job.setdefault("display_name", "추출된 RGB+Pose feature 학습")
     return retry_job
 
 
@@ -126,6 +188,26 @@ def snapshot_job(job: dict | None) -> dict | None:
         "runtime_config_path": str(job["runtime_config_path"]) if job.get("runtime_config_path") else None,
         "log_path": str(job["log_path"]) if job.get("log_path") else None,
         "result_summary": job.get("result_summary"),
+        "job_kind": infer_dashboard_job_kind(job),
+        "display_name": job.get("display_name"),
+        "stage": job.get("stage"),
+        "source": job.get("source"),
+        "include_rgb": job.get("include_rgb"),
+        "start_train": job.get("start_train"),
+        "cleanup_after": job.get("cleanup_after"),
+        "rgb_model": job.get("rgb_model"),
+        "device": job.get("device"),
+        "notification_step": job.get("notification_step"),
+        "source_filekey": job.get("source_filekey"),
+        "source_datasetkey": job.get("source_datasetkey"),
+        "auto_recommended": job.get("auto_recommended"),
+        "target_label": job.get("target_label"),
+        "source_label": job.get("source_label"),
+        "recommendation_reason": job.get("recommendation_reason"),
+        "recommendation_scope": job.get("recommendation_scope"),
+        "recommendation_score": job.get("recommendation_score"),
+        "predownload_cache": job.get("predownload_cache"),
+        "reuse_existing_only": job.get("reuse_existing_only"),
     }
 
 
@@ -138,7 +220,10 @@ def write_dashboard_status(paths: dict, *, stage: str, state: str, message: str,
         "updated_at": current_timestamp(),
         **extra,
     }
-    write_json_atomic(paths["pipeline_status"], payload)
+    try:
+        write_json_atomic(paths["pipeline_status"], payload)
+    except OSError as exc:
+        print(f"[dashboard][status-warning] pipeline_status.json write skipped: {exc}")
 
 
 def persist_launcher_history(launcher_history_path: Path, launcher_state: dict) -> None:

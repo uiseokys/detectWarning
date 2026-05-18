@@ -88,7 +88,7 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
-    validate_source_config(config, config_path)
+    validate_source_config(config, config_path, stage=args.stage)
     config = apply_gpu_auto_tune(config, stage=args.stage, logger=print)
     paths = resolve_paths(config, config_path.parent)
     continual_config = get_continual_config(config)
@@ -232,6 +232,7 @@ def main() -> None:
                     hidden_dim=int(config.get("training", {}).get("hidden_dim", 128)),
                     num_layers=int(config.get("training", {}).get("num_layers", 2)),
                     dropout=float(config.get("training", {}).get("dropout", 0.2)),
+                    temporal_pooling=str(config.get("training", {}).get("temporal_pooling", "mean")),
                     label_smoothing=float(config.get("training", {}).get("label_smoothing", 0.05)),
                     loss_name=str(config.get("training", {}).get("loss", "cross_entropy")),
                     focal_gamma=float(config.get("training", {}).get("focal_gamma", 2.0)),
@@ -253,15 +254,43 @@ def main() -> None:
                     pin_memory=config.get("training", {}).get("pin_memory", "auto"),
                     early_stopping_patience=int(config.get("training", {}).get("early_stopping_patience", 5)),
                     early_stopping_min_delta=float(config.get("training", {}).get("early_stopping_min_delta", 0.001)),
+                    selection_metric=str(config.get("training", {}).get("selection_metric", "macro_f1")),
+                    overfit_guard_enabled=bool(config.get("training", {}).get("overfit_guard_enabled", True)),
+                    overfit_guard_min_epoch=int(config.get("training", {}).get("overfit_guard_min_epoch", 8)),
+                    overfit_guard_loss_gap=float(config.get("training", {}).get("overfit_guard_loss_gap", 0.45)),
+                    overfit_guard_patience=int(config.get("training", {}).get("overfit_guard_patience", 3)),
                     imbalance_warn_min_samples=int(config.get("training", {}).get("imbalance_warn_min_samples", 8)),
                     imbalance_warn_ratio=float(config.get("training", {}).get("imbalance_warn_ratio", 5.0)),
                     progress_path=paths["training_progress"],
                     resume_from=resume_from,
+                    max_duplicate_pose_label_samples=int(
+                        config.get("training", {}).get("max_duplicate_pose_label_samples", 3)
+                    ),
                 )
                 stage_timings["train"] = build_stage_timing_entry(active_stage_started_at, current_timestamp_iso())
                 print(f"[train] best model: {artifacts.best_model_path}")
                 print(f"[train] metrics: {artifacts.metrics_path}")
                 print(f"[train] labels: {artifacts.labels_path}")
+                trained_labels = read_trained_labels(artifacts.labels_path) or labels
+                if list(trained_labels) == list(labels):
+                    run_post_training_model_improvement(
+                        config,
+                        paths,
+                        training_manifests=training_manifests,
+                        labels=labels,
+                    )
+                else:
+                    print(
+                        "[train] post ensemble/hybrid skipped: pose training labels differ from full task labels "
+                        f"trained={trained_labels} full={labels}. "
+                        "Use specialized detection/classification tasks for RGB/I3D metrics."
+                    )
+                run_specialized_training_tasks(
+                    config,
+                    paths,
+                    training_manifests=training_manifests,
+                    labels=labels,
+                )
 
                 if args.stage == "all" and continual_config["cleanup_raw_after_job"]:
                     cleanup_transient_job_data(paths)
@@ -329,11 +358,14 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
     raw_dir = workspace_dir / "raw_videos"
     import_dir = workspace_dir / "imported_dataset"
     extracted_dir = workspace_dir / "extracted_dataset"
+    xml_cache_dir = workspace_dir / "xml_cache"
     manifests_dir = workspace_dir / "manifests"
     prepared_dir = workspace_dir / "prepared_pose"
     artifacts_dir = workspace_dir / "artifacts"
-    for path in (workspace_dir, raw_dir, import_dir, extracted_dir, manifests_dir, prepared_dir, artifacts_dir):
+    for path in (workspace_dir, raw_dir, import_dir, extracted_dir, xml_cache_dir, manifests_dir, prepared_dir, artifacts_dir):
         path.mkdir(parents=True, exist_ok=True)
+    predownload_dir = workspace_dir / "predownload_aihub"
+    predownload_dir.mkdir(parents=True, exist_ok=True)
     return {
         "workspace_dir": workspace_dir,
         "workspace_default_dir": workspace_dir_default,
@@ -342,7 +374,9 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "workspace_override_value": workspace_dir_override or None,
         "raw_dir": raw_dir,
         "import_dir": import_dir,
+        "predownload_dir": predownload_dir,
         "extracted_dir": extracted_dir,
+        "xml_cache_dir": xml_cache_dir,
         "manifests_dir": manifests_dir,
         "prepared_dir": prepared_dir,
         "artifacts_dir": artifacts_dir,
@@ -355,6 +389,9 @@ def resolve_paths(config: dict, base_dir: Path) -> dict:
         "prepared_train": manifests_dir / "cumulative_prepared_train.jsonl",
         "prepared_val": manifests_dir / "cumulative_prepared_val.jsonl",
         "prepared_test": manifests_dir / "cumulative_prepared_test.jsonl",
+        "guideline_prepared_train": manifests_dir / "guideline_prepared_train.jsonl",
+        "guideline_prepared_val": manifests_dir / "guideline_prepared_val.jsonl",
+        "guideline_prepared_test": manifests_dir / "guideline_prepared_test.jsonl",
         "active_prepared_train": manifests_dir / "active_prepared_train.jsonl",
         "active_prepared_val": manifests_dir / "active_prepared_val.jsonl",
         "active_prepared_test": manifests_dir / "active_prepared_test.jsonl",
@@ -386,7 +423,10 @@ def write_pipeline_status(paths: dict, *, stage: str, state: str, message: str, 
         "total_duration_seconds": extra.pop("total_duration_seconds", existing.get("total_duration_seconds")),
         **extra,
     }
-    write_json_atomic(paths["pipeline_status"], payload)
+    try:
+        write_json_atomic(paths["pipeline_status"], payload)
+    except OSError as exc:
+        print(f"[pipeline][status-warning] pipeline_status.json write skipped: {exc}")
     print(format_pipeline_status_log(payload))
 
 
@@ -503,7 +543,7 @@ def resolve_adaptive_class_weight_multipliers(config: dict, paths: dict, *, labe
     if isinstance(adaptive_config, bool):
         adaptive_config = {"enabled": adaptive_config}
     if not isinstance(adaptive_config, dict) or not bool(adaptive_config.get("enabled", False)):
-        return base_multipliers
+        return apply_manifest_normal_ratio_multiplier(config, paths, labels=labels, multipliers=base_multipliers)
 
     payloads = []
     artifacts_dir = paths.get("artifacts_dir")
@@ -515,12 +555,13 @@ def resolve_adaptive_class_weight_multipliers(config: dict, paths: dict, *, labe
         if isinstance(payload, dict):
             payloads.append(payload)
 
-    return build_adaptive_class_weight_multipliers(
+    multipliers = build_adaptive_class_weight_multipliers(
         config,
         labels=labels,
         metric_payloads=payloads,
         base_multipliers=base_multipliers,
     )
+    return apply_manifest_normal_ratio_multiplier(config, paths, labels=labels, multipliers=multipliers)
 
 
 def build_adaptive_class_weight_multipliers(
@@ -634,6 +675,71 @@ def build_adaptive_class_weight_multipliers(
     return dict(sorted(multipliers.items(), key=lambda item: labels.index(item[0]) if item[0] in labels else len(labels)))
 
 
+def apply_manifest_normal_ratio_multiplier(
+    config: dict,
+    paths: dict,
+    *,
+    labels: list[str],
+    multipliers: dict[str, float],
+) -> dict[str, float]:
+    training_config = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+    adaptive_config = training_config.get("adaptive_class_weighting", {})
+    if isinstance(adaptive_config, bool):
+        adaptive_config = {"enabled": adaptive_config}
+    if not isinstance(adaptive_config, dict) or not bool(adaptive_config.get("normal_ratio_multiplier_enabled", True)):
+        return multipliers
+
+    guideline_config = config.get("guideline_sampling", {}) if isinstance(config.get("guideline_sampling"), dict) else {}
+    normal_label = str(guideline_config.get("normal_label") or "normal").strip()
+    if normal_label not in {str(label) for label in labels}:
+        return multipliers
+
+    counts = manifest_label_counts(paths.get("guideline_prepared_train") or paths.get("prepared_train"))
+    total = sum(counts.values())
+    if total <= 0:
+        return multipliers
+
+    normal_count = int(counts.get(normal_label, 0) or 0)
+    normal_ratio = normal_count / max(total, 1)
+    target_ratio = clamp_float(
+        safe_float(adaptive_config.get("normal_ratio_target"), safe_float(guideline_config.get("target_normal_clip_ratio"), 0.25)),
+        0.0,
+        0.5,
+    )
+    min_ratio = clamp_float(safe_float(adaptive_config.get("normal_ratio_min"), 0.20), 0.0, target_ratio)
+    if normal_ratio >= min_ratio:
+        return multipliers
+
+    requested_multiplier = safe_float(adaptive_config.get("normal_ratio_multiplier"), 1.35)
+    max_multiplier = safe_float(adaptive_config.get("normal_ratio_max_multiplier"), 1.6)
+    multiplier = clamp_float(requested_multiplier, 1.0, max(max_multiplier, 1.0))
+    current = float(multipliers.get(normal_label, 1.0) or 1.0)
+    multipliers[normal_label] = round(max(current, multiplier), 6)
+    return dict(sorted(multipliers.items(), key=lambda item: labels.index(item[0]) if item[0] in labels else len(labels)))
+
+
+def manifest_label_counts(manifest_path) -> dict[str, int]:
+    if not isinstance(manifest_path, Path) or not manifest_path.exists():
+        return {}
+    counts: Counter[str] = Counter()
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                label = str(row.get("target_label") or "").strip()
+                if label:
+                    counts[label] += 1
+    except OSError:
+        return {}
+    return dict(counts)
+
+
 def select_metric_payload_for_adaptive_weights(metric_payloads: list[dict] | tuple[dict, ...]) -> dict | None:
     for payload in metric_payloads:
         if not isinstance(payload, dict):
@@ -710,6 +816,94 @@ def confusion_support_and_prediction_counts(confusion_matrix, *, labels: list[st
             if column_index < len(labels):
                 predictions[str(labels[column_index])] += int(safe_float(value, 0.0))
     return supports, predictions
+
+
+def run_post_training_model_improvement(
+    config: dict,
+    paths: dict,
+    *,
+    training_manifests: dict[str, Path],
+    labels: list[str],
+) -> None:
+    auto_tune_config = config.get("auto_tune") if isinstance(config.get("auto_tune"), dict) else {}
+    if not auto_tune_config:
+        return
+    target_metric = str(auto_tune_config.get("target_metric") or "accuracy")
+    timestamp = datetime.now(UTC).astimezone().strftime("%Y%m%d_%H%M%S")
+
+    if bool(auto_tune_config.get("ensemble_enabled", True)):
+        try:
+            from ensemble_action_models import run_ensemble_search
+
+            ensemble_result = run_ensemble_search(
+                config=config,
+                paths=paths,
+                training_manifests=training_manifests,
+                labels=labels,
+                output_dir=paths["artifacts_dir"] / "auto_tune" / "ensembles" / f"manual_{timestamp}",
+                target_metric=target_metric,
+                top_k=int(auto_tune_config.get("ensemble_top_k", 12) or 12),
+                max_size=int(auto_tune_config.get("ensemble_max_size", 5) or 5),
+                device=str(config.get("training", {}).get("device", "cuda")),
+                promote=bool(auto_tune_config.get("promote_ensemble", True)),
+            )
+            print(f"[train] post ensemble summary: {ensemble_result.get('summary_path')}")
+        except Exception as exc:
+            print(f"[train] post ensemble skipped: {exc}")
+
+    if bool(auto_tune_config.get("hybrid_enabled", True)):
+        try:
+            from hybrid_pose_ensemble import run_hybrid_search
+
+            hybrid_result = run_hybrid_search(
+                config=config,
+                paths=paths,
+                manifests=training_manifests,
+                labels=labels,
+                output_dir=paths["artifacts_dir"] / "auto_tune" / "hybrid" / f"manual_{timestamp}",
+                promote=bool(auto_tune_config.get("promote_hybrid", True)),
+            )
+            print(f"[train] post hybrid summary: {hybrid_result.get('summary_path')}")
+        except Exception as exc:
+            print(f"[train] post hybrid skipped: {exc}")
+
+
+def run_specialized_training_tasks(
+    config: dict,
+    paths: dict,
+    *,
+    training_manifests: dict[str, Path],
+    labels: list[str],
+) -> None:
+    task_config = config.get("training_tasks") if isinstance(config.get("training_tasks"), dict) else {}
+    if not bool(task_config.get("enabled", True)):
+        return
+    try:
+        from specialized_action_tasks import run_specialized_action_tasks
+
+        print("[train] specialized detection/classification tasks start", flush=True)
+        summary = run_specialized_action_tasks(
+            config=config,
+            paths=paths,
+            manifests=training_manifests,
+            labels=labels,
+        )
+        summary_path = paths["artifacts_dir"] / "specialized_tasks" / "summary.json"
+        task_names = ", ".join(sorted((summary.get("tasks") or {}).keys())) if isinstance(summary, dict) else "-"
+        print(f"[train] specialized tasks complete: {task_names} -> {summary_path}", flush=True)
+    except Exception as exc:
+        print(f"[train] specialized tasks skipped: {exc}", flush=True)
+
+
+def read_trained_labels(labels_path: Path) -> list[str]:
+    try:
+        payload = json.loads(labels_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    labels = payload.get("labels") if isinstance(payload, dict) else None
+    if not isinstance(labels, list):
+        return []
+    return [str(label) for label in labels]
 
 
 def safe_optional_float(value) -> float | None:
@@ -1051,6 +1245,11 @@ def download_dataset(config: dict, paths: dict) -> list[DownloadedItem]:
         per_class_counts[target_label] += 1
 
     if not downloaded:
+        raise RuntimeError(
+            "No training videos were found after download/import. "
+            "Check filekey access, archive extraction, and label_mapping."
+        )
+    if not downloaded:
         raise RuntimeError("다운로드된 학습 가능 영상이 없습니다. label_mapping과 API 응답 필드를 확인해 주세요.")
 
     write_downloaded_items_manifest(raw_manifest_path, downloaded)
@@ -1068,7 +1267,9 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
     datasetkey = shell_config.get("datasetkey")
     datapackagekey = shell_config.get("datapackagekey")
     filekey = shell_config.get("filekey")
-    import_dir = paths["import_dir"]
+    import_dir = build_aihub_job_import_dir(paths, filekey=filekey)
+    extracted_dir = paths["extracted_dir"] / import_dir.name
+    extracted_dir.mkdir(parents=True, exist_ok=True)
     raw_manifest_path = paths["current_raw_manifest"]
 
     command = build_aihub_shell_command(shell_path, api_key, mode=mode)
@@ -1097,7 +1298,18 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         message="AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다.",
         stage_progress=0.08,
     )
-    run_download_command_with_progress(command, cwd=import_dir, paths=paths)
+    used_predownload = consume_predownload_cache(paths, filekey=filekey, target_dir=import_dir)
+    if used_predownload:
+        write_pipeline_status(
+            paths,
+            stage="download",
+            state="running",
+            message="미리 다운로드된 AIHub cache를 사용합니다.",
+            stage_progress=0.2,
+        )
+        print(f"[download] using predownload cache for filekey={filekey} -> {import_dir}", flush=True)
+    else:
+        run_download_command_with_progress(command, cwd=import_dir, paths=paths)
     import_files = list_indexed_files(import_dir)
     write_pipeline_status(
         paths,
@@ -1115,7 +1327,7 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
         message="병합된 ZIP 파일을 압축 해제하는 중입니다.",
         stage_progress=0.38,
     )
-    source_root = extract_archives(import_dir, paths["extracted_dir"], zip_files=zip_candidates)
+    source_root = extract_archives(import_dir, extracted_dir, zip_files=zip_candidates)
     source_files = import_files if source_root == import_dir else list_indexed_files(source_root)
     write_pipeline_status(
         paths,
@@ -1152,6 +1364,48 @@ def download_dataset_via_aihub_shell(config: dict, paths: dict) -> list[Download
 
     print(f"[download] aihubshell imported {len(downloaded)} videos -> {raw_manifest_path}")
     return downloaded
+
+
+def build_aihub_job_import_dir(paths: dict, *, filekey) -> Path:
+    base_dir = paths["import_dir"]
+    if isinstance(filekey, list):
+        filekey_text = "_".join(str(item) for item in filekey[:4])
+    else:
+        filekey_text = str(filekey or "all")
+    job_dir = base_dir / f"job_{slugify(filekey_text)}_{uuid.uuid4().hex[:8]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def build_aihub_predownload_cache_dir(paths: dict, *, filekey) -> Path:
+    if isinstance(filekey, list):
+        filekey_text = "_".join(str(item) for item in filekey[:4])
+    else:
+        filekey_text = str(filekey or "all")
+    return paths["predownload_dir"] / f"job_{slugify(filekey_text)}"
+
+
+def aihub_predownload_marker(cache_dir: Path) -> Path:
+    return cache_dir / ".predownload_complete.json"
+
+
+def consume_predownload_cache(paths: dict, *, filekey, target_dir: Path) -> bool:
+    cache_dir = build_aihub_predownload_cache_dir(paths, filekey=filekey)
+    marker_path = aihub_predownload_marker(cache_dir)
+    if not marker_path.exists():
+        return False
+    children = [path for path in cache_dir.iterdir() if path.name != marker_path.name]
+    if not children:
+        return False
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for child in children:
+        shutil.move(str(child), str(target_dir / child.name))
+    try:
+        marker_path.unlink(missing_ok=True)
+        cache_dir.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def list_indexed_files(root: Path) -> list[Path]:
@@ -1659,8 +1913,18 @@ def scan_local_video_dataset(
         destination_dir.mkdir(parents=True, exist_ok=True)
         destination_path = destination_dir / sanitize_filename(video_path.name)
         materialize_local_video_asset(video_path, destination_path)
+        sidecar_metadata = preserve_video_annotation_sidecars(
+            video_path,
+            paths,
+            source_root=import_dir,
+        )
 
         relative_id = str(video_path.relative_to(import_dir)).replace("\\", "/")
+        metadata = {
+            "source_path": str(video_path.resolve()),
+            "relative_path": relative_id,
+        }
+        metadata.update(sidecar_metadata)
         scanned.append(
             DownloadedItem(
                 item_id=slugify(relative_id),
@@ -1668,10 +1932,7 @@ def scan_local_video_dataset(
                 target_label=target_label,
                 video_path=destination_path.resolve(),
                 download_url="aihubshell://local-import",
-                metadata={
-                    "source_path": str(video_path.resolve()),
-                    "relative_path": relative_id,
-                },
+                metadata=metadata,
             )
         )
     if excluded_video_count:
@@ -1692,6 +1953,41 @@ def scan_local_video_dataset(
     elif scanned:
         print(f"[scan] labeled videos: {len(scanned)} / candidates: {candidate_video_count}")
     return scanned
+
+
+def infer_filekey_from_source_path(path: Path) -> str:
+    for part in path.parts:
+        match = re.match(r"^job_(?P<filekey>\d+)(?:_|$)", part, re.IGNORECASE)
+        if match:
+            return match.group("filekey")
+    return "unknown"
+
+
+def preserve_video_annotation_sidecars(video_path: Path, paths: dict, *, source_root: Path) -> dict:
+    xml_cache_dir = paths.get("xml_cache_dir")
+    if not isinstance(xml_cache_dir, Path):
+        return {}
+    filekey = infer_filekey_from_source_path(video_path)
+    try:
+        relative_parent = video_path.parent.relative_to(source_root)
+    except ValueError:
+        relative_parent = Path(sanitize_filename(video_path.parent.name))
+    destination_dir = xml_cache_dir / f"job_{slugify(filekey)}" / relative_parent
+    metadata: dict[str, str] = {}
+    for suffix, metadata_key in ((".xml", "xml_path"), (".json", "json_path")):
+        source_sidecar = video_path.with_suffix(suffix)
+        if not source_sidecar.exists():
+            continue
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / sanitize_filename(source_sidecar.name)
+        try:
+            shutil.copy2(source_sidecar, destination_path)
+        except OSError:
+            continue
+        metadata[metadata_key] = str(destination_path.resolve())
+    if metadata:
+        metadata["annotation_cache_filekey"] = filekey
+    return metadata
 
 
 def materialize_local_video_asset(source_path: Path, destination_path: Path) -> None:
@@ -1896,6 +2192,8 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
     fallback_min_detection_confidence = float(preprocess_config.get("fallback_min_detection_confidence", 0.15))
     fallback_min_person_score = int(preprocess_config.get("fallback_min_person_score", 20))
     skip_invalid_labels = bool(preprocess_config.get("skip_invalid_labels", True))
+    person_retry_config = resolve_person_detection_retry_config(preprocess_config)
+    person_retry_detectors: dict[tuple[float, int], PersonDetector] = {}
 
     prepared_paths = {
         "train": paths["current_prepared_train"],
@@ -2056,6 +2354,21 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                             fallback_min_detection_confidence=fallback_min_detection_confidence,
                             fallback_min_person_score=fallback_min_person_score,
                         )
+                        sequence = retry_person_detection_if_needed(
+                            sequence,
+                            payload=payload,
+                            retry_config=person_retry_config,
+                            detector_cache=person_retry_detectors,
+                            face_detector=face_detector,
+                            detector_batch_size=detector_batch_size,
+                            device=device,
+                            allow_rejected_pose_fallback=allow_rejected_pose_fallback,
+                            fallback_min_keypoints=fallback_min_keypoints,
+                            fallback_min_detection_confidence=fallback_min_detection_confidence,
+                            fallback_min_person_score=fallback_min_person_score,
+                            extract_pose_sequence_from_payload=extract_pose_sequence_from_payload,
+                            person_detector_cls=PersonDetector,
+                        )
                     except Exception as exc:
                         reason = "unreadable_video"
                         skipped += 1
@@ -2103,6 +2416,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                             video_path=video_path,
                             target_label=target_label,
                             reason=skip_reason,
+                            detail=format_person_retry_detail(sequence),
                             valid_frames=int(sequence["valid_frames"]),
                             confirmed_frames=int(sequence["confirmed_frames"]),
                             total_valid_keypoints=int(sequence.get("total_valid_keypoints", 0) or 0),
@@ -2145,6 +2459,7 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
                                 ),
                                 "chosen_track_id": sequence["chosen_track_id"],
                                 "recovery_actions": recovery_actions,
+                                "person_retry": sequence.get("person_retry", {}),
                                 "frame_stats": sequence.get("frame_stats", {}),
                             },
                             ensure_ascii=False,
@@ -2203,12 +2518,199 @@ def prepare_pose_dataset(config: dict, paths: dict, split_manifests: dict[str, P
         f"skipped={summary.get('skipped_count', 0)}"
     )
 
-    if kept_by_split.get("train", 0) <= 0 or kept_by_split.get("val", 0) <= 0:
+    if (
+        kept_by_split.get("train", 0) <= 0 or kept_by_split.get("val", 0) <= 0
+    ) and allow_insufficient_pose_samples_for_rgb_fallback(config):
+        warning = (
+            "Pose train/val samples are too low, but guideline RGB/I3D fallback is enabled; "
+            f"continuing so raw split data can be reused. train={kept_by_split.get('train', 0)}, "
+            f"val={kept_by_split.get('val', 0)}"
+        )
+        print(f"[prepare][warning] {warning}")
+        skip_report.setdefault("warnings", []).append(
+            {
+                "type": "insufficient_pose_samples_rgb_fallback",
+                "message": warning,
+                "train_used": kept_by_split.get("train", 0),
+                "val_used": kept_by_split.get("val", 0),
+                "test_used": kept_by_split.get("test", 0),
+            }
+        )
+        write_skip_reports(paths, skip_report)
+        write_pipeline_status(
+            paths,
+            stage="prepare",
+            state="running",
+            message="Pose samples are low; continuing with guideline RGB/I3D fallback.",
+            stage_progress=0.79,
+            kept_items=sum(kept_by_split.values()),
+            skipped_items=summary.get("skipped_items", 0),
+            pose_fallback_warning=warning,
+        )
+
+    if (
+        kept_by_split.get("train", 0) <= 0 or kept_by_split.get("val", 0) <= 0
+    ) and not allow_insufficient_pose_samples_for_rgb_fallback(config):
         raise RuntimeError(
             "전처리 후 학습/검증 샘플이 부족합니다. min_frames_with_person, 라벨 매핑, 원본 영상을 확인해 주세요."
         )
 
     return prepared_paths
+
+
+def allow_insufficient_pose_samples_for_rgb_fallback(config: dict) -> bool:
+    preprocess_config = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
+    if bool(preprocess_config.get("strict_data_validation", False)):
+        return False
+    if "allow_insufficient_pose_samples_for_rgb_fallback" in preprocess_config:
+        return bool(preprocess_config.get("allow_insufficient_pose_samples_for_rgb_fallback"))
+
+    guideline_config = (
+        config.get("guideline_sampling", {})
+        if isinstance(config.get("guideline_sampling"), dict)
+        else {}
+    )
+    return bool(
+        guideline_config.get("enabled", False)
+        and (
+            guideline_config.get("keep_pose_failed_clips", False)
+            or guideline_config.get("include_pose_skipped_videos", False)
+        )
+    )
+
+
+def resolve_person_detection_retry_config(preprocess_config: dict) -> dict:
+    raw = preprocess_config.get("person_not_detected_retry")
+    if not isinstance(raw, dict):
+        raw = {}
+    attempts = raw.get("attempts")
+    if not isinstance(attempts, list):
+        attempts = [
+            {"person_score_threshold": 0.15, "person_imgsz": 960},
+            {"person_score_threshold": 0.10, "person_imgsz": 1280},
+        ]
+    normalized_attempts = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        try:
+            threshold = float(attempt.get("person_score_threshold", attempt.get("threshold", 0.15)))
+            imgsz = int(attempt.get("person_imgsz", attempt.get("imgsz", 960)))
+        except (TypeError, ValueError):
+            continue
+        normalized_attempts.append(
+            {
+                "person_score_threshold": clamp_float(threshold, 0.01, 0.95),
+                "person_imgsz": max(imgsz, 320),
+            }
+        )
+    reasons = raw.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        reasons = ["person_not_detected"]
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "reasons": {str(reason or "").strip() for reason in reasons if str(reason or "").strip()},
+        "attempts": normalized_attempts,
+    }
+
+
+def retry_person_detection_if_needed(
+    sequence: dict,
+    *,
+    payload: dict,
+    retry_config: dict,
+    detector_cache: dict,
+    face_detector,
+    detector_batch_size: int,
+    device: str,
+    allow_rejected_pose_fallback: bool,
+    fallback_min_keypoints: int,
+    fallback_min_detection_confidence: float,
+    fallback_min_person_score: int,
+    extract_pose_sequence_from_payload,
+    person_detector_cls,
+) -> dict:
+    retry_payload = {
+        "enabled": bool(retry_config.get("enabled", True)),
+        "attempted": False,
+        "success": False,
+        "attempts": [],
+    }
+    if not retry_payload["enabled"]:
+        sequence["person_retry"] = retry_payload
+        return sequence
+    skip_reason = str(sequence.get("skip_reason") or "")
+    valid_frames = int(sequence.get("valid_frames", 0) or 0)
+    if valid_frames > 0 or skip_reason not in retry_config.get("reasons", {"person_not_detected"}):
+        sequence["person_retry"] = retry_payload
+        return sequence
+
+    best_sequence = sequence
+    for attempt in retry_config.get("attempts") or []:
+        threshold = float(attempt["person_score_threshold"])
+        imgsz = int(attempt["person_imgsz"])
+        cache_key = (threshold, imgsz)
+        detector = detector_cache.get(cache_key)
+        if detector is None:
+            detector = person_detector_cls(score_threshold=threshold, resize_width=imgsz, device=device)
+            detector_cache[cache_key] = detector
+        retry_payload["attempted"] = True
+        retry_sequence = extract_pose_sequence_from_payload(
+            payload=payload,
+            person_detector=detector,
+            face_detector=face_detector,
+            detector_batch_size=detector_batch_size,
+            allow_rejected_pose_fallback=allow_rejected_pose_fallback,
+            fallback_min_keypoints=fallback_min_keypoints,
+            fallback_min_detection_confidence=fallback_min_detection_confidence,
+            fallback_min_person_score=fallback_min_person_score,
+        )
+        retry_valid_frames = int(retry_sequence.get("valid_frames", 0) or 0)
+        retry_payload["attempts"].append(
+            {
+                "person_score_threshold": threshold,
+                "person_imgsz": imgsz,
+                "valid_frames": retry_valid_frames,
+                "skip_reason": retry_sequence.get("skip_reason") or "",
+            }
+        )
+        if retry_valid_frames > int(best_sequence.get("valid_frames", 0) or 0):
+            best_sequence = retry_sequence
+        if retry_valid_frames > 0:
+            retry_payload["success"] = True
+            retry_payload["selected"] = {
+                "person_score_threshold": threshold,
+                "person_imgsz": imgsz,
+                "valid_frames": retry_valid_frames,
+            }
+            actions = list(retry_sequence.get("recovery_actions") or [])
+            actions.append(f"person_detector_retry:{threshold:g}@{imgsz}")
+            retry_sequence["recovery_actions"] = sorted(set(actions))
+            retry_sequence["person_retry"] = retry_payload
+            return retry_sequence
+
+    best_sequence["person_retry"] = retry_payload
+    return best_sequence
+
+
+def format_person_retry_detail(sequence: dict) -> str | None:
+    retry_payload = sequence.get("person_retry") if isinstance(sequence.get("person_retry"), dict) else {}
+    if not retry_payload.get("attempted"):
+        return None
+    attempts = retry_payload.get("attempts") if isinstance(retry_payload.get("attempts"), list) else []
+    parts = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        parts.append(
+            "threshold={threshold}, imgsz={imgsz}, valid_frames={valid}, reason={reason}".format(
+                threshold=attempt.get("person_score_threshold"),
+                imgsz=attempt.get("person_imgsz"),
+                valid=attempt.get("valid_frames"),
+                reason=attempt.get("skip_reason") or "-",
+            )
+        )
+    return "person_retry failed: " + " | ".join(parts) if parts else "person_retry failed"
 
 
 def create_prepare_stats(labels: list[str]) -> dict:
@@ -2491,7 +2993,29 @@ def get_continual_config(config: dict) -> dict:
 
 
 def load_training_manifests(config: dict, paths: dict, *, continual_enabled: bool) -> dict[str, Path]:
-    if continual_enabled and paths["prepared_train"].exists() and paths["prepared_val"].exists():
+    guideline_config = config.get("guideline_sampling") if isinstance(config.get("guideline_sampling"), dict) else {}
+    if (
+        bool(guideline_config.get("enabled", False))
+        and paths["guideline_prepared_train"].exists()
+        and paths["guideline_prepared_val"].exists()
+    ):
+        base_manifests = {
+            "train": paths["guideline_prepared_train"],
+            "val": paths["guideline_prepared_val"],
+            "test": paths["guideline_prepared_test"],
+        }
+        if continual_enabled and paths["prepared_train"].exists() and paths["prepared_val"].exists():
+            base_manifests = repair_guideline_manifests_with_cumulative_classes(
+                config,
+                paths,
+                guideline_manifests=base_manifests,
+                cumulative_manifests={
+                    "train": paths["prepared_train"],
+                    "val": paths["prepared_val"],
+                    "test": paths["prepared_test"],
+                },
+            )
+    elif continual_enabled and paths["prepared_train"].exists() and paths["prepared_val"].exists():
         base_manifests = {
             "train": paths["prepared_train"],
             "val": paths["prepared_val"],
@@ -2504,6 +3028,65 @@ def load_training_manifests(config: dict, paths: dict, *, continual_enabled: boo
             "test": paths["current_prepared_test"],
         }
     return materialize_training_manifests(config, paths, base_manifests)
+
+
+def repair_guideline_manifests_with_cumulative_classes(
+    config: dict,
+    paths: dict,
+    *,
+    guideline_manifests: dict[str, Path],
+    cumulative_manifests: dict[str, Path],
+) -> dict[str, Path]:
+    target_labels = [str(label) for label in get_target_labels(config)]
+    guideline_config = config.get("guideline_sampling") if isinstance(config.get("guideline_sampling"), dict) else {}
+    normal_label = str(guideline_config.get("normal_label") or "normal")
+    danger_labels = [label for label in target_labels if label != normal_label]
+    if not danger_labels:
+        return guideline_manifests
+
+    repaired_manifests: dict[str, Path] = {}
+    repaired_any = False
+    for split_name in ("train", "val", "test"):
+        guideline_path = guideline_manifests.get(split_name)
+        cumulative_path = cumulative_manifests.get(split_name)
+        if not isinstance(guideline_path, Path) or not guideline_path.exists():
+            continue
+        if not isinstance(cumulative_path, Path) or not cumulative_path.exists():
+            repaired_manifests[split_name] = guideline_path
+            continue
+
+        guideline_counts = count_manifest_labels(guideline_path)
+        cumulative_counts = count_manifest_labels(cumulative_path)
+        missing_labels = [
+            label
+            for label in danger_labels
+            if guideline_counts.get(label, 0) <= 0 and cumulative_counts.get(label, 0) > 0
+        ]
+        if not missing_labels:
+            repaired_manifests[split_name] = guideline_path
+            continue
+
+        repaired_any = True
+        repaired_path = paths["manifests_dir"] / f"training_guideline_repaired_{split_name}.jsonl"
+        missing_label_set = set(missing_labels)
+        rows = list(read_jsonl_entries(guideline_path))
+        rows.extend(
+            row
+            for row in read_jsonl_entries(cumulative_path)
+            if str(row.get("target_label") or "").strip() in missing_label_set
+        )
+        write_jsonl_entries(repaired_path, rows)
+        repaired_manifests[split_name] = repaired_path
+        print(
+            "[train-manifest] guideline manifest class repair "
+            f"{split_name}: added missing labels from cumulative {missing_labels} -> {repaired_path}"
+        )
+
+    if not repaired_any:
+        return guideline_manifests
+    for split_name, guideline_path in guideline_manifests.items():
+        repaired_manifests.setdefault(split_name, guideline_path)
+    return repaired_manifests
 
 
 def count_manifest_labels(path: Path) -> Counter[str]:
@@ -2861,6 +3444,9 @@ def materialize_training_manifests(
 
 def remap_prepared_entry(entry: dict, *, label_to_idx: dict[str, int], label_mapping: dict) -> dict | None:
     mapped_entry = dict(entry)
+    if mapped_entry.get("rgb_catalog_only"):
+        return None
+
     target_label = str(mapped_entry.get("target_label") or "").strip()
     source_label = str(mapped_entry.get("source_label") or "").strip()
 
@@ -2987,16 +3573,51 @@ def write_jsonl_entries(path: Path, entries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with temp_path.open("w", encoding="utf-8") as handle:
-            for entry in entries:
-                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        temp_path.replace(path)
+        write_jsonl_entries_to_path(temp_path, entries)
+        replace_path_with_retries(temp_path, path)
     finally:
         try:
             if temp_path.exists():
                 temp_path.unlink()
         except OSError:
             pass
+
+
+def write_jsonl_entries_to_path(path: Path, entries: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def replace_path_with_retries(
+    source_path: Path,
+    target_path: Path,
+    *,
+    retries: int = 120,
+    delay_seconds: float = 0.25,
+) -> None:
+    last_error: OSError | None = None
+    for attempt in range(max(int(retries), 1)):
+        try:
+            source_path.replace(target_path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        if attempt + 1 < retries:
+            time.sleep(float(delay_seconds))
+    try:
+        with source_path.open("rb") as source_handle:
+            payload = source_handle.read()
+        with target_path.open("wb") as target_handle:
+            target_handle.write(payload)
+        return
+    except OSError:
+        pass
+    if last_error is not None:
+        raise last_error
+    source_path.replace(target_path)
 
 
 def append_jsonl_entries(path: Path, entries: list[dict]) -> None:
@@ -3010,6 +3631,20 @@ def append_jsonl_entries(path: Path, entries: list[dict]) -> None:
 
 def build_manifest_unique_key(entry: dict) -> str:
     metadata = entry.get("metadata") or {}
+    item_id = entry.get("item_id")
+    is_clip_level_entry = any(
+        entry.get(key)
+        for key in (
+            "clip_role",
+            "rgb_feature_path",
+            "clip_start_seconds",
+            "clip_end_seconds",
+            "event_start_seconds",
+            "event_end_seconds",
+        )
+    )
+    if is_clip_level_entry and item_id:
+        return f"item::{normalize_manifest_identity(item_id)}"
     relative_path = metadata.get("relative_path")
     if relative_path:
         return f"relative::{normalize_manifest_identity(relative_path)}"
@@ -3019,7 +3654,6 @@ def build_manifest_unique_key(entry: dict) -> str:
     video_path = entry.get("video_path")
     if video_path:
         return f"video::{normalize_manifest_identity(video_path)}"
-    item_id = entry.get("item_id")
     if item_id:
         return f"item::{normalize_manifest_identity(item_id)}"
     pose_path = entry.get("pose_path")
@@ -3050,7 +3684,7 @@ def build_active_manifest_state(
     quality_rules: dict | None = None,
 ) -> dict:
     schema_payload = {
-        "materializer_version": 3,
+        "materializer_version": 4,
         "target_labels": list(target_labels),
         "label_mapping": label_mapping,
         "quality_rules": quality_rules or {},
@@ -3121,12 +3755,53 @@ def write_active_manifest_state(state_path: Path, desired_state: dict) -> None:
     )
 
 
+def remove_transient_path_with_retries(
+    target: Path,
+    *,
+    recreate_dir: bool = False,
+    retries: int = 8,
+    delay_seconds: float = 1.0,
+) -> bool:
+    last_error: Exception | None = None
+    for attempt in range(max(int(retries), 1)):
+        try:
+            if not target.exists():
+                if recreate_dir:
+                    target.mkdir(parents=True, exist_ok=True)
+                return True
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            if recreate_dir:
+                target.mkdir(parents=True, exist_ok=True)
+            return True
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(delay_seconds)
+                continue
+        except OSError as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(delay_seconds)
+                continue
+        break
+
+    print(f"[cleanup] warning: could not remove locked path {target}: {last_error}")
+    if recreate_dir:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return False
+
+
 def cleanup_transient_job_data(paths: dict) -> None:
     for key in ("raw_dir", "import_dir", "extracted_dir"):
         target = paths.get(key)
         if isinstance(target, Path) and target.exists():
-            shutil.rmtree(target)
-            target.mkdir(parents=True, exist_ok=True)
+            remove_transient_path_with_retries(target, recreate_dir=True)
 
     for key in (
         "current_raw_manifest",
@@ -3139,7 +3814,7 @@ def cleanup_transient_job_data(paths: dict) -> None:
     ):
         target = paths.get(key)
         if isinstance(target, Path) and target.exists():
-            target.unlink()
+            remove_transient_path_with_retries(target)
 
 
 def fetch_api_items(session: requests.Session, api_config: dict) -> list[dict]:
@@ -3222,7 +3897,9 @@ def build_headers(api_config: dict) -> dict:
     return headers
 
 
-def validate_source_config(config: dict, config_path: Path) -> None:
+def validate_source_config(config: dict, config_path: Path, *, stage: str = "all") -> None:
+    if str(stage or "").strip().lower() == "train":
+        return
     source_mode = str(config.get("dataset_source", "json_api")).strip().lower()
     if source_mode == "aihub_shell":
         validate_aihub_shell_config(config.get("aihub_shell", {}), config_path)

@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import random
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -26,6 +27,7 @@ POSE_COORD_CLIP_RANGE = (-0.5, 1.5)
 POSE_CONFIDENCE_CLIP_RANGE = (0.0, 1.0)
 MAX_MISCLASSIFIED_EXAMPLES = 200
 MAX_ERROR_EXAMPLES_PER_GROUP = 20
+MAX_DUPLICATE_POSE_LABEL_SAMPLES = 3
 
 
 @dataclass
@@ -37,25 +39,55 @@ class TrainingArtifacts:
 
 
 class PoseSequenceDataset(Dataset):
-    def __init__(self, manifest_path: Path, *, cache_size: int = 0) -> None:
+    def __init__(
+        self,
+        manifest_path: Path,
+        *,
+        cache_size: int = 0,
+        max_duplicate_pose_label_samples: int = MAX_DUPLICATE_POSE_LABEL_SAMPLES,
+    ) -> None:
         self.samples = []
+        self.skipped_missing_pose_path = 0
+        self.skipped_conflicting_pose_label = 0
+        self.skipped_duplicate_pose_label = 0
         self.cache_size = max(int(cache_size), 0)
         self._cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = OrderedDict()
+        loaded_samples: list[dict] = []
         with manifest_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
                     continue
-                self.samples.append(json.loads(line))
+                sample = json.loads(line)
+                pose_path = str(sample.get("pose_path") or "").strip()
+                if not pose_path or not Path(pose_path).exists():
+                    self.skipped_missing_pose_path += 1
+                    continue
+                loaded_samples.append(sample)
+        filtered_samples, self.skipped_conflicting_pose_label = _filter_conflicting_pose_label_samples(loaded_samples)
+        self.max_duplicate_pose_label_samples = int(max_duplicate_pose_label_samples)
+        self.samples, self.skipped_duplicate_pose_label = _limit_duplicate_pose_label_samples(
+            filtered_samples,
+            max_per_pose_label=self.max_duplicate_pose_label_samples,
+        )
         if not self.samples:
-            raise RuntimeError(f"학습용 샘플이 없습니다: {manifest_path}")
+            raise RuntimeError(
+                f"Pose 학습용 샘플이 없습니다: {manifest_path} "
+                f"(pose_path 없음/파일 없음: {self.skipped_missing_pose_path})"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
-        cache_key = str(sample["pose_path"])
+        cache_key = "::".join(
+            [
+                str(sample.get("pose_path") or ""),
+                str(sample.get("label_idx") or ""),
+                str(sample.get("item_id") or index),
+            ]
+        )
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._cache.move_to_end(cache_key)
@@ -82,6 +114,153 @@ class PoseSequenceDataset(Dataset):
             torch.from_numpy(mask),
             torch.tensor(label_idx, dtype=torch.long),
         )
+
+
+def _filter_conflicting_pose_label_samples(samples: list[dict]) -> tuple[list[dict], int]:
+    by_pose: dict[str, list[dict]] = {}
+    for sample in samples:
+        pose_key = str(sample.get("pose_path") or "").strip()
+        by_pose.setdefault(pose_key, []).append(sample)
+
+    kept: list[dict] = []
+    skipped = 0
+    for group in by_pose.values():
+        labels = {str(sample.get("target_label") or sample.get("label_idx") or "") for sample in group}
+        if len(labels) <= 1:
+            kept.extend(group)
+            continue
+
+        non_normal = [
+            sample
+            for sample in group
+            if str(sample.get("target_label") or "").strip().lower() != "normal"
+            and str(sample.get("clip_role") or "").strip() != "normal_context"
+        ]
+        if non_normal:
+            label_counts: dict[str, int] = {}
+            for sample in non_normal:
+                label_key = str(sample.get("target_label") or sample.get("label_idx") or "")
+                label_counts[label_key] = label_counts.get(label_key, 0) + 1
+            dominant_label = max(label_counts.items(), key=lambda item: item[1])[0]
+            selected = [
+                sample
+                for sample in non_normal
+                if str(sample.get("target_label") or sample.get("label_idx") or "") == dominant_label
+            ]
+        else:
+            selected = [group[0]]
+        kept.extend(selected)
+        skipped += len(group) - len(selected)
+    return kept, skipped
+
+
+def _drop_empty_training_labels(
+    train_dataset: PoseSequenceDataset,
+    val_dataset: PoseSequenceDataset,
+    labels: list[str],
+) -> tuple[list[str], list[str]]:
+    train_counts = _count_sample_label_indices(train_dataset.samples, len(labels))
+    val_counts = _count_sample_label_indices(val_dataset.samples, len(labels))
+    keep_indices = [
+        index
+        for index, _label in enumerate(labels)
+        if train_counts.get(index, 0) > 0 and val_counts.get(index, 0) > 0
+    ]
+    if len(keep_indices) == len(labels) or len(keep_indices) < 2:
+        return labels, []
+
+    index_map = {old_index: new_index for new_index, old_index in enumerate(keep_indices)}
+    filtered_labels = [labels[index] for index in keep_indices]
+    dropped_labels = [label for index, label in enumerate(labels) if index not in index_map]
+    train_dataset.samples = _remap_samples_to_kept_labels(train_dataset.samples, labels, index_map)
+    val_dataset.samples = _remap_samples_to_kept_labels(val_dataset.samples, labels, index_map)
+    return filtered_labels, dropped_labels
+
+
+def _count_sample_label_indices(samples: list[dict], num_labels: int) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for sample in samples:
+        try:
+            label_idx = int(sample.get("label_idx"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= label_idx < num_labels:
+            counts[label_idx] = counts.get(label_idx, 0) + 1
+    return counts
+
+
+def _remap_samples_to_kept_labels(
+    samples: list[dict],
+    labels: list[str],
+    index_map: dict[int, int],
+) -> list[dict]:
+    remapped: list[dict] = []
+    for sample in samples:
+        try:
+            old_index = int(sample.get("label_idx"))
+        except (TypeError, ValueError):
+            continue
+        if old_index not in index_map:
+            continue
+        next_sample = dict(sample)
+        next_sample["source_label_idx"] = old_index
+        next_sample["source_target_label"] = next_sample.get("target_label") or labels[old_index]
+        next_sample["label_idx"] = index_map[old_index]
+        next_sample["target_label"] = labels[old_index]
+        next_sample["label"] = labels[old_index]
+        remapped.append(next_sample)
+    return remapped
+
+
+def _limit_duplicate_pose_label_samples(
+    samples: list[dict],
+    *,
+    max_per_pose_label: int = MAX_DUPLICATE_POSE_LABEL_SAMPLES,
+) -> tuple[list[dict], int]:
+    if max_per_pose_label <= 0:
+        return list(samples), 0
+
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    passthrough: list[dict] = []
+    for sample in samples:
+        pose_key = str(sample.get("pose_path") or "").strip()
+        try:
+            label_idx = int(sample.get("label_idx"))
+        except (TypeError, ValueError):
+            passthrough.append(sample)
+            continue
+        if not pose_key:
+            passthrough.append(sample)
+            continue
+        grouped.setdefault((pose_key, label_idx), []).append(sample)
+
+    kept = list(passthrough)
+    skipped = 0
+    for group in grouped.values():
+        ranked = sorted(group, key=_duplicate_pose_sample_rank)
+        selected = ranked[:max_per_pose_label]
+        kept.extend(selected)
+        skipped += max(0, len(group) - len(selected))
+    return kept, skipped
+
+
+def _duplicate_pose_sample_rank(sample: dict) -> tuple:
+    role = str(sample.get("clip_role") or "").strip()
+    is_event = 0 if role != "normal_context" else 1
+    try:
+        sample_weight = -float(sample.get("sample_weight") or 1.0)
+    except (TypeError, ValueError):
+        sample_weight = -1.0
+    try:
+        valid_frames = -int(sample.get("valid_frames") or sample.get("frames_with_person") or 0)
+    except (TypeError, ValueError):
+        valid_frames = 0
+    return (
+        is_event,
+        sample_weight,
+        valid_frames,
+        str(sample.get("item_id") or sample.get("video") or sample.get("source_video") or ""),
+    )
 
 
 def _sanitize_pose_arrays(pose: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -147,6 +326,90 @@ class TemporalPoseClassifier(nn.Module):
         mask = mask.unsqueeze(-1)
         pooled = (temporal_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         return self.classifier(pooled)
+
+
+class MeanMaxTemporalPoseClassifier(nn.Module):
+    def __init__(
+        self,
+        num_joints: int,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_classes: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        feature_dim = num_joints * input_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_encoder = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        pooled_dim = hidden_dim * 4
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, pose: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        batch_size, time_steps, num_joints, input_dim = pose.shape
+        flattened = pose.view(batch_size, time_steps, num_joints * input_dim)
+        encoded = self.input_proj(flattened)
+        temporal_out, _hidden = self.temporal_encoder(encoded)
+
+        mask_float = mask.unsqueeze(-1).to(dtype=temporal_out.dtype)
+        mean_pooled = (temporal_out * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
+
+        valid_mask = mask.unsqueeze(-1).to(dtype=torch.bool)
+        min_value = torch.finfo(temporal_out.dtype).min
+        masked_temporal = temporal_out.masked_fill(~valid_mask, min_value)
+        max_pooled = masked_temporal.max(dim=1).values
+        has_valid_frame = valid_mask.any(dim=1)
+        max_pooled = torch.where(has_valid_frame, max_pooled, torch.zeros_like(max_pooled))
+
+        pooled = torch.cat([mean_pooled, max_pooled], dim=-1)
+        return self.classifier(pooled)
+
+
+def _resolve_temporal_pooling(value: str | None) -> str:
+    normalized = str(value or "mean").strip().lower().replace("-", "_")
+    if normalized in {"mean_max", "meanmax", "max_mean"}:
+        return "mean_max"
+    return "mean"
+
+
+def _build_temporal_pose_classifier(
+    *,
+    temporal_pooling: str | None,
+    num_joints: int,
+    input_dim: int,
+    hidden_dim: int,
+    num_layers: int,
+    num_classes: int,
+    dropout: float,
+) -> nn.Module:
+    pooling = _resolve_temporal_pooling(temporal_pooling)
+    model_class = MeanMaxTemporalPoseClassifier if pooling == "mean_max" else TemporalPoseClassifier
+    return model_class(
+        num_joints=num_joints,
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_classes=num_classes,
+        dropout=dropout,
+    )
 
 
 class FocalLoss(nn.Module):
@@ -283,6 +546,7 @@ def train_action_classifier(
     hidden_dim: int = 128,
     num_layers: int = 2,
     dropout: float = 0.2,
+    temporal_pooling: str = "mean",
     label_smoothing: float = 0.05,
     loss_name: str = "cross_entropy",
     focal_gamma: float = 2.0,
@@ -304,10 +568,16 @@ def train_action_classifier(
     pin_memory: bool | str = "auto",
     early_stopping_patience: int = 5,
     early_stopping_min_delta: float = 0.001,
+    selection_metric: str = "macro_f1",
+    overfit_guard_enabled: bool = True,
+    overfit_guard_min_epoch: int = 8,
+    overfit_guard_loss_gap: float = 0.45,
+    overfit_guard_patience: int = 3,
     imbalance_warn_min_samples: int = 8,
     imbalance_warn_ratio: float = 5.0,
     progress_path: Path | None = None,
     resume_from: Path | None = None,
+    max_duplicate_pose_label_samples: int = MAX_DUPLICATE_POSE_LABEL_SAMPLES,
 ) -> TrainingArtifacts:
     output_dir.mkdir(parents=True, exist_ok=True)
     labels_path = output_dir / "labels.json"
@@ -340,10 +610,56 @@ def train_action_classifier(
         num_workers=resolved_num_workers,
     )
 
-    train_dataset = PoseSequenceDataset(train_manifest, cache_size=effective_cache_size)
-    val_dataset = PoseSequenceDataset(val_manifest, cache_size=effective_cache_size)
+    train_dataset = PoseSequenceDataset(
+        train_manifest,
+        cache_size=effective_cache_size,
+        max_duplicate_pose_label_samples=max_duplicate_pose_label_samples,
+    )
+    val_dataset = PoseSequenceDataset(
+        val_manifest,
+        cache_size=effective_cache_size,
+        max_duplicate_pose_label_samples=max_duplicate_pose_label_samples,
+    )
+    skipped_missing_pose_total = (
+        int(getattr(train_dataset, "skipped_missing_pose_path", 0))
+        + int(getattr(val_dataset, "skipped_missing_pose_path", 0))
+    )
+    skipped_conflicting_pose_total = (
+        int(getattr(train_dataset, "skipped_conflicting_pose_label", 0))
+        + int(getattr(val_dataset, "skipped_conflicting_pose_label", 0))
+    )
+    skipped_duplicate_pose_total = (
+        int(getattr(train_dataset, "skipped_duplicate_pose_label", 0))
+        + int(getattr(val_dataset, "skipped_duplicate_pose_label", 0))
+    )
+    if skipped_missing_pose_total > 0:
+        print(
+            "[train] pose dataset filtered RGB/I3D-only fallback rows "
+            f"train={getattr(train_dataset, 'skipped_missing_pose_path', 0)} "
+            f"val={getattr(val_dataset, 'skipped_missing_pose_path', 0)}"
+        )
+    if skipped_conflicting_pose_total > 0:
+        print(
+            "[train] pose dataset filtered conflicting pose-label rows "
+            f"train={getattr(train_dataset, 'skipped_conflicting_pose_label', 0)} "
+            f"val={getattr(val_dataset, 'skipped_conflicting_pose_label', 0)}"
+        )
+    if skipped_duplicate_pose_total > 0:
+        print(
+            "[train] pose dataset capped duplicate pose-label rows "
+            f"max_per_pose_label={max_duplicate_pose_label_samples} "
+            f"train={getattr(train_dataset, 'skipped_duplicate_pose_label', 0)} "
+            f"val={getattr(val_dataset, 'skipped_duplicate_pose_label', 0)}"
+        )
 
     label_mapping_payload = _build_label_mapping_payload(labels)
+    labels, dropped_labels = _drop_empty_training_labels(train_dataset, val_dataset, labels)
+    if dropped_labels:
+        print(
+            "[train] dropped labels with no pose-ready train/val samples: "
+            + ", ".join(dropped_labels)
+        )
+        label_mapping_payload = _build_label_mapping_payload(labels)
     _validate_dataset_label_mapping(train_dataset.samples, labels, split_name="train")
     _validate_dataset_label_mapping(val_dataset.samples, labels, split_name="val")
     train_distribution = _summarize_class_distribution(
@@ -379,35 +695,42 @@ def train_action_classifier(
         class_weight_multipliers=class_weight_multiplier_tensor,
     )
 
-    train_loader = _build_dataloader(
-        dataset=train_dataset,
-        batch_size=resolved_batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=resolved_num_workers,
-        pin_memory=use_pin_memory,
-        pin_memory_device=resolved_pin_memory_device,
-        prefetch_factor=resolved_prefetch_factor,
-        persistent_workers=use_persistent_workers,
-        generator=train_generator,
-        worker_init_fn=worker_init_fn,
-    )
-    val_loader = _build_dataloader(
-        dataset=val_dataset,
-        batch_size=resolved_eval_batch_size,
-        shuffle=False,
-        sampler=None,
-        num_workers=resolved_num_workers,
-        pin_memory=use_pin_memory,
-        pin_memory_device=resolved_pin_memory_device,
-        prefetch_factor=resolved_prefetch_factor,
-        persistent_workers=use_persistent_workers,
-        generator=None,
-        worker_init_fn=worker_init_fn,
-    )
+    def build_training_loaders(loader_num_workers: int) -> tuple[DataLoader, DataLoader, bool]:
+        loader_persistent_workers = bool(persistent_workers and loader_num_workers > 0)
+        train_data_loader = _build_dataloader(
+            dataset=train_dataset,
+            batch_size=resolved_batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            num_workers=loader_num_workers,
+            pin_memory=use_pin_memory,
+            pin_memory_device=resolved_pin_memory_device,
+            prefetch_factor=resolved_prefetch_factor,
+            persistent_workers=loader_persistent_workers,
+            generator=train_generator,
+            worker_init_fn=worker_init_fn,
+        )
+        val_data_loader = _build_dataloader(
+            dataset=val_dataset,
+            batch_size=resolved_eval_batch_size,
+            shuffle=False,
+            sampler=None,
+            num_workers=loader_num_workers,
+            pin_memory=use_pin_memory,
+            pin_memory_device=resolved_pin_memory_device,
+            prefetch_factor=resolved_prefetch_factor,
+            persistent_workers=loader_persistent_workers,
+            generator=None,
+            worker_init_fn=worker_init_fn,
+        )
+        return train_data_loader, val_data_loader, loader_persistent_workers
+
+    train_loader, val_loader, use_persistent_workers = build_training_loaders(resolved_num_workers)
 
     first_pose, _first_mask, _first_label = train_dataset[0]
-    base_model = TemporalPoseClassifier(
+    resolved_temporal_pooling = _resolve_temporal_pooling(temporal_pooling)
+    base_model = _build_temporal_pose_classifier(
+        temporal_pooling=resolved_temporal_pooling,
         num_joints=first_pose.shape[1],
         input_dim=first_pose.shape[2],
         hidden_dim=hidden_dim,
@@ -424,9 +747,21 @@ def train_action_classifier(
         checkpoint_labels = list(checkpoint.get("labels", []))
         checkpoint_state = checkpoint.get("model_state_dict", {}) or {}
         if checkpoint_labels == list(labels):
-            base_model.load_state_dict(checkpoint_state, strict=False)
-            resumed_from_checkpoint = True
-            resume_mode = "full"
+            try:
+                base_model.load_state_dict(checkpoint_state, strict=False)
+                resumed_from_checkpoint = True
+                resume_mode = "full"
+            except RuntimeError as exc:
+                loaded_count, skipped_keys = _load_compatible_state_dict(base_model, checkpoint_state)
+                if loaded_count > 0:
+                    resumed_from_checkpoint = True
+                    resume_mode = "partial"
+                    print(
+                        "[train] checkpoint를 부분 warm-start로 읽었습니다. "
+                        f"loaded={loaded_count} skipped={len(skipped_keys)} reason={exc}"
+                    )
+                else:
+                    print(f"[train] checkpoint resume을 건너뜁니다: {exc}")
         else:
             loaded_count, skipped_keys = _load_compatible_state_dict(base_model, checkpoint_state)
             if loaded_count > 0:
@@ -458,12 +793,8 @@ def train_action_classifier(
         num_classes=len(labels),
         requested=class_weight,
     )
-    if class_weight_multiplier_tensor is not None:
-        if class_weights is None:
-            class_weights = torch.ones(len(labels), dtype=torch.float32)
-            class_weight_mode = "multipliers"
-        else:
-            class_weight_mode = f"{class_weight_mode}+multipliers"
+    if class_weight_multiplier_tensor is not None and class_weights is not None:
+        class_weight_mode = f"{class_weight_mode}+multipliers"
         class_weights = class_weights * class_weight_multiplier_tensor
     class_weights_for_loss = class_weights.to(device) if class_weights is not None else None
     criterion, resolved_loss_name = _build_loss_function(
@@ -481,10 +812,16 @@ def train_action_classifier(
     scaler = _create_grad_scaler(enabled=use_amp)
 
     history: list[dict] = []
+    resolved_selection_metric = _resolve_selection_metric(selection_metric)
+    best_selection_score = -1.0
     best_val_f1 = -1.0
     best_epoch = 0
     effective_patience = max(int(early_stopping_patience), 0)
     effective_min_delta = max(float(early_stopping_min_delta), 0.0)
+    effective_overfit_guard_enabled = bool(overfit_guard_enabled)
+    effective_overfit_guard_min_epoch = max(int(overfit_guard_min_epoch), 1)
+    effective_overfit_guard_loss_gap = max(float(overfit_guard_loss_gap), 0.0)
+    effective_overfit_guard_patience = max(int(overfit_guard_patience), 1)
     epochs_without_improvement = 0
     stopped_early = False
     stop_reason: str | None = None
@@ -500,8 +837,17 @@ def train_action_classifier(
         "focal_gamma": max(float(focal_gamma), 0.0),
         "weight_decay": max(float(weight_decay), 0.0),
         "grad_clip_norm": effective_grad_clip_norm,
+        "overfit_guard": {
+            "enabled": effective_overfit_guard_enabled,
+            "min_epoch": effective_overfit_guard_min_epoch,
+            "loss_gap": effective_overfit_guard_loss_gap,
+            "patience": effective_overfit_guard_patience,
+            "metric": f"val_{resolved_selection_metric}",
+        },
+        "selection_metric": resolved_selection_metric,
         "seed": effective_seed,
         "deterministic": bool(deterministic),
+        "temporal_pooling": resolved_temporal_pooling,
     }
 
     print(
@@ -519,6 +865,7 @@ def train_action_classifier(
         f"prefetch={resolved_prefetch_factor if resolved_num_workers > 0 else 0} "
         f"persistent={'on' if use_persistent_workers else 'off'} "
         f"loss={resolved_loss_name} "
+        f"pooling={resolved_temporal_pooling} "
         f"class_weight={class_weight_mode} "
         f"class_weight_multipliers={class_weight_multiplier_payload or 'none'} "
         f"sampler={sampler_mode} "
@@ -563,6 +910,10 @@ def train_action_classifier(
                 "resume_mode": resume_mode,
                 "train_samples": train_sample_count,
                 "val_samples": val_sample_count,
+                "skipped_missing_pose_path": {
+                    "train": int(getattr(train_dataset, "skipped_missing_pose_path", 0)),
+                    "val": int(getattr(val_dataset, "skipped_missing_pose_path", 0)),
+                },
                 "amp_enabled": use_amp,
                 "amp_dtype": resolved_amp_dtype_label,
                 "compile_enabled": compiled_model,
@@ -580,30 +931,54 @@ def train_action_classifier(
                 "val_distribution": val_distribution,
                 "stopped_early": False,
                 "stop_reason": None,
-                "early_stopping": {
-                    "enabled": effective_patience > 0,
-                    "patience": effective_patience,
-                    "min_delta": effective_min_delta,
-                    "metric": "val_macro_f1",
-                    "epochs_without_improvement": 0,
+                    "early_stopping": {
+                        "enabled": effective_patience > 0,
+                        "patience": effective_patience,
+                        "min_delta": effective_min_delta,
+                        "metric": "val_macro_f1",
+                        "epochs_without_improvement": 0,
+                        "overfit_guard": training_options["overfit_guard"],
+                    },
                 },
-            },
-        )
+            )
 
     for epoch in range(1, epochs + 1):
         current_lr = float(optimizer.param_groups[0]["lr"])
-        train_loss = _run_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            train=True,
-            use_amp=use_amp,
-            amp_dtype=resolved_amp_dtype,
-            scaler=scaler,
-            grad_clip_norm=effective_grad_clip_norm,
-        )
+        try:
+            train_loss = _run_epoch(
+                model=model,
+                loader=train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=device,
+                train=True,
+                use_amp=use_amp,
+                amp_dtype=resolved_amp_dtype,
+                scaler=scaler,
+                grad_clip_norm=effective_grad_clip_norm,
+            )
+        except PermissionError as exc:
+            if resolved_num_workers <= 0 or not _is_dataloader_worker_permission_error(exc):
+                raise
+            print(
+                "[train][warning] dataloader worker startup failed; "
+                "retrying with num_workers=0. "
+                f"reason={exc}"
+            )
+            resolved_num_workers = 0
+            train_loader, val_loader, use_persistent_workers = build_training_loaders(resolved_num_workers)
+            train_loss = _run_epoch(
+                model=model,
+                loader=train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=device,
+                train=True,
+                use_amp=use_amp,
+                amp_dtype=resolved_amp_dtype,
+                scaler=scaler,
+                grad_clip_norm=effective_grad_clip_norm,
+            )
         val_metrics = _evaluate(
             model=model,
             loader=val_loader,
@@ -642,11 +1017,14 @@ def train_action_classifier(
             f"[{progress_bar}] "
             f"loss train={train_loss:.4f} val={val_metrics['loss']:.4f} ce={val_metrics['cross_entropy_loss']:.4f} "
             f"score acc={val_metrics['accuracy']:.4f} f1={val_metrics['macro_f1']:.4f} "
-            f"best_f1={max(best_val_f1, val_metrics['macro_f1']):.4f}"
+            f"best_{resolved_selection_metric}="
+            f"{max(best_selection_score, _metric_value(val_metrics, resolved_selection_metric)):.4f}"
         )
 
-        improved = val_metrics["macro_f1"] > (best_val_f1 + effective_min_delta)
+        current_selection_score = _metric_value(val_metrics, resolved_selection_metric)
+        improved = current_selection_score > (best_selection_score + effective_min_delta)
         if best_epoch == 0 or improved:
+            best_selection_score = current_selection_score
             best_val_f1 = val_metrics["macro_f1"]
             best_epoch = epoch
             epochs_without_improvement = 0
@@ -661,7 +1039,10 @@ def train_action_classifier(
                     "hidden_dim": hidden_dim,
                     "num_layers": num_layers,
                     "dropout": dropout,
+                    "temporal_pooling": resolved_temporal_pooling,
                     "best_epoch": best_epoch,
+                    "best_selection_metric": resolved_selection_metric,
+                    "best_selection_score": round(best_selection_score, 6),
                     "best_val_macro_f1": round(best_val_f1, 6),
                     "best_validation": val_metrics,
                     "training_options": training_options,
@@ -687,6 +1068,10 @@ def train_action_classifier(
                     "resume_mode": resume_mode,
                     "train_samples": train_sample_count,
                     "val_samples": val_sample_count,
+                    "skipped_missing_pose_path": {
+                        "train": int(getattr(train_dataset, "skipped_missing_pose_path", 0)),
+                        "val": int(getattr(val_dataset, "skipped_missing_pose_path", 0)),
+                    },
                     "amp_enabled": use_amp,
                     "amp_dtype": resolved_amp_dtype_label,
                     "compile_enabled": compiled_model,
@@ -710,9 +1095,27 @@ def train_action_classifier(
                         "min_delta": effective_min_delta,
                         "metric": "val_macro_f1",
                         "epochs_without_improvement": epochs_without_improvement,
+                        "overfit_guard": training_options["overfit_guard"],
                     },
                 },
             )
+
+        current_loss_gap = float(val_metrics["loss"] - train_loss)
+        overfit_guard_triggered = (
+            effective_overfit_guard_enabled
+            and epoch >= effective_overfit_guard_min_epoch
+            and epochs_without_improvement >= effective_overfit_guard_patience
+            and current_loss_gap >= effective_overfit_guard_loss_gap
+        )
+        if overfit_guard_triggered:
+            stopped_early = True
+            stop_reason = (
+                "overfit guard: validation loss gap이 커지고 "
+                f"val_macro_f1이 {epochs_without_improvement} epoch 동안 개선되지 않아 조기 종료합니다. "
+                f"loss_gap={current_loss_gap:.4f}, threshold={effective_overfit_guard_loss_gap:.4f}"
+            )
+            print(f"[train] overfit guard triggered: {stop_reason}")
+            break
 
         if effective_patience > 0 and epochs_without_improvement >= effective_patience:
             stopped_early = True
@@ -891,6 +1294,27 @@ def _safe_label_index(value, *, num_classes: int | None = None) -> int:
     if num_classes is not None and not 0 <= index < num_classes:
         return -1
     return index
+
+
+def _resolve_selection_metric(value: str | None) -> str:
+    metric = str(value or "macro_f1").strip().lower()
+    aliases = {
+        "acc": "accuracy",
+        "f1": "macro_f1",
+        "macro": "macro_f1",
+        "balanced": "balanced_accuracy",
+        "balanced_acc": "balanced_accuracy",
+    }
+    metric = aliases.get(metric, metric)
+    allowed = {"accuracy", "macro_f1", "macro_f1_supported", "balanced_accuracy"}
+    return metric if metric in allowed else "macro_f1"
+
+
+def _metric_value(metrics: dict, metric: str) -> float:
+    try:
+        return float(metrics.get(metric) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _build_label_mapping_payload(labels: list[str]) -> dict:
@@ -1123,10 +1547,14 @@ def _build_sample_weights(
         multiplier_values = class_weight_multipliers.detach().cpu().numpy().astype(np.float64, copy=False)
         if multiplier_values.shape[0] >= num_classes:
             class_weights = class_weights * multiplier_values[:num_classes]
-    sample_weights = [
-        class_weights[label_idx] if label_idx >= 0 else 0.0
-        for label_idx in label_indices
-    ]
+    sample_weights = []
+    for sample, label_idx in zip(samples, label_indices, strict=False):
+        base_weight = class_weights[label_idx] if label_idx >= 0 else 0.0
+        try:
+            sample_multiplier = float(sample.get("sample_weight", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            sample_multiplier = 1.0
+        sample_weights.append(base_weight * max(sample_multiplier, 0.0))
     return torch.tensor(sample_weights, dtype=torch.double)
 
 
@@ -1501,6 +1929,17 @@ def _build_dataloader(
     return DataLoader(dataset, **kwargs)
 
 
+def _is_dataloader_worker_permission_error(exc: BaseException) -> bool:
+    message = f"{type(exc).__name__}: {exc}"
+    return (
+        isinstance(exc, PermissionError)
+        or "WinError 5" in message
+        or "Access is denied" in message
+        or "access is denied" in message
+        or "액세스가 거부" in message
+    )
+
+
 def _uses_cuda(device: str) -> bool:
     return str(device).strip().lower().startswith("cuda")
 
@@ -1655,10 +2094,33 @@ def _save_torch_checkpoint_atomic(path: Path, payload: dict) -> None:
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         torch.save(payload, temp_path)
-        temp_path.replace(path)
+        _replace_path_with_retries(temp_path, path)
     finally:
         try:
             if temp_path.exists():
                 temp_path.unlink()
         except OSError:
             pass
+
+
+def _replace_path_with_retries(
+    source_path: Path,
+    target_path: Path,
+    *,
+    retries: int = 30,
+    delay_seconds: float = 0.1,
+) -> None:
+    last_error: OSError | None = None
+    for attempt in range(max(int(retries), 1)):
+        try:
+            source_path.replace(target_path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        if attempt + 1 < retries:
+            time.sleep(float(delay_seconds))
+    if last_error is not None:
+        raise last_error
+    source_path.replace(target_path)

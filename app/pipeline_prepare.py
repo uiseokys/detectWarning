@@ -20,6 +20,8 @@ def extract_pose_sequence(
     sequence_length: int,
     max_frames_to_scan: int,
     detector_batch_size: int,
+    clip_start_seconds: float | None = None,
+    clip_end_seconds: float | None = None,
     allow_rejected_pose_fallback: bool = True,
     fallback_min_keypoints: int = 3,
     fallback_min_detection_confidence: float = 0.15,
@@ -29,6 +31,8 @@ def extract_pose_sequence(
         video_path=video_path,
         sequence_length=sequence_length,
         max_frames_to_scan=max_frames_to_scan,
+        clip_start_seconds=clip_start_seconds,
+        clip_end_seconds=clip_end_seconds,
     )
     return extract_pose_sequence_from_payload(
         payload=payload,
@@ -47,13 +51,23 @@ def load_video_sequence_payload(
     video_path: Path,
     sequence_length: int,
     max_frames_to_scan: int,
+    clip_start_seconds: float | None = None,
+    clip_end_seconds: float | None = None,
 ) -> dict:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"영상 파일을 열지 못했습니다: {video_path}")
 
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    frame_indices = build_frame_indices(total_frames, sequence_length, max_frames_to_scan)
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_indices = build_frame_indices(
+        total_frames,
+        sequence_length,
+        max_frames_to_scan,
+        fps=fps,
+        clip_start_seconds=clip_start_seconds,
+        clip_end_seconds=clip_end_seconds,
+    )
 
     sampled_frames = read_sampled_frames(capture, frame_indices)
     valid_frames: list[np.ndarray] = []
@@ -68,6 +82,8 @@ def load_video_sequence_payload(
     return {
         "video_path": str(video_path),
         "sequence_length": int(sequence_length),
+        "clip_start_seconds": clip_start_seconds,
+        "clip_end_seconds": clip_end_seconds,
         "frames": valid_frames,
         "time_indices": valid_time_indices,
     }
@@ -276,8 +292,29 @@ def candidate_selection_score(candidate: dict) -> float:
     )
 
 
-def build_frame_indices(total_frames: int, sequence_length: int, max_frames_to_scan: int) -> list[int]:
+def build_frame_indices(
+    total_frames: int,
+    sequence_length: int,
+    max_frames_to_scan: int,
+    *,
+    fps: float = 0.0,
+    clip_start_seconds: float | None = None,
+    clip_end_seconds: float | None = None,
+) -> list[int]:
     if total_frames > 0:
+        if fps > 0 and (clip_start_seconds is not None or clip_end_seconds is not None):
+            start_frame = max(int(float(clip_start_seconds or 0.0) * fps), 0)
+            end_frame = (
+                int(float(clip_end_seconds) * fps)
+                if clip_end_seconds is not None
+                else total_frames
+            )
+            end_frame = min(max(end_frame, start_frame + 1), total_frames)
+            available = max(end_frame - start_frame, 1)
+            if available <= sequence_length:
+                return list(range(start_frame, end_frame))
+            return np.linspace(start_frame, end_frame - 1, num=sequence_length, dtype=int).tolist()
+
         effective_total = min(total_frames, max_frames_to_scan)
         if effective_total <= sequence_length:
             return list(range(effective_total))

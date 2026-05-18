@@ -249,7 +249,7 @@ class AudioStreamer:
         speech_level = 0.008
         block_duration = 0.4
         max_phrase_bytes = int(self.sample_rate * self.phrase_seconds * 2)
-        min_phrase_bytes = int(self.sample_rate * 0.55 * 2)
+        min_phrase_bytes = int(self.sample_rate * min(max(self.phrase_seconds * 0.35, 0.8), 1.2) * 2)
         last_voice_at = None
         speech_started_at = None
         buffer = bytearray()
@@ -349,6 +349,8 @@ def main() -> None:
 
     client_id = build_client_id(args.client_id)
     interval = 1.0 / max(args.max_fps, 0.1)
+    dynamic_interval = interval
+    dynamic_frame_width = int(args.frame_width)
     session = requests.Session()
     last_sent_at = 0.0
     audio_streamer = None
@@ -404,12 +406,12 @@ def main() -> None:
                     break
 
             now = perf_counter()
-            if now - last_sent_at < interval:
+            if now - last_sent_at < dynamic_interval:
                 sleep(0.005)
                 frame = None
                 continue
 
-            upload_frame = resize_frame_for_upload(frame, args.frame_width)
+            upload_frame = resize_frame_for_upload(frame, dynamic_frame_width)
             success, encoded = cv2.imencode(
                 ".jpg",
                 upload_frame,
@@ -429,6 +431,14 @@ def main() -> None:
                 )
                 response.raise_for_status()
                 payload = response.json()
+                upload_hint = payload.get("upload_hint") if isinstance(payload, dict) else {}
+                if isinstance(upload_hint, dict):
+                    hinted_fps = float(upload_hint.get("max_fps") or args.max_fps)
+                    hinted_width = int(upload_hint.get("frame_width") or args.frame_width)
+                    hinted_fps = max(0.5, min(max(float(args.max_fps), hinted_fps), hinted_fps))
+                    dynamic_interval = 1.0 / max(hinted_fps, 0.1)
+                    if args.frame_width > 0:
+                        dynamic_frame_width = max(480, min(int(args.frame_width), hinted_width))
                 print(
                     f"\r전송 성공 | 사람 {len(payload.get('tracked_people', []))} | "
                     f"얼굴 {len(payload.get('faces', []))} | "

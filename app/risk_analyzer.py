@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from math import hypot
 from pathlib import Path
@@ -24,6 +25,11 @@ class RiskAssessment:
     matched_keywords: list[str]
     categories: list[str]
     context_flags: list[str]
+    video_score: int = 0
+    audio_score: int = 0
+    fusion_score: int = 0
+    raw_score: int = 0
+    speech_match_quality: str = ""
 
 
 def _load_rule_bundle(path: Path) -> dict | None:
@@ -48,12 +54,16 @@ class RiskAnalyzer:
         self._last_text_matches: list[str] = []
         self._last_text_codes: list[str] = []
         self._last_text_time = 0.0
+        self._last_match_quality = ""
 
         self._last_audio_level = 0.0
         self._last_audio_time = 0.0
         self._loud_audio_hits: list[float] = []
         self._audio_history: list[tuple[float, float]] = []
         self._recent_text_events: list[tuple[float, tuple[str, ...], str]] = []
+        self._recent_risk_hits: list[tuple[float, float]] = []
+        self._risk_hold_until = 0.0
+        self._risk_hold_score = 0.0
 
         self._text_window_seconds = 4.0
         self._audio_window_seconds = 2.0
@@ -514,6 +524,7 @@ class RiskAnalyzer:
                 if str(code).strip()
             } or self._threat_codes
 
+        self._append_realtime_speech_boost_rules()
         self._normalized_category_rules = [
             (
                 rule,
@@ -556,7 +567,929 @@ class RiskAnalyzer:
             if normalized
         )
 
-    def update(self, speech_result, tracked_people, face_count: int) -> RiskAssessment:
+    def _append_realtime_speech_boost_rules(self) -> None:
+        extra_rules = [
+            CategoryRule(
+                "A7",
+                "구조 요청",
+                68,
+                (
+                    "살려주세요",
+                    "살려 주세요",
+                    "살려주새요",
+                    "살려주세여",
+                    "사려주세요",
+                    "살려줘요",
+                    "살려줘",
+                    "사람 살려",
+                    "도와주세요",
+                    "도와 주세요",
+                    "도와주새요",
+                    "도와주세여",
+                    "도와줘요",
+                    "도와줘",
+                    "제발 도와주세요",
+                    "제발 살려주세요",
+                    "경찰 불러주세요",
+                    "경찰 불러줘",
+                    "신고해주세요",
+                    "신고해 주세요",
+                    "일일이 신고",
+                    "일일이 불러",
+                    "백십이 신고",
+                    "백십구 신고",
+                    "구급차 불러주세요",
+                ),
+            ),
+            CategoryRule(
+                "A8",
+                "비명/공포 반응",
+                46,
+                (
+                    "하지마세요",
+                    "하지 마세요",
+                    "하지마",
+                    "하지 마",
+                    "하지마새요",
+                    "그만하세요",
+                    "그만해",
+                    "그만 헤",
+                    "멈춰주세요",
+                    "멈춰",
+                    "오지마세요",
+                    "오지 마세요",
+                    "오지마",
+                    "다가오지마",
+                    "다가오지 마",
+                    "가까이 오지마",
+                    "손대지마",
+                    "손대지 마",
+                    "만지지마",
+                    "만지지 마",
+                    "놔주세요",
+                    "놔줘요",
+                    "놔줘",
+                    "놓아줘",
+                    "무서워요",
+                    "무서워",
+                    "위험해요",
+                    "위험해",
+                    "때리지마",
+                    "때리지 마",
+                    "밀지마",
+                    "차지마",
+                ),
+            ),
+            CategoryRule(
+                "A1",
+                "직접 위해 협박",
+                66,
+                (
+                    "죽여버릴거야",
+                    "죽여 버릴거야",
+                    "죽여버린다",
+                    "죽인다",
+                    "죽일거야",
+                    "죽일 거야",
+                    "가만 안둔다",
+                    "가만 안 둔다",
+                    "가만 안둘거야",
+                    "칼로 찌른다",
+                    "찌른다",
+                    "찔러버린다",
+                    "패버린다",
+                    "때려버린다",
+                    "죽고싶냐",
+                    "맞고싶냐",
+                ),
+            ),
+            CategoryRule(
+                "A9",
+                "납치/끌려감 의심",
+                60,
+                (
+                    "끌고가지마",
+                    "끌고 가지마",
+                    "끌고 가지 마",
+                    "끌려가요",
+                    "끌려가",
+                    "잡아가지마",
+                    "잡아 가지 마",
+                    "차에 태우지마",
+                    "차에 태우지 마",
+                    "어디 데려가",
+                    "어디 가는거야",
+                    "팔 놔",
+                    "손 놔",
+                    "따라가기 싫어",
+                ),
+            ),
+        ]
+        extra_rules.extend(self._build_large_speech_rule_pack())
+        existing = {(rule.code, rule.label, rule.phrases) for rule in self._category_rules}
+        for rule in extra_rules:
+            key = (rule.code, rule.label, rule.phrases)
+            if key not in existing:
+                self._category_rules.append(rule)
+
+    @staticmethod
+    def _unique_phrases(*groups: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        phrases: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for phrase in group:
+                normalized = str(phrase).strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                phrases.append(normalized)
+        return tuple(phrases)
+
+    @staticmethod
+    def _combine_phrases(stems: tuple[str, ...], suffixes: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(f"{stem}{suffix}" for stem in stems for suffix in suffixes)
+
+    def _build_large_speech_rule_pack(self) -> list[CategoryRule]:
+        polite = ("", "요", "주세요", "해줘", "해줘요", "해 주세요", "해주세여", "해주새요")
+        stop_stems = (
+            "하지 마",
+            "그만",
+            "멈춰",
+            "오지 마",
+            "다가오지 마",
+            "가까이 오지 마",
+            "손대지 마",
+            "만지지 마",
+            "건드리지 마",
+            "때리지 마",
+            "밀지 마",
+            "차지 마",
+            "잡지 마",
+            "끌지 마",
+            "따라오지 마",
+            "쫓아오지 마",
+            "문 열지 마",
+            "들어오지 마",
+        )
+        rescue = self._unique_phrases(
+            (
+                "살려",
+                "살려줘",
+                "살려줘요",
+                "살려주세요",
+                "살려 주십시오",
+                "사려주세요",
+                "살려주세여",
+                "살려주새요",
+                "사람 살려",
+                "누가 좀 살려주세요",
+                "제발 살려주세요",
+                "제발 살려줘",
+                "도와줘",
+                "도와줘요",
+                "도와주세요",
+                "도와 주십시오",
+                "도와주세여",
+                "도와주새요",
+                "누가 좀 도와주세요",
+                "제발 도와주세요",
+                "여기 좀 봐주세요",
+                "여기 좀 와주세요",
+                "빨리 와주세요",
+                "빨리 도와주세요",
+                "도움이 필요해요",
+                "위급해요",
+                "위험해요",
+                "위험합니다",
+                "큰일 났어요",
+                "응급 상황이에요",
+                "구해주세요",
+                "구해줘요",
+                "구해줘",
+                "구조해주세요",
+                "구조 요청합니다",
+                "긴급 상황이에요",
+                "혼자 있어요",
+                "무서워요",
+                "무서워",
+                "사람 불러주세요",
+                "관리자 불러주세요",
+                "경비 불러주세요",
+                "경찰 불러",
+                "경찰 불러줘",
+                "경찰 불러주세요",
+                "경찰에 신고해",
+                "경찰에 신고해주세요",
+                "신고해",
+                "신고해줘",
+                "신고해주세요",
+                "112 신고",
+                "일일이 신고",
+                "백십이 신고",
+                "119 신고",
+                "백십구 신고",
+                "구급차 불러",
+                "구급차 불러주세요",
+                "119 불러",
+                "응급차 불러주세요",
+                "please help",
+                "help me",
+                "call police",
+                "call the police",
+                "call emergency",
+                "call 911",
+                "i am in danger",
+            )
+        )
+        fear_stop = self._unique_phrases(
+            self._combine_phrases(stop_stems, polite),
+            (
+                "하지마",
+                "하지마요",
+                "하지마세요",
+                "하지마새요",
+                "하지마세여",
+                "그만해",
+                "그만하세요",
+                "그만 헤",
+                "멈춰요",
+                "멈춰주세요",
+                "오지마",
+                "오지마요",
+                "오지마세요",
+                "다가오지마",
+                "다가오지마세요",
+                "가까이 오지마",
+                "손대지마",
+                "손대지마세요",
+                "만지지마",
+                "만지지마세요",
+                "놔줘",
+                "놔줘요",
+                "놔주세요",
+                "놓아줘",
+                "놓아주세요",
+                "손 놔",
+                "팔 놔",
+                "발 놔",
+                "잡은 거 놔",
+                "아파",
+                "아파요",
+                "너무 아파요",
+                "비켜",
+                "비켜요",
+                "떨어져",
+                "떨어져요",
+                "무섭다고",
+                "싫어요",
+                "싫다고",
+                "싫다니까",
+                "안 돼",
+                "안돼요",
+                "이러지 마",
+                "이러지마세요",
+                "제발 그만",
+                "살려줘 제발",
+                "으악",
+                "아악",
+                "악",
+                "꺄악",
+                "소리 지르지 마",
+                "울지 마",
+            )
+        )
+        direct_threat = self._unique_phrases(
+            (
+                "죽여버릴거야",
+                "죽여 버릴거야",
+                "죽여버릴 거야",
+                "죽여버린다",
+                "죽여 줄게",
+                "죽인다",
+                "죽일거야",
+                "죽일 거야",
+                "죽여줄게",
+                "너 죽었어",
+                "오늘 죽었어",
+                "끝장내버린다",
+                "끝장낼거야",
+                "가만 안 둔다",
+                "가만 안둔다",
+                "가만 안둘거야",
+                "가만 안 둘 거야",
+                "가만 안 둬",
+                "패버린다",
+                "패줄게",
+                "때려버린다",
+                "때릴거야",
+                "때릴 거야",
+                "맞고 싶냐",
+                "죽고 싶냐",
+                "한 대 맞을래",
+                "박살내버린다",
+                "부숴버린다",
+                "칼로 찌른다",
+                "칼로 찌를거야",
+                "찌른다",
+                "찔러버린다",
+                "찔러 죽인다",
+                "목 조른다",
+                "목 졸라버린다",
+                "불 질러버린다",
+                "태워버린다",
+                "너 오늘 끝이야",
+                "오늘 끝내자",
+                "밖으로 나와",
+                "이리 와",
+                "따라와",
+                "도망가지 마",
+                "피하지 마",
+                "숨어도 소용없어",
+                "찾아간다",
+                "기다리고 있어",
+                "칼 가져올게",
+                "무기 가져올게",
+                "죽여 버릴 거다",
+                "넌 끝났어",
+                "가만두지 않겠다",
+                "복수할 거야",
+                "해코지할 거야",
+                "협박하는 거야",
+                "후회하게 해줄게",
+                "신고하면 죽는다",
+                "소리 지르면 죽는다",
+                "말하면 가만 안 둬",
+                "입 다물어",
+                "조용히 해",
+                "핸드폰 내놔",
+                "폰 내놔",
+                "시키는 대로 해",
+                "차에 타",
+                "따라가기만 해",
+                "말 안 들으면 죽인다",
+                "말 안 들으면 때린다",
+                "신고하면 찾아간다",
+            )
+        )
+        kidnapping = self._unique_phrases(
+            (
+                "끌고 가지 마",
+                "끌고가지마",
+                "끌고 가지마요",
+                "끌고 가지 마세요",
+                "끌려가요",
+                "끌려가고 있어요",
+                "납치",
+                "납치당했어요",
+                "납치당하는 중이에요",
+                "잡아가지 마",
+                "잡아가지마",
+                "강제로 데려가요",
+                "강제로 끌고 가요",
+                "차에 태우지 마",
+                "차에 태우지마",
+                "차에 타기 싫어",
+                "차 타기 싫어요",
+                "어디 데려가",
+                "어디 데려가는 거야",
+                "어디 가는 거야",
+                "따라가기 싫어",
+                "가고 싶지 않아",
+                "집에 보내줘",
+                "문 열어줘",
+                "나가게 해줘",
+                "감금됐어요",
+                "갇혔어요",
+                "문이 잠겼어요",
+                "못 나가게 해요",
+                "팔 잡지 마",
+                "손목 놔",
+                "어깨 잡지 마",
+                "끌지 마",
+                "잡아끌지 마",
+                "풀어줘",
+                "묶지 마",
+                "입 막지 마",
+                "차 문 열어",
+                "여기서 내릴래",
+            )
+        )
+        sexual_contact = self._unique_phrases(
+            (
+                "만지지 마",
+                "만지지마",
+                "몸 만지지 마",
+                "손대지 마",
+                "손대지마",
+                "이상한 짓 하지 마",
+                "이러지 마세요",
+                "싫다고 했잖아",
+                "싫어요",
+                "치한",
+                "변태",
+                "성추행",
+                "성폭행",
+                "몰래 찍지 마",
+                "사진 찍지 마",
+                "촬영하지 마",
+                "옷 잡지 마",
+                "옷 만지지 마",
+                "가슴 만지지 마",
+                "허리 잡지 마",
+                "껴안지 마",
+                "키스하지 마",
+                "따라오지 마",
+                "스토킹하지 마",
+                "계속 따라와요",
+                "저 사람 따라와요",
+                "집 앞에 있어요",
+                "계속 연락해요",
+                "무서워서 못 가겠어요",
+                "떨어져 주세요",
+                "가까이 오지 마세요",
+            )
+        )
+        self_harm = self._unique_phrases(
+            (
+                "죽고 싶다",
+                "죽고싶다",
+                "죽고 싶어요",
+                "살기 싫다",
+                "살기싫다",
+                "살고 싶지 않아",
+                "끝내고 싶다",
+                "그만 살고 싶다",
+                "사라지고 싶다",
+                "뛰어내릴 거야",
+                "뛰어내리고 싶다",
+                "옥상에 갈 거야",
+                "약 먹을 거야",
+                "약을 먹었다",
+                "목 매달고 싶다",
+                "자살할 거야",
+                "자살하고 싶다",
+                "더는 못 버티겠다",
+                "이제 못 하겠다",
+                "방법이 없다",
+                "유서 썼어",
+                "마지막이야",
+                "나 없어질 거야",
+                "죽으면 편하겠지",
+                "세상에서 없어지고 싶다",
+                "i want to die",
+                "kill myself",
+                "suicide",
+            )
+        )
+        violence_context = self._unique_phrases(
+            (
+                "맞고 있어요",
+                "때리고 있어요",
+                "폭행당했어요",
+                "폭행당하고 있어요",
+                "싸움 났어요",
+                "싸우고 있어요",
+                "사람이 맞고 있어요",
+                "누가 때려요",
+                "머리 때리지 마",
+                "발로 차지 마",
+                "밀지 마세요",
+                "목 조르지 마",
+                "숨 못 쉬겠어",
+                "숨을 못 쉬겠어요",
+                "피나요",
+                "다쳤어요",
+                "넘어졌어요",
+                "기절했어요",
+                "쓰러졌어요",
+                "의식이 없어요",
+                "칼 들고 있어요",
+                "흉기 들고 있어요",
+                "망치 들고 있어요",
+                "병 들고 있어요",
+                "불 지르려고 해요",
+                "불났어요",
+                "불이야",
+                "문 부수고 있어요",
+                "쫓아와요",
+                "쫓기고 있어요",
+            )
+        )
+        low_risk_more = (
+            "게임에서 죽었다",
+            "게임하다 죽었다",
+            "배고파 죽겠다",
+            "더워 죽겠다",
+            "추워 죽겠다",
+            "피곤해 죽겠다",
+            "웃겨 죽겠다",
+            "귀여워 죽겠다",
+            "숙제 때문에 죽겠다",
+            "시험 망했다",
+            "농담이야",
+            "장난이야",
+            "드라마에서 죽었다",
+            "영화에서 죽었다",
+        )
+        self._low_risk_overstatements = self._unique_phrases(self._low_risk_overstatements, low_risk_more)
+        self._target_tokens = self._unique_phrases(
+            self._target_tokens,
+            ("저 사람", "그 사람", "아저씨", "아줌마", "남자", "여자", "학생", "아이", "친구", "선배", "후배"),
+        )
+        self._immediacy_tokens = self._unique_phrases(
+            self._immediacy_tokens,
+            ("지금", "당장", "바로", "빨리", "여기", "오늘", "이제", "계속", "또", "방금"),
+        )
+        self._means_tokens = self._unique_phrases(
+            self._means_tokens,
+            ("칼", "흉기", "망치", "병", "가위", "돌", "불", "라이터", "차", "끈", "약", "옥상", "베란다"),
+        )
+        self._threat_codes = set(self._threat_codes) | {"A11"}
+        weapon_context = self._unique_phrases(
+            (
+                "칼 들고 있어요",
+                "칼을 들고 있어요",
+                "흉기 들고 있어요",
+                "흉기를 들고 있어요",
+                "망치 들고 있어요",
+                "병 들고 있어요",
+                "가위 들고 있어요",
+                "무기 들고 있어요",
+                "칼 가져왔어요",
+                "흉기 가져왔어요",
+                "칼을 꺼냈어요",
+                "흉기를 꺼냈어요",
+                "칼로 위협해요",
+                "흉기로 위협해요",
+                "불 지르려고 해요",
+                "라이터 들고 있어요",
+                "기름 뿌렸어요",
+                "방화하려고 해요",
+                "불났어요",
+                "불이야",
+            )
+        )
+        domestic_dating = self._unique_phrases(
+            (
+                "남편이 때려요",
+                "아내가 때려요",
+                "아빠가 때려요",
+                "엄마가 때려요",
+                "가족이 때려요",
+                "애인을 때려요",
+                "남자친구가 때려요",
+                "여자친구가 때려요",
+                "전 남자친구가 찾아왔어요",
+                "전 여자친구가 찾아왔어요",
+                "계속 집 앞에 있어요",
+                "문을 두드려요",
+                "문을 부수려고 해요",
+                "집에 못 들어가겠어요",
+                "집에서 나가고 싶어요",
+                "집에 가기 무서워요",
+                "계속 협박해요",
+                "계속 때려요",
+                "매일 맞아요",
+                "목을 졸랐어요",
+                "물건을 던져요",
+                "핸드폰을 뺏었어요",
+                "감금했어요",
+                "못 나가게 해요",
+                "아이를 때려요",
+                "아이를 위협해요",
+                "애를 데려갔어요",
+                "아이를 데려가려고 해요",
+                "가정폭력 신고",
+                "데이트폭력 신고",
+                "교제폭력 신고",
+                "접근금지 어겼어요",
+                "보호명령 어겼어요",
+                "스토킹 신고",
+                "계속 따라다녀요",
+                "계속 연락해요",
+                "계속 기다리고 있어요",
+                "몰래 지켜봐요",
+                "집 앞에서 기다려요",
+                "회사 앞에서 기다려요",
+                "학교 앞에서 기다려요",
+                "위치 추적해요",
+                "몰래 촬영해요",
+                "사진을 유포한다고 해요",
+                "동영상을 유포한다고 해요",
+            )
+        )
+        child_school = self._unique_phrases(
+            (
+                "아이를 때리지 마",
+                "애를 때리지 마",
+                "아이 울어요",
+                "아이가 울어요",
+                "아이를 데려가지 마",
+                "아이가 위험해요",
+                "아이가 다쳤어요",
+                "아이를 방치했어요",
+                "아동학대 신고",
+                "선생님 도와주세요",
+                "학교폭력 신고",
+                "친구들이 때려요",
+                "괴롭힘 당하고 있어요",
+                "따돌림 당하고 있어요",
+                "돈을 뺏어요",
+                "협박당하고 있어요",
+                "화장실에 갇혔어요",
+                "교실에 갇혔어요",
+                "집에 가기 무서워요",
+                "학교 가기 무서워요",
+                "아이를 흔들지 마",
+                "아기를 흔들지 마",
+                "아기를 때리지 마",
+                "아기가 숨을 못 쉬어요",
+            )
+        )
+        medical_emergency = self._unique_phrases(
+            (
+                "숨을 못 쉬겠어요",
+                "숨 못 쉬겠어",
+                "호흡이 안 돼요",
+                "가슴이 아파요",
+                "심장이 아파요",
+                "쓰러졌어요",
+                "사람이 쓰러졌어요",
+                "기절했어요",
+                "의식이 없어요",
+                "피를 흘려요",
+                "피가 많이 나요",
+                "머리를 다쳤어요",
+                "움직이지 않아요",
+                "반응이 없어요",
+                "발작해요",
+                "경련해요",
+                "119 불러주세요",
+                "구급차 빨리 불러주세요",
+                "응급실 가야 해요",
+                "약을 많이 먹었어요",
+                "독을 마셨어요",
+                "연기가 나요",
+                "가스 냄새가 나요",
+                "가스가 새요",
+                "문 열어 주세요",
+            )
+        )
+        robbery_intrusion = self._unique_phrases(
+            (
+                "도둑이야",
+                "강도야",
+                "강도가 들어왔어요",
+                "집에 누가 들어왔어요",
+                "모르는 사람이 들어왔어요",
+                "문을 따고 있어요",
+                "창문으로 들어왔어요",
+                "지갑을 뺏어갔어요",
+                "가방을 뺏어갔어요",
+                "핸드폰을 뺏어갔어요",
+                "돈을 뺏어갔어요",
+                "칼 들고 돈 달래요",
+                "협박해서 돈을 가져갔어요",
+                "차에 누가 탔어요",
+                "집 안에 숨어 있어요",
+                "누가 쫓아와요",
+                "도망가고 있어요",
+                "문 잠가",
+                "문 잠가주세요",
+            )
+        )
+        self._low_risk_overstatements = self._unique_phrases(
+            self._low_risk_overstatements,
+            (
+                "게임에서 맞았다",
+                "영화에서 맞았다",
+                "드라마에서 맞았다",
+                "축구에서 졌다",
+                "피곤해서 죽겠다",
+                "웃겨서 죽겠다",
+                "맛있어 죽겠다",
+                "좋아 죽겠다",
+                "심심해 죽겠다",
+                "졸려 죽겠다",
+                "힘들어 죽겠다",
+                "일 때문에 죽겠다",
+                "과제 때문에 죽겠다",
+                "시험 때문에 죽겠다",
+                "회사 때문에 죽겠다",
+                "장난친 거야",
+                "농담한 거야",
+                "연기하는 거야",
+                "대사였어",
+                "노래 가사야",
+            ),
+        )
+        family_subjects = (
+            "남편이",
+            "아내가",
+            "아빠가",
+            "엄마가",
+            "가족이",
+            "오빠가",
+            "형이",
+            "누나가",
+            "언니가",
+            "애인이",
+            "남자친구가",
+            "여자친구가",
+            "전 남자친구가",
+            "전 여자친구가",
+        )
+        assault_actions = (
+            " 때려요",
+            " 때리고 있어요",
+            " 계속 때려요",
+            " 목을 졸라요",
+            " 밀쳤어요",
+            " 발로 차요",
+            " 물건을 던져요",
+            " 협박해요",
+            " 죽인다고 해요",
+            " 칼을 들었어요",
+            " 못 나가게 해요",
+            " 문을 막고 있어요",
+            " 핸드폰을 뺏었어요",
+            " 신고하지 말래요",
+        )
+        stalking_subjects = (
+            "저 사람이",
+            "그 사람이",
+            "모르는 사람이",
+            "전 애인이",
+            "전 남자친구가",
+            "전 여자친구가",
+            "아는 사람이",
+            "낯선 사람이",
+        )
+        stalking_actions = (
+            " 계속 따라와요",
+            " 집 앞에 있어요",
+            " 회사 앞에 있어요",
+            " 학교 앞에 있어요",
+            " 계속 연락해요",
+            " 문자를 계속 보내요",
+            " 기다리고 있어요",
+            " 몰래 보고 있어요",
+            " 사진을 찍어요",
+            " 위치를 추적해요",
+            " 차까지 따라와요",
+            " 엘리베이터까지 따라와요",
+        )
+        child_subjects = (
+            "아이가",
+            "애가",
+            "학생이",
+            "친구들이",
+            "선배가",
+            "동급생이",
+            "어른이",
+            "선생님이",
+        )
+        child_actions = (
+            " 맞고 있어요",
+            " 울고 있어요",
+            " 괴롭힘 당해요",
+            " 협박당해요",
+            " 돈을 뺏겨요",
+            " 화장실에 갇혔어요",
+            " 교실에 갇혔어요",
+            " 집에 가기 무서워해요",
+            " 학교 가기 무서워해요",
+            " 다쳤어요",
+            " 숨을 못 쉬어요",
+            " 데려가지 말라고 해요",
+        )
+        medical_subjects = (
+            "사람이",
+            "아이가",
+            "친구가",
+            "여자가",
+            "남자가",
+            "어르신이",
+            "환자가",
+            "누가",
+        )
+        medical_actions = (
+            " 쓰러졌어요",
+            " 기절했어요",
+            " 숨을 못 쉬어요",
+            " 피를 흘려요",
+            " 반응이 없어요",
+            " 의식이 없어요",
+            " 발작해요",
+            " 경련해요",
+            " 머리를 다쳤어요",
+            " 가슴이 아프대요",
+            " 움직이지 않아요",
+            " 많이 다쳤어요",
+            " 약을 먹었어요",
+            " 넘어져서 못 일어나요",
+        )
+        weapon_subjects = (
+            "저 사람이",
+            "그 사람이",
+            "모르는 사람이",
+            "남자가",
+            "여자가",
+            "강도가",
+            "누가",
+            "가해자가",
+        )
+        weapon_actions = (
+            " 칼을 들고 있어요",
+            " 흉기를 들고 있어요",
+            " 망치를 들고 있어요",
+            " 가위를 들고 있어요",
+            " 병을 들고 있어요",
+            " 라이터를 들고 있어요",
+            " 불을 지르려고 해요",
+            " 기름을 뿌렸어요",
+            " 칼로 위협해요",
+            " 흉기로 위협해요",
+            " 칼을 꺼냈어요",
+            " 무기를 꺼냈어요",
+        )
+        intrusion_subjects = (
+            "도둑이",
+            "강도가",
+            "모르는 사람이",
+            "낯선 사람이",
+            "누가",
+            "저 사람이",
+            "그 사람이",
+        )
+        intrusion_actions = (
+            " 들어왔어요",
+            " 문을 따고 있어요",
+            " 창문으로 들어와요",
+            " 집에 숨어 있어요",
+            " 돈을 달래요",
+            " 지갑을 뺏어갔어요",
+            " 가방을 뺏어갔어요",
+            " 핸드폰을 뺏어갔어요",
+            " 도망가고 있어요",
+            " 따라와요",
+            " 문을 부수고 있어요",
+        )
+        direct_victims = (
+            "나를",
+            "저를",
+            "아이를",
+            "친구를",
+            "엄마를",
+            "아빠를",
+            "여자를",
+            "남자를",
+            "사람을",
+        )
+        direct_actions = (
+            " 때리지 마",
+            " 밀지 마",
+            " 차지 마",
+            " 잡지 마",
+            " 끌고 가지 마",
+            " 차에 태우지 마",
+            " 만지지 마",
+            " 협박하지 마",
+            " 감금하지 마",
+            " 목 조르지 마",
+            " 칼로 위협하지 마",
+            " 따라오지 마",
+        )
+        generated_domestic = self._combine_phrases(family_subjects, assault_actions)
+        generated_stalking = self._combine_phrases(stalking_subjects, stalking_actions)
+        generated_child = self._combine_phrases(child_subjects, child_actions)
+        generated_medical = self._combine_phrases(medical_subjects, medical_actions)
+        generated_weapon = self._combine_phrases(weapon_subjects, weapon_actions)
+        generated_intrusion = self._combine_phrases(intrusion_subjects, intrusion_actions)
+        generated_stop = self._combine_phrases(direct_victims, direct_actions)
+        return [
+            CategoryRule("A7", "구조 요청", 68, rescue),
+            CategoryRule("A8", "비명/공포 반응", 46, fear_stop),
+            CategoryRule("A1", "직접 위해 협박", 66, direct_threat),
+            CategoryRule("A9", "납치/끌려감 의심", 60, kidnapping),
+            CategoryRule("A10", "성범죄/접촉 위험", 62, sexual_contact),
+            CategoryRule("A4", "자해/극단 선택 위험", 54, self_harm),
+            CategoryRule("A11", "흉기/방화 위험", 64, weapon_context),
+            CategoryRule("A12", "가정/교제폭력·스토킹 위험", 60, domestic_dating),
+            CategoryRule("A13", "아동/학교폭력 위험", 58, child_school),
+            CategoryRule("A14", "응급 의료 위험", 62, medical_emergency),
+            CategoryRule("A15", "침입/강도 위험", 62, robbery_intrusion),
+            CategoryRule("A12", "가정/교제폭력·스토킹 위험", 60, generated_domestic),
+            CategoryRule("A12", "가정/교제폭력·스토킹 위험", 58, generated_stalking),
+            CategoryRule("A13", "아동/학교폭력 위험", 58, generated_child),
+            CategoryRule("A14", "응급 의료 위험", 62, generated_medical),
+            CategoryRule("A11", "흉기/방화 위험", 64, generated_weapon),
+            CategoryRule("A15", "침입/강도 위험", 62, generated_intrusion),
+            CategoryRule("A8", "비명/공포 반응", 50, generated_stop),
+            CategoryRule("A2", "폭행/위험 상황", 48, violence_context),
+        ]
+
+    def update(self, speech_result, tracked_people, face_count: int, action_result=None) -> RiskAssessment:
         now = monotonic()
         transcript = (speech_result.transcript or "").strip()
 
@@ -570,6 +1503,7 @@ class RiskAnalyzer:
                 self._last_text_flags = list(text_analysis["flags"])
                 self._last_text_matches = list(text_analysis["matches"])
                 self._last_text_codes = list(text_analysis["codes"])
+                self._last_match_quality = str(text_analysis.get("match_quality") or "")
                 self._last_text_time = now
                 self._recent_text_events.append(
                     (now, tuple(text_analysis["codes"]), normalized[:60])
@@ -591,6 +1525,9 @@ class RiskAnalyzer:
         ]
 
         score = 0.0
+        audio_component_score = 0.0
+        video_component_score = 0.0
+        fusion_bonus_score = 0.0
         reasons: list[str] = []
         matched_keywords: list[str] = []
         categories: list[str] = []
@@ -600,7 +1537,9 @@ class RiskAnalyzer:
         active_text_codes: list[str] = []
         if self._last_text_score > 0 and text_age <= self._text_window_seconds:
             decay = 1.0 - (text_age / self._text_window_seconds) * 0.35
-            score += self._last_text_score * max(decay, 0.65)
+            text_score = self._last_text_score * max(decay, 0.65)
+            score += text_score
+            audio_component_score += text_score
             reasons.extend(self._last_text_reasons)
             categories.extend(self._last_text_categories)
             context_flags.extend(self._last_text_flags)
@@ -616,6 +1555,7 @@ class RiskAnalyzer:
         )
         if audio_score > 0:
             score += audio_score
+            audio_component_score += audio_score
             reasons.extend(audio_reasons)
             categories.extend(audio_categories)
             context_flags.extend(audio_flags)
@@ -623,32 +1563,63 @@ class RiskAnalyzer:
         video_categories, video_score = self._score_video(tracked_people)
         if video_score > 0:
             score += video_score
+            video_component_score += video_score
             reasons.extend(video_categories)
             categories.extend(video_categories)
 
+        if action_result is not None and bool(getattr(action_result, "available", False)):
+            action_label = str(getattr(action_result, "label", "") or "")
+            action_confidence = float(getattr(action_result, "confidence", 0.0) or 0.0)
+            abnormal_score = float(getattr(action_result, "abnormal_score", 0.0) or 0.0)
+            if action_label and action_label != "normal":
+                action_score = 24.0 + min(action_confidence, 1.0) * 26.0 + min(abnormal_score, 1.0) * 18.0
+                score += action_score
+                video_component_score += action_score
+                categories.append(f"action:{action_label}")
+                reasons.append(f"action:{action_label}")
+                context_flags.append(f"AI:{action_label}:{action_confidence:.2f}")
+            elif abnormal_score >= 0.5:
+                action_score = min(abnormal_score, 1.0) * 18.0
+                score += action_score
+                video_component_score += action_score
+                categories.append("action:abnormal")
+                reasons.append("action:abnormal")
+                context_flags.append(f"AI:abnormal:{abnormal_score:.2f}")
+
         if len(tracked_people) > 0:
             score += 6
+            video_component_score += 6
             context_flags.append(f"사람:{len(tracked_people)}")
         if face_count > 0:
             score += 4
+            video_component_score += 4
             context_flags.append(f"얼굴:{face_count}")
 
         if active_text_codes and len(tracked_people) > 0:
             score += 8
+            fusion_bonus_score += 8
             context_flags.append("발화+사람")
         if active_text_codes and recent_audio_level >= 0.10:
             score += 10
+            fusion_bonus_score += 10
             context_flags.append("발화+고성")
         if recent_audio_level >= 0.18 and len(tracked_people) > 0:
             score += 8
+            fusion_bonus_score += 8
             context_flags.append("큰소리+사람")
+
+        if audio_component_score >= 30 and video_component_score >= 25:
+            score += 8
+            fusion_bonus_score += 8
+            context_flags.append("audio+video_confirmed")
 
         reasons = list(dict.fromkeys(reasons))
         categories = list(dict.fromkeys(categories))
         context_flags = list(dict.fromkeys(context_flags))
         matched_keywords = list(dict.fromkeys(matched_keywords))
 
-        score = min(int(round(score)), 100)
+        raw_score = min(int(round(score)), 100)
+        score = self._apply_risk_hysteresis(now, raw_score)
         return RiskAssessment(
             score=score,
             level=self._score_to_level(score),
@@ -656,14 +1627,38 @@ class RiskAnalyzer:
             matched_keywords=matched_keywords[:6],
             categories=categories[:4],
             context_flags=context_flags[:4],
+            video_score=min(int(round(video_component_score)), 100),
+            audio_score=min(int(round(audio_component_score)), 100),
+            fusion_score=score,
+            raw_score=raw_score,
+            speech_match_quality=self._last_match_quality if active_text_codes else "",
         )
 
+    def _apply_risk_hysteresis(self, now: float, raw_score: int) -> int:
+        self._recent_risk_hits = [
+            (ts, value) for ts, value in self._recent_risk_hits if now - ts <= 5.0
+        ]
+        if raw_score >= 35:
+            self._recent_risk_hits.append((now, float(raw_score)))
+        strong_recent_hits = [
+            value for ts, value in self._recent_risk_hits if now - ts <= 5.0 and value >= 35
+        ]
+        if raw_score >= 70 or len(strong_recent_hits) >= 2:
+            self._risk_hold_until = max(self._risk_hold_until, now + 3.0)
+            self._risk_hold_score = max(float(raw_score), self._risk_hold_score * 0.88)
+        elif now > self._risk_hold_until:
+            self._risk_hold_score = 0.0
+        if now <= self._risk_hold_until:
+            return min(100, max(raw_score, int(round(self._risk_hold_score))))
+        return raw_score
+
     def _analyze_transcript(self, normalized_text: str, now: float) -> dict:
-        matched_rules: list[tuple[CategoryRule, str]] = []
+        matched_rules: list[tuple[CategoryRule, str, float, str]] = []
         for rule, normalized_phrases in self._normalized_category_rules:
             for phrase, normalized_phrase in zip(rule.phrases, normalized_phrases):
-                if normalized_phrase in normalized_text:
-                    matched_rules.append((rule, phrase))
+                match_score, match_quality = self._match_phrase_quality(normalized_text, normalized_phrase)
+                if match_score > 0:
+                    matched_rules.append((rule, phrase, match_score, match_quality))
                     break
 
         if not matched_rules:
@@ -680,14 +1675,16 @@ class RiskAnalyzer:
         codes: list[str] = []
         matches: list[str] = []
         base_scores: list[int] = []
-        for rule, phrase in matched_rules:
+        match_qualities: list[str] = []
+        for rule, phrase, match_score, match_quality in matched_rules:
             if rule.label not in categories:
                 categories.append(rule.label)
             if rule.code not in codes:
                 codes.append(rule.code)
             if phrase not in matches:
                 matches.append(phrase)
-            base_scores.append(rule.base_score)
+            base_scores.append(int(round(rule.base_score * match_score)))
+            match_qualities.append(match_quality)
 
         score = max(base_scores)
         for extra in sorted(base_scores, reverse=True)[1:]:
@@ -736,6 +1733,7 @@ class RiskAnalyzer:
             "flags": flags,
             "matches": matches,
             "codes": codes,
+            "match_quality": "exact" if "exact" in match_qualities else "fuzzy" if match_qualities else "",
         }
 
     def _count_recent_repetition(self, now: float, codes: list[str]) -> int:
@@ -895,5 +1893,50 @@ class RiskAnalyzer:
             lowered = lowered.replace(old, "")
         return lowered
 
+    @staticmethod
+    def _similarity(first: str, second: str) -> float:
+        if not first or not second:
+            return 0.0
+        return float(SequenceMatcher(None, first, second).ratio())
+
+    def _matches_phrase(self, normalized_text: str, normalized_phrase: str) -> bool:
+        return self._match_phrase_quality(normalized_text, normalized_phrase)[0] > 0.0
+
+    def _match_phrase_quality(self, normalized_text: str, normalized_phrase: str) -> tuple[float, str]:
+        if not normalized_text or not normalized_phrase:
+            return 0.0, ""
+        if normalized_phrase in normalized_text:
+            return 1.0, "exact"
+        phrase_len = len(normalized_phrase)
+        if phrase_len < 3 or len(normalized_text) < max(3, phrase_len - 1):
+            return 0.0, ""
+        if phrase_len <= 4:
+            threshold = 0.92
+        elif phrase_len <= 7:
+            threshold = 0.84
+        else:
+            threshold = 0.78
+        min_len = max(3, int(round(phrase_len * 0.72)))
+        max_len = min(len(normalized_text), int(round(phrase_len * 1.25)) + 1)
+        for window_len in range(min_len, max_len + 1):
+            for start in range(0, len(normalized_text) - window_len + 1):
+                candidate = normalized_text[start : start + window_len]
+                if not self._shares_substantial_fragment(candidate, normalized_phrase):
+                    continue
+                if self._similarity(candidate, normalized_phrase) >= threshold:
+                    return (0.86 if phrase_len >= 5 else 0.72), "fuzzy"
+        return 0.0, ""
+
+    @staticmethod
+    def _shares_substantial_fragment(candidate: str, phrase: str) -> bool:
+        if len(phrase) <= 3:
+            return False
+        if len(phrase) <= 5:
+            fragments = {phrase[index : index + 2] for index in range(len(phrase) - 1)}
+            return any(fragment in candidate for fragment in fragments)
+        fragments = {phrase[index : index + 2] for index in range(len(phrase) - 1)}
+        shared = sum(1 for fragment in fragments if fragment in candidate)
+        return shared >= 2
+
     def _contains_any(self, normalized_text: str, tokens: tuple[str, ...]) -> bool:
-        return any(token in normalized_text for token in tokens if token)
+        return any(self._matches_phrase(normalized_text, token) for token in tokens if token)

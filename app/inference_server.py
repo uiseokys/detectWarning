@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import platform
 import queue
 import shutil
@@ -9,6 +10,7 @@ import socket
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from time import monotonic, perf_counter
 import wave
 
@@ -19,6 +21,7 @@ from fastapi import Body
 from fastapi.responses import HTMLResponse, Response
 from fastapi import FastAPI, HTTPException, Query, Request
 
+from action_realtime import RealtimeActionRecognizer
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from person_classifier import PersonPresenceFilter
 from risk_analyzer import RiskAnalyzer
@@ -39,6 +42,7 @@ class ClientSession:
     latest_frame_jpeg: bytes | None = None
     latest_people: list[dict] | None = None
     latest_meta: dict | None = None
+    last_detection_log_at: float = 0.0
 
 
 @dataclass
@@ -155,6 +159,20 @@ def _to_float(value: str) -> float | None:
         return None
 
 
+def normalize_audio_for_stt(audio: np.ndarray, *, target_rms: float = 0.075, max_gain: float = 8.0) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    audio = audio - float(np.mean(audio))
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 0.98:
+        audio = audio / max(peak, 1e-6) * 0.96
+    rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+    if 0.0 < rms < target_rms:
+        audio = audio * min(target_rms / max(rms, 1e-6), max_gain)
+    return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 class ServerSpeechRecognizer:
     def __init__(
         self,
@@ -178,6 +196,13 @@ class ServerSpeechRecognizer:
         self.beam_size = beam_size
         self.best_of = best_of
         self.no_speech_threshold = no_speech_threshold
+        self.initial_prompt = (
+            "한국어 CCTV 위험상황 감지 음성입니다. "
+            "주요 표현: 살려주세요, 도와주세요, 경찰 불러주세요, 신고해주세요, "
+            "하지 마세요, 그만해, 멈춰, 오지 마, 손대지 마, 놓아줘, "
+            "때리지 마, 끌고 가지 마, 납치, 칼, 죽여버릴거야, 가만 안 둬, "
+            "죽고 싶다, 자살, 위험해요."
+        )
         self.model = WhisperModel(
             model_size_or_path=model_size,
             device=device,
@@ -194,17 +219,38 @@ class ServerSpeechRecognizer:
             return "", 0.0
 
         audio_level = float(np.sqrt(np.mean(np.square(audio))))
+        audio = normalize_audio_for_stt(audio)
         with self._lock:
-            segments, _info = self.model.transcribe(
-                audio,
-                language=self.language,
-                vad_filter=False,
-                beam_size=self.beam_size,
-                best_of=self.best_of,
-                no_speech_threshold=self.no_speech_threshold,
-                condition_on_previous_text=False,
-                temperature=0.0,
-            )
+            try:
+                segments, _info = self.model.transcribe(
+                    audio,
+                    language=self.language,
+                    vad_filter=True,
+                    vad_parameters={
+                        "threshold": 0.35,
+                        "min_speech_duration_ms": 160,
+                        "min_silence_duration_ms": 350,
+                        "speech_pad_ms": 220,
+                    },
+                    beam_size=self.beam_size,
+                    best_of=self.best_of,
+                    no_speech_threshold=self.no_speech_threshold,
+                    condition_on_previous_text=False,
+                    initial_prompt=self.initial_prompt,
+                    temperature=0.0,
+                )
+            except Exception:
+                segments, _info = self.model.transcribe(
+                    audio,
+                    language=self.language,
+                    vad_filter=False,
+                    beam_size=self.beam_size,
+                    best_of=self.best_of,
+                    no_speech_threshold=self.no_speech_threshold,
+                    condition_on_previous_text=False,
+                    initial_prompt=self.initial_prompt,
+                    temperature=0.0,
+                )
         transcript = " ".join(
             segment.text.strip() for segment in segments if segment.text.strip()
         ).strip()
@@ -216,6 +262,77 @@ def normalize_language(language: str) -> str:
     if "-" in normalized:
         normalized = normalized.split("-", 1)[0]
     return normalized.lower() or "ko"
+
+
+def enqueue_latest_audio_job(audio_job_queue: queue.Queue, job: AudioJob) -> bool:
+    """Keep speech responsive by preferring the newest audio chunk per client."""
+    try:
+        with audio_job_queue.mutex:
+            retained = [
+                queued_job
+                for queued_job in audio_job_queue.queue
+                if getattr(queued_job, "client_id", None) != job.client_id
+            ]
+            dropped_count = len(audio_job_queue.queue) - len(retained)
+            audio_job_queue.queue.clear()
+            audio_job_queue.queue.extend(retained)
+            audio_job_queue.unfinished_tasks = max(
+                0,
+                audio_job_queue.unfinished_tasks - dropped_count,
+            )
+            if audio_job_queue._qsize() >= audio_job_queue.maxsize:
+                audio_job_queue._get()
+                audio_job_queue.unfinished_tasks = max(0, audio_job_queue.unfinished_tasks - 1)
+            audio_job_queue._put(job)
+            audio_job_queue.unfinished_tasks += 1
+            audio_job_queue.not_empty.notify()
+            audio_job_queue.not_full.notify()
+        return True
+    except Exception:
+        try:
+            audio_job_queue.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+
+def build_realtime_event_log_path() -> Path:
+    return Path("training_data") / "action_pipeline_aihub" / "realtime_detection_events.jsonl"
+
+
+def should_log_detection_event(session: ClientSession, risk_score: int, transcript: str, action_label: str) -> bool:
+    now = monotonic()
+    important = bool(transcript) or risk_score >= 20 or (action_label and action_label != "normal")
+    if not important:
+        return False
+    if risk_score >= 45 or transcript:
+        min_interval = 1.0
+    else:
+        min_interval = 3.0
+    if now - session.last_detection_log_at < min_interval:
+        return False
+    session.last_detection_log_at = now
+    return True
+
+
+def write_detection_event_log(payload: dict) -> None:
+    path = build_realtime_event_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def build_adaptive_upload_hint(latency_ms: float, risk_score: int, action_label: str) -> dict:
+    if risk_score >= 45 or (action_label and action_label != "normal"):
+        return {"max_fps": 6.0, "frame_width": 960, "reason": "risk_active"}
+    if latency_ms >= 900:
+        return {"max_fps": 3.0, "frame_width": 720, "reason": "server_latency_high"}
+    if latency_ms >= 550:
+        return {"max_fps": 4.0, "frame_width": 840, "reason": "server_latency_medium"}
+    return {"max_fps": 5.0, "frame_width": 960, "reason": "balanced"}
 
 
 def draw_server_overlay(frame, client_id: str, faces, latency_ms: float, people_count: int) -> None:
@@ -240,6 +357,34 @@ def draw_server_overlay(frame, client_id: str, faces, latency_ms: float, people_
         (0, 255, 255),
         2,
     )
+
+
+def draw_action_overlay(frame, action_result) -> None:
+    if action_result is None or not getattr(action_result, "available", False):
+        status = getattr(action_result, "status", "unavailable") if action_result is not None else "unavailable"
+        reason = getattr(action_result, "reason", "") if action_result is not None else ""
+        text = f"Action AI: {status}"
+        if reason:
+            text += f" ({reason[:34]})"
+        color = (180, 180, 180)
+    else:
+        label = localize_action_label(str(action_result.label))
+        confidence = float(action_result.confidence or 0.0)
+        abnormal = float(action_result.abnormal_score or 0.0)
+        text = f"Action AI: {label} {confidence:.2f} | abnormal {abnormal:.2f}"
+        color = (40, 220, 120) if action_result.label == "normal" else (0, 120, 255)
+    cv2.putText(frame, text, (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
+
+
+def localize_action_label(label: str) -> str:
+    labels = {
+        "normal": "normal",
+        "violence": "violence",
+        "collapse": "collapse",
+        "loitering": "loitering",
+        "abnormal": "abnormal",
+    }
+    return labels.get(label, label)
 
 
 def draw_pose_overlay(frame, keypoints) -> None:
@@ -339,6 +484,58 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Whisper 추론 장치. 예: cuda, cpu",
     )
+    parser.add_argument(
+        "--action-artifacts-dir",
+        default="training_data/action_pipeline_aihub/artifacts",
+        help="학습된 action/RGB-I3D 모델 artifacts 디렉터리",
+    )
+    parser.add_argument(
+        "--action-rgb-model",
+        default="i3d_r50",
+        choices=("i3d_r50", "r3d_18", "mc3_18", "r2plus1d_18"),
+        help="실시간 RGB feature 추출 모델",
+    )
+    parser.add_argument(
+        "--disable-action-model",
+        action="store_true",
+        help="학습된 action 모델 연결을 끕니다.",
+    )
+    parser.add_argument(
+        "--action-clip-seconds",
+        type=float,
+        default=4.0,
+        help="실시간 action 판단에 사용할 최근 clip 길이(초)",
+    )
+    parser.add_argument(
+        "--action-interval-seconds",
+        type=float,
+        default=2.0,
+        help="action 모델 추론 최소 간격(초)",
+    )
+    parser.add_argument(
+        "--action-normal-threshold",
+        type=float,
+        default=0.78,
+        help="실시간 action 판단에서 normal로 남길 최소 abnormal threshold. 높을수록 오탐이 줄어듭니다.",
+    )
+    parser.add_argument(
+        "--action-min-confidence",
+        type=float,
+        default=0.45,
+        help="이상행동 라벨을 표시하기 위한 최소 분류 confidence.",
+    )
+    parser.add_argument(
+        "--action-collapse-static-motion-threshold",
+        type=float,
+        default=4.0,
+        help="collapse 오탐 완화용 정지 상태 motion threshold.",
+    )
+    parser.add_argument(
+        "--action-collapse-static-abnormal-threshold",
+        type=float,
+        default=0.90,
+        help="정지 상태에서 collapse로 인정할 최소 abnormal score.",
+    )
     return parser.parse_args()
 
 
@@ -348,6 +545,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         score_threshold=args.person_score_threshold,
         resize_width=args.person_imgsz,
         device=args.yolo_device,
+    )
+    action_recognizer = RealtimeActionRecognizer(
+        artifacts_dir=args.action_artifacts_dir,
+        enabled=not bool(args.disable_action_model),
+        device=args.yolo_device,
+        rgb_model=args.action_rgb_model,
+        clip_seconds=args.action_clip_seconds,
+        min_interval_seconds=args.action_interval_seconds,
+        normal_threshold=args.action_normal_threshold,
+        min_action_confidence=args.action_min_confidence,
+        collapse_static_motion_threshold=args.action_collapse_static_motion_threshold,
+        collapse_static_abnormal_threshold=args.action_collapse_static_abnormal_threshold,
     )
     face_detector = FaceDetector()
     speech_recognizer = ServerSpeechRecognizer(
@@ -404,9 +613,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "speech_status": str(meta.get("speech_status", "idle")),
                         "transcript": str(meta.get("transcript", "")),
                         "risk_score": int(meta.get("risk_score", 0)),
+                        "risk_audio_score": int(meta.get("risk_audio_score", 0)),
+                        "risk_video_score": int(meta.get("risk_video_score", 0)),
+                        "risk_raw_score": int(meta.get("risk_raw_score", 0)),
                         "risk_level": str(meta.get("risk_level", "LOW")),
                         "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
                         "risk_categories": list(meta.get("risk_categories", [])),
+                        "action_label": str(meta.get("action_label", "unknown")),
+                        "action_label_label": str(meta.get("action_label_label", localize_action_label(str(meta.get("action_label", "unknown"))))),
+                        "action_confidence": float(meta.get("action_confidence", 0.0)),
+                        "action_abnormal_score": float(meta.get("action_abnormal_score", 0.0)),
+                        "action_available": bool(meta.get("action_available", False)),
                         "has_frame": session.latest_frame_jpeg is not None,
                     }
                 )
@@ -1057,6 +1274,26 @@ def create_app(args: argparse.Namespace) -> FastAPI:
               <div class="metric-label">위험도</div>
               <div class="metric-value status-pill tone-neutral" id="riskLevel">0/100 | 낮음</div>
             </article>
+            <article class="metric-card">
+              <div class="metric-label">Video-only</div>
+              <div class="metric-value metric-compact" id="riskVideoScore">0/100</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Audio-only</div>
+              <div class="metric-value metric-compact" id="riskAudioScore">0/100</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Fusion raw</div>
+              <div class="metric-value metric-compact" id="riskRawScore">0/100</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Action AI</div>
+              <div class="metric-value status-pill tone-neutral" id="actionLabel">-</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Abnormal score</div>
+              <div class="metric-value metric-compact" id="actionAbnormalScore">0.000</div>
+            </article>
           </section>
 
           <section class="detail-grid">
@@ -1071,6 +1308,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <article class="detail-card">
               <div class="detail-label">위험 신호</div>
               <div class="detail-value" id="riskReasons">없음</div>
+            </article>
+            <article class="detail-card">
+              <div class="detail-label">Speech match</div>
+              <div class="detail-value" id="riskMatchQuality">-</div>
+            </article>
+            <article class="detail-card">
+              <div class="detail-label">Action probabilities</div>
+              <div class="detail-value" id="actionProbabilities">-</div>
             </article>
           </section>
 
@@ -1203,6 +1448,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           <div class="client-stats">
             <div class="client-stat">사람<strong>${client.people_count}</strong></div>
             <div class="client-stat">얼굴<strong>${client.face_count}</strong></div>
+            <div class="client-stat">Action<strong>${escapeHtml(client.action_label_label || '-')}</strong></div>
+            <div class="client-stat">Abnormal<strong>${Number(client.action_abnormal_score || 0).toFixed(2)}</strong></div>
             <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
             <div class="client-stat">지연<strong>${client.latency_ms.toFixed(1)}ms</strong></div>
           </div>
@@ -1276,10 +1523,27 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       const riskLevel = document.getElementById('riskLevel');
       riskLevel.textContent = `${data ? data.risk_score : 0}/100 | ${data ? data.risk_level_label : '낮음'}`;
       riskLevel.className = `metric-value status-pill ${riskTone(data ? data.risk_level : 'LOW')}`;
+      document.getElementById('riskVideoScore').textContent = `${data ? data.risk_video_score || 0 : 0}/100`;
+      document.getElementById('riskAudioScore').textContent = `${data ? data.risk_audio_score || 0 : 0}/100`;
+      document.getElementById('riskRawScore').textContent = `${data ? data.risk_raw_score || 0 : 0}/100`;
+
+      const actionLabel = document.getElementById('actionLabel');
+      const actionText = data && data.action_available
+        ? `${data.action_label_label || data.action_label} ${(data.action_confidence || 0).toFixed(2)}`
+        : (data && data.action_status ? data.action_status : '-');
+      actionLabel.textContent = actionText;
+      actionLabel.className = `metric-value status-pill ${data && data.action_label !== 'normal' && data.action_available ? 'tone-danger' : 'tone-good'}`;
+      document.getElementById('actionAbnormalScore').textContent = data ? `${(data.action_abnormal_score || 0).toFixed(3)} / ${(data.action_threshold || 0).toFixed(3)}` : '0.000';
 
       document.getElementById('transcript').textContent = data && data.transcript ? data.transcript : '-';
       document.getElementById('riskCategories').textContent = data && data.risk_categories && data.risk_categories.length ? data.risk_categories.join(', ') : '없음';
       document.getElementById('riskReasons').textContent = data && data.risk_reasons && data.risk_reasons.length ? data.risk_reasons.join(', ') : '없음';
+      document.getElementById('riskMatchQuality').textContent = data && data.risk_match_quality ? data.risk_match_quality : '-';
+      const probabilities = data && data.action_probabilities ? data.action_probabilities : {};
+      const probabilityText = Object.keys(probabilities).length
+        ? Object.entries(probabilities).map(([label, value]) => `${label}: ${Number(value || 0).toFixed(3)}`).join(' | ')
+        : (data && data.action_reason ? data.action_reason : '-');
+      document.getElementById('actionProbabilities').textContent = probabilityText;
     }
 
     const params = new URLSearchParams(window.location.search);
@@ -1301,7 +1565,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         snapshot = system_monitor.get_snapshot()
-        snapshot.update({"status": "ok", "sessions": len(sessions)})
+        snapshot.update(
+            {
+                "status": "ok",
+                "sessions": len(sessions),
+                "action_model_enabled": bool(action_recognizer.enabled),
+                "action_model_status": action_recognizer.latest.status,
+                "action_model_reason": action_recognizer.latest.reason,
+            }
+        )
         return snapshot
 
     @app.get("/", response_class=HTMLResponse)
@@ -1316,6 +1588,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     def api_system() -> dict:
         snapshot = system_monitor.get_snapshot()
         snapshot["sessions"] = len(sessions)
+        snapshot["action_model_enabled"] = bool(action_recognizer.enabled)
+        snapshot["action_model_status"] = action_recognizer.latest.status
+        snapshot["action_model_reason"] = action_recognizer.latest.reason
         return snapshot
 
     @app.get("/api/client/{client_id}")
@@ -1335,10 +1610,23 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "transcript": str(meta.get("transcript", "")),
                 "audio_level": float(meta.get("audio_level", 0.0)),
                 "risk_score": int(meta.get("risk_score", 0)),
+                "risk_audio_score": int(meta.get("risk_audio_score", 0)),
+                "risk_video_score": int(meta.get("risk_video_score", 0)),
+                "risk_raw_score": int(meta.get("risk_raw_score", 0)),
+                "risk_match_quality": str(meta.get("risk_match_quality", "")),
                 "risk_level": str(meta.get("risk_level", "LOW")),
                 "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
                 "risk_categories": list(meta.get("risk_categories", [])),
                 "risk_reasons": list(meta.get("risk_reasons", [])),
+                "action_status": str(meta.get("action_status", "unknown")),
+                "action_label": str(meta.get("action_label", "unknown")),
+                "action_label_label": str(meta.get("action_label_label", localize_action_label(str(meta.get("action_label", "unknown"))))),
+                "action_confidence": float(meta.get("action_confidence", 0.0)),
+                "action_abnormal_score": float(meta.get("action_abnormal_score", 0.0)),
+                "action_threshold": float(meta.get("action_threshold", 0.0)),
+                "action_available": bool(meta.get("action_available", False)),
+                "action_reason": str(meta.get("action_reason", "")),
+                "action_probabilities": dict(meta.get("action_probabilities", {}) or {}),
                 "last_seen_seconds": monotonic() - session.last_seen,
                 "has_frame": session.latest_frame_jpeg is not None,
             }
@@ -1372,10 +1660,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         if session.latest_meta is None:
             session.latest_meta = {}
         session.latest_meta.update({"speech_status": "processing"})
-        try:
-            audio_job_queue.put_nowait(AudioJob(client_id=client_id, wav_bytes=audio_bytes))
-            queued = True
-        except queue.Full:
+        queued = enqueue_latest_audio_job(audio_job_queue, AudioJob(client_id=client_id, wav_bytes=audio_bytes))
+        if not queued:
             queued = False
             session.latest_meta.update(
                 {
@@ -1422,16 +1708,29 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             for person in evaluated_people
             if person.get("person_state") in {"full_body_person", "upper_body_person"}
         ]
+        previous_risk_score = int((session.latest_meta or {}).get("risk_score", 0) or 0)
+        if previous_risk_score >= 35 or float((session.latest_meta or {}).get("audio_level", 0.0) or 0.0) >= 0.12:
+            action_recognizer.min_interval_seconds = min(action_recognizer.min_interval_seconds, 1.0)
+        elif not confirmed_people:
+            action_recognizer.min_interval_seconds = max(action_recognizer.min_interval_seconds, 2.5)
+        action_result = action_recognizer.update(frame, confirmed_people)
         latency_ms = (perf_counter() - started_at) * 1000.0
         annotated = frame.copy()
         session.person_filter.draw_debug_overlay(annotated, evaluated_people, draw_pose_overlay)
         draw_server_overlay(annotated, client_id, faces, latency_ms, len(confirmed_people))
+        draw_action_overlay(annotated, action_result)
         success, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if success:
             session.latest_frame_jpeg = encoded.tobytes()
         session.latest_people = confirmed_people
         if session.latest_meta is None:
             session.latest_meta = {}
+        risk = session.risk_analyzer.update(
+            ServerSpeechResult(status=str(session.latest_meta.get("speech_status", "idle"))),
+            tracked_people=confirmed_people,
+            face_count=len(faces),
+            action_result=action_result,
+        )
         session.latest_meta.update(
             {
                 "people_count": len(confirmed_people),
@@ -1441,8 +1740,57 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "candidate_count": len(evaluated_people),
                 "face_count": len(faces),
                 "latency_ms": round(latency_ms, 1),
+                "action_status": action_result.status,
+                "action_label": action_result.label,
+                "action_label_label": localize_action_label(action_result.label),
+                "action_confidence": round(float(action_result.confidence or 0.0), 4),
+                "action_abnormal_score": round(float(action_result.abnormal_score or 0.0), 4),
+                "action_threshold": round(float(action_result.threshold or 0.0), 4),
+                "action_available": bool(action_result.available),
+                "action_reason": action_result.reason,
+                "action_probabilities": action_result.probabilities or {},
+                "risk_score": risk.score,
+                "risk_audio_score": risk.audio_score,
+                "risk_video_score": risk.video_score,
+                "risk_raw_score": risk.raw_score,
+                "risk_match_quality": risk.speech_match_quality,
+                "risk_level": risk.level,
+                "risk_categories": list(risk.categories),
+                "risk_reasons": list(risk.reasons),
+                "risk_context_flags": list(risk.context_flags),
             }
         )
+        upload_hint = build_adaptive_upload_hint(latency_ms, risk.score, action_result.label)
+        session.latest_meta["upload_hint"] = upload_hint
+        if should_log_detection_event(
+            session,
+            risk.score,
+            str(session.latest_meta.get("transcript", "")),
+            action_result.label,
+        ):
+            write_detection_event_log(
+                {
+                    "client_id": client_id,
+                    "timestamp_monotonic": round(monotonic(), 3),
+                    "risk_score": risk.score,
+                    "risk_audio_score": risk.audio_score,
+                    "risk_video_score": risk.video_score,
+                    "risk_raw_score": risk.raw_score,
+                    "risk_level": risk.level,
+                    "risk_categories": list(risk.categories),
+                    "risk_reasons": list(risk.reasons),
+                    "risk_context_flags": list(risk.context_flags),
+                    "matched_keywords": list(risk.matched_keywords),
+                    "transcript": str(session.latest_meta.get("transcript", "")),
+                    "action_label": action_result.label,
+                    "action_confidence": round(float(action_result.confidence or 0.0), 4),
+                    "action_abnormal_score": round(float(action_result.abnormal_score or 0.0), 4),
+                    "people_count": len(confirmed_people),
+                    "face_count": len(faces),
+                    "latency_ms": round(latency_ms, 1),
+                    "upload_hint": upload_hint,
+                }
+            )
         if args.show_windows:
             cv2.imshow(f"detectWarning server - {client_id}", annotated)
             cv2.waitKey(1)
@@ -1451,6 +1799,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "tracked_people": evaluated_people,
             "faces": [list(map(int, face)) for face in faces],
             "latency_ms": round(latency_ms, 1),
+            "action": {
+                "available": bool(action_result.available),
+                "status": action_result.status,
+                "label": action_result.label,
+                "label_text": localize_action_label(action_result.label),
+                "confidence": round(float(action_result.confidence or 0.0), 4),
+                "abnormal_score": round(float(action_result.abnormal_score or 0.0), 4),
+                "threshold": round(float(action_result.threshold or 0.0), 4),
+                "reason": action_result.reason,
+                "probabilities": action_result.probabilities or {},
+            },
+            "upload_hint": upload_hint,
         }
 
     def audio_worker() -> None:
@@ -1479,12 +1839,38 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "transcript": transcript,
                         "audio_level": round(audio_level, 4),
                         "risk_score": risk.score,
+                        "risk_audio_score": risk.audio_score,
+                        "risk_video_score": risk.video_score,
+                        "risk_raw_score": risk.raw_score,
+                        "risk_match_quality": risk.speech_match_quality,
                         "risk_level": risk.level,
                         "risk_categories": list(risk.categories),
                         "risk_reasons": list(risk.reasons),
                         "risk_context_flags": list(risk.context_flags),
                     }
                 )
+                if should_log_detection_event(session, risk.score, transcript, str(session.latest_meta.get("action_label", "normal"))):
+                    write_detection_event_log(
+                        {
+                            "client_id": job.client_id,
+                            "timestamp_monotonic": round(monotonic(), 3),
+                            "source": "audio",
+                            "risk_score": risk.score,
+                            "risk_audio_score": risk.audio_score,
+                            "risk_video_score": risk.video_score,
+                            "risk_raw_score": risk.raw_score,
+                            "risk_level": risk.level,
+                            "risk_categories": list(risk.categories),
+                            "risk_reasons": list(risk.reasons),
+                            "risk_context_flags": list(risk.context_flags),
+                            "matched_keywords": list(risk.matched_keywords),
+                            "match_quality": risk.speech_match_quality,
+                            "transcript": transcript,
+                            "audio_level": round(audio_level, 4),
+                            "people_count": len(tracked_people),
+                            "face_count": face_count,
+                        }
+                    )
                 session.latest_meta.pop("speech_error", None)
             except Exception as exc:
                 session.latest_meta.update(

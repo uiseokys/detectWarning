@@ -162,6 +162,11 @@
       "low_f1_multiplier": 1.6,
       "missing_prediction_multiplier": 2.5,
       "minority_count_multiplier": 1.25,
+      "normal_ratio_multiplier_enabled": true,
+      "normal_ratio_target": 0.25,
+      "normal_ratio_min": 0.2,
+      "normal_ratio_multiplier": 1.35,
+      "normal_ratio_max_multiplier": 1.6,
       "min_multiplier": 1.0,
       "max_multiplier": 2.5,
       "min_validation_support": 1

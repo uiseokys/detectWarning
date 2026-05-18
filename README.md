@@ -37,12 +37,29 @@ python app\inference_server.py --host 0.0.0.0 --port 8000 --yolo-device cuda:0 -
 python app\training_dashboard.py --config configs/action_training.aihub_shell.example.json --port 8010
 ```
 
+### 전처리 재사용 자동 튜닝
+
+이미 만들어진 `manifests/active_prepared_*` 또는 `cumulative_prepared_*`만 사용해서 여러 학습 설정을 비교하려면 아래처럼 실행합니다. 다운로드와 pose 전처리는 다시 하지 않습니다.
+
+```powershell
+python app\auto_tune_action_training.py --config configs/action_training.aihub_shell.example.json --trials 16
+```
+
+Auto-tune also runs an optional ensemble search when `auto_tune.ensemble_enabled=true`. It reuses saved trial checkpoints, searches weighted probability ensembles and class-bias calibration on the prepared validation manifest, writes `artifacts/best_action_ensemble.json` and `artifacts/ensemble_metrics.json`, and promotes the ensemble metrics when they beat the best single checkpoint. To run only the ensemble pass:
+
+```powershell
+python app\ensemble_action_models.py --config configs/action_training.aihub_shell.example.json --top-k 12 --max-size 5 --target-metric accuracy --promote
+```
+
+trial 결과는 `training_data/action_pipeline_aihub/artifacts/auto_tune/` 아래에 따로 저장되고, 기본 설정에서는 가장 좋은 trial의 `best_action_model.pt`, `metrics.json`, 분석 파일을 메인 `artifacts/`로 승격해 대시보드가 바로 표시합니다. 또한 `auto_tune.update_config_with_best=true`이면 best trial의 학습 JSON 값이 설정 파일에 반영되고, 전체 effective 설정은 `artifacts/auto_tune/best_training_config.json`에 저장됩니다. 후보만 확인하려면 `--dry-run`, 승격 없이 비교만 하려면 `--no-promote-best`, config 갱신을 막으려면 `--no-update-config`를 사용하세요.
+
 ## 주요 진입점
 
 - `app/main.py`: 로컬 카메라/영상 기반 위험 감지 실행
 - `app/inference_server.py`: 원격 추론 서버와 관리 UI
 - `app/camera_uploader.py`: 원격 서버로 프레임을 업로드하는 클라이언트
 - `app/action_training_pipeline.py`: AIHub 다운로드, split, pose 전처리, 행동 모델 학습 파이프라인
+- `app/auto_tune_action_training.py`: 기존 전처리 결과를 재사용해 반복 학습 설정을 자동 비교/승격
 - `app/training_dashboard.py`: 학습 큐, 상태 모니터링, 자동 추천, 학습 진단 대시보드
 - `app/action_model.py`: pose 기반 행동 분류 모델, 학습 루프, 평가/분석 저장
 - `app/training_insights.py`: 학습 지표를 rule-based로 해석하는 자동 진단 로직

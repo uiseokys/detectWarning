@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -33,14 +34,43 @@ def read_json(path: Path | str | None) -> dict | list | None:
         return None
 
 
-def write_json_atomic(path: Path | str, payload: dict | list, *, indent: int | None = 2) -> None:
+def write_json_atomic(
+    path: Path | str,
+    payload: dict | list,
+    *,
+    indent: int | None = 2,
+    retries: int = 30,
+    retry_delay_seconds: float = 0.1,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=indent)
-        temp_path.replace(path)
+        last_error: OSError | None = None
+        for attempt in range(max(int(retries), 1)):
+            try:
+                temp_path.replace(path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(float(retry_delay_seconds))
+
+        # Windows can briefly deny atomic replace when a dashboard/browser refresh
+        # has the target JSON open. A direct rewrite is less perfect, but better
+        # than killing a long-running training job for a status-file race.
+        try:
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=indent)
+            return
+        except OSError:
+            if last_error is not None:
+                raise last_error
+            raise
     finally:
         try:
             if temp_path.exists():

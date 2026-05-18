@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from action_training_pipeline import get_target_labels, load_config, resolve_paths
+from dashboard_quality import build_guideline_quality_summary
 from reporting import (
     analyze_class_balance,
     STATE_SCHEMA_VERSION,
@@ -33,6 +34,16 @@ RESULT_DATASET_MANIFEST_SPECS = (
     ("prepared_train", "prepared_train"),
     ("prepared_val", "prepared_val"),
     ("prepared_test", "prepared_test"),
+)
+
+RESULT_CURRENT_DATASET_MANIFEST_SPECS = (
+    ("raw", "current_raw_manifest"),
+    ("train", "current_split_train"),
+    ("val", "current_split_val"),
+    ("test", "current_split_test"),
+    ("prepared_train", "current_prepared_train"),
+    ("prepared_val", "current_prepared_val"),
+    ("prepared_test", "current_prepared_test"),
 )
 
 
@@ -185,6 +196,11 @@ def build_latest_result_payload(
         output_key: summarize_manifest(paths[path_key], label_field="target_label")
         for output_key, path_key in RESULT_DATASET_MANIFEST_SPECS
     }
+    current_dataset = {
+        output_key: summarize_manifest(paths[path_key], label_field="target_label")
+        for output_key, path_key in RESULT_CURRENT_DATASET_MANIFEST_SPECS
+    }
+    guideline_quality = build_guideline_quality_summary(paths, config={})
     train_total = dataset["prepared_train"]["total"]
     val_total = dataset["prepared_val"]["total"]
     test_total = dataset["prepared_test"]["total"]
@@ -282,6 +298,15 @@ def build_latest_result_payload(
         "per_class": per_class_rows,
         "confusion_matrix": confusion_matrix,
         "dataset": dataset,
+        "current_dataset": current_dataset,
+        "guideline_quality": guideline_quality,
+        "predownload": {
+            "enabled": False,
+            "max_parallel": 0,
+            "running": [],
+            "completed": [],
+            "failed": [],
+        },
         "continual_state": continual_state,
         "train_distribution": train_distribution,
         "val_distribution": val_distribution,

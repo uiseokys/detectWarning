@@ -1,129 +1,442 @@
 {
   "schema_version": 1,
   "project_name": "detectWarning",
-  "report_title": "행동 학습 결과 리포트",
-  "updated_at": "2026-04-15T10:00:00+09:00",
+  "report_title": "detectWarning 학습 결과 리포트",
+  "updated_at": "2026-05-10T01:14:50.197833+09:00",
   "summary": {
-    "current_state": "offline",
-    "latest_datasetkey": "171",
-    "latest_filekey": "49841",
-    "latest_job_state": "completed_warning",
-    "train_samples": 25,
-    "val_samples": 5,
-    "test_samples": 7,
-    "best_epoch": 8,
-    "best_val_macro_f1": 0.8142,
-    "final_accuracy": 0.8571,
-    "final_macro_f1": 0.8021,
-    "resumed_from_checkpoint": true
+    "current_state": "running",
+    "latest_datasetkey": null,
+    "latest_filekey": null,
+    "latest_job_state": "running",
+    "train_samples": 0,
+    "val_samples": 0,
+    "test_samples": 0,
+    "best_epoch": null,
+    "best_val_macro_f1": null,
+    "final_accuracy": null,
+    "final_macro_f1": null,
+    "resumed_from_checkpoint": false,
+    "val_sample_total": 0,
+    "class_coverage": {
+      "covered": 0,
+      "total": 5
+    },
+    "dominant_class": "normal",
+    "dominant_class_support": 0,
+    "issues": {
+      "total": 0,
+      "broken": 0,
+      "skipped": 0
+    },
+    "stopped_early": false,
+    "stop_reason": null,
+    "total_duration_seconds": null
   },
   "latest_job": {
-    "datasetkey": "171",
-    "filekey": "49841",
-    "state": "completed_warning",
-    "started_at": "2026-04-14T21:02:54+09:00",
-    "finished_at": "2026-04-14T22:00:20+09:00",
-    "duration_minutes": 57,
-    "message": "학습 산출물은 정상 저장되었고 종료 단계에서만 경고 종료가 발생했습니다. 현재 결과는 공유 및 후속 누적 학습에 그대로 사용할 수 있습니다."
+    "datasetkey": null,
+    "filekey": null,
+    "state": "running",
+    "started_at": null,
+    "finished_at": "2026-05-10T01:14:18.181306+09:00",
+    "duration_minutes": null,
+    "message": "AIHub에서 분할 ZIP 데이터를 다운로드하는 중입니다. 20.74G 수신 · 5.79M/s"
   },
   "artifacts": {
-    "best_model": "artifacts/best_action_model.pt",
-    "metrics": "artifacts/metrics.json",
-    "labels": "artifacts/labels.json"
+    "best_model": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\best_action_model.pt",
+    "metrics": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\metrics.json",
+    "labels": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\labels.json",
+    "has_model": false,
+    "has_metrics": false,
+    "has_labels": false
   },
   "labels": [
     "normal",
     "violence",
     "collapse",
-    "abduction"
+    "abduction",
+    "loitering"
   ],
-  "history": [
-    {
-      "epoch": 1,
-      "train_loss": 1.184,
-      "val_loss": 0.982,
-      "val_accuracy": 0.600,
-      "val_macro_f1": 0.541
-    },
-    {
-      "epoch": 2,
-      "train_loss": 0.918,
-      "val_loss": 0.841,
-      "val_accuracy": 0.600,
-      "val_macro_f1": 0.596
-    },
-    {
-      "epoch": 3,
-      "train_loss": 0.782,
-      "val_loss": 0.733,
-      "val_accuracy": 0.714,
-      "val_macro_f1": 0.671
-    },
-    {
-      "epoch": 4,
-      "train_loss": 0.661,
-      "val_loss": 0.648,
-      "val_accuracy": 0.714,
-      "val_macro_f1": 0.701
-    },
-    {
-      "epoch": 5,
-      "train_loss": 0.574,
-      "val_loss": 0.604,
-      "val_accuracy": 0.857,
-      "val_macro_f1": 0.781
-    },
-    {
-      "epoch": 6,
-      "train_loss": 0.511,
-      "val_loss": 0.572,
-      "val_accuracy": 0.857,
-      "val_macro_f1": 0.792
-    },
-    {
-      "epoch": 7,
-      "train_loss": 0.474,
-      "val_loss": 0.558,
-      "val_accuracy": 0.857,
-      "val_macro_f1": 0.799
-    },
-    {
-      "epoch": 8,
-      "train_loss": 0.438,
-      "val_loss": 0.541,
-      "val_accuracy": 0.857,
-      "val_macro_f1": 0.814
-    }
-  ],
+  "history": [],
   "per_class": [
     {
       "label": "normal",
-      "precision": 0.880,
-      "recall": 0.900,
-      "f1": 0.890
+      "precision": null,
+      "recall": null,
+      "f1": null,
+      "support": 0
     },
     {
       "label": "violence",
-      "precision": 0.820,
-      "recall": 0.800,
-      "f1": 0.810
+      "precision": null,
+      "recall": null,
+      "f1": null,
+      "support": 0
     },
     {
       "label": "collapse",
-      "precision": 0.750,
-      "recall": 0.750,
-      "f1": 0.750
+      "precision": null,
+      "recall": null,
+      "f1": null,
+      "support": 0
     },
     {
       "label": "abduction",
-      "precision": 0.760,
-      "recall": 0.730,
-      "f1": 0.740
+      "precision": null,
+      "recall": null,
+      "f1": null,
+      "support": 0
+    },
+    {
+      "label": "loitering",
+      "precision": null,
+      "recall": null,
+      "f1": null,
+      "support": 0
     }
   ],
+  "confusion_matrix": [
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "dataset": {
+    "raw": {
+      "total": 0,
+      "by_label": {}
+    },
+    "train": {
+      "total": 0,
+      "by_label": {}
+    },
+    "val": {
+      "total": 0,
+      "by_label": {}
+    },
+    "test": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_train": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_val": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_test": {
+      "total": 0,
+      "by_label": {}
+    }
+  },
+  "current_dataset": {
+    "raw": {
+      "total": 0,
+      "by_label": {}
+    },
+    "train": {
+      "total": 0,
+      "by_label": {}
+    },
+    "val": {
+      "total": 0,
+      "by_label": {}
+    },
+    "test": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_train": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_val": {
+      "total": 0,
+      "by_label": {}
+    },
+    "prepared_test": {
+      "total": 0,
+      "by_label": {}
+    }
+  },
+  "guideline_quality": {
+    "total_clips": 0,
+    "source_videos": 0,
+    "filekey_count": 0,
+    "by_split": {},
+    "by_label": {},
+    "by_role": {},
+    "by_filekey": [],
+    "rgb_feature_models": {},
+    "rgb_feature_ready": 0,
+    "rgb_feature_missing": 0,
+    "rgb_ready_ratio": 0.0,
+    "xml_matched": 0,
+    "xml_missing": 0,
+    "xml_match_ratio": 0.0,
+    "action_tagged": 0,
+    "rgb_only_fallback": 0,
+    "person_retry_attempted": 0,
+    "person_retry_success": 0,
+    "low_weight_clips": 0,
+    "low_pose_clips": 0,
+    "avg_valid_frames": 0.0,
+    "avg_pose_confidence": 0.0,
+    "normal_ratio": 0.0,
+    "target_normal_ratio": 0.25,
+    "normal_target_met": false,
+    "imbalance_ratio": 0.0,
+    "prepare_source": "",
+    "cumulative_filekey_count": 0,
+    "health": "pending",
+    "notes": [
+      "guideline clip manifest가 아직 없습니다."
+    ],
+    "prepare_summary": {}
+  },
+  "predownload": {
+    "enabled": false,
+    "max_parallel": 0,
+    "running": [],
+    "completed": [],
+    "failed": []
+  },
+  "continual_state": {},
+  "train_distribution": {
+    "severity": "critical",
+    "counts": [
+      {
+        "label": "normal",
+        "count": 0
+      },
+      {
+        "label": "violence",
+        "count": 0
+      },
+      {
+        "label": "collapse",
+        "count": 0
+      },
+      {
+        "label": "abduction",
+        "count": 0
+      },
+      {
+        "label": "loitering",
+        "count": 0
+      }
+    ],
+    "covered": 0,
+    "total": 5,
+    "empty_labels": [
+      "normal",
+      "violence",
+      "collapse",
+      "abduction",
+      "loitering"
+    ],
+    "low_sample_labels": [],
+    "dominant_label": null,
+    "dominant_count": 0,
+    "minority_label": null,
+    "minority_count": 0,
+    "imbalance_ratio": null,
+    "messages": [
+      "비어 있는 클래스: normal, violence, collapse, abduction, loitering"
+    ],
+    "min_samples": 8,
+    "ratio_warn": 5.0
+  },
+  "val_distribution": {
+    "severity": "critical",
+    "counts": [
+      {
+        "label": "normal",
+        "count": 0
+      },
+      {
+        "label": "violence",
+        "count": 0
+      },
+      {
+        "label": "collapse",
+        "count": 0
+      },
+      {
+        "label": "abduction",
+        "count": 0
+      },
+      {
+        "label": "loitering",
+        "count": 0
+      }
+    ],
+    "covered": 0,
+    "total": 5,
+    "empty_labels": [
+      "normal",
+      "violence",
+      "collapse",
+      "abduction",
+      "loitering"
+    ],
+    "low_sample_labels": [],
+    "dominant_label": null,
+    "dominant_count": 0,
+    "minority_label": null,
+    "minority_count": 0,
+    "imbalance_ratio": null,
+    "messages": [
+      "비어 있는 클래스: normal, violence, collapse, abduction, loitering"
+    ],
+    "min_samples": 8,
+    "ratio_warn": 5.0
+  },
+  "stage_timings": {
+    "ordered": [
+      {
+        "stage": "download",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      {
+        "stage": "prepare",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      {
+        "stage": "train",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      {
+        "stage": "total",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      }
+    ],
+    "by_stage": {
+      "download": {
+        "stage": "download",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      "prepare": {
+        "stage": "prepare",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      "train": {
+        "stage": "train",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      },
+      "total": {
+        "stage": "total",
+        "started_at": null,
+        "finished_at": null,
+        "duration_seconds": null
+      }
+    }
+  },
+  "issues": {
+    "summary": {
+      "total_issues": 0,
+      "broken_count": 0,
+      "skipped_count": 0
+    },
+    "issues": []
+  },
+  "recent_jobs": [],
+  "diagnostics": {
+    "pipeline": {
+      "warnings": [],
+      "pipeline_status_source": "pipeline_status",
+      "pipeline_status_stale": false,
+      "sources": {
+        "pipeline_status": {
+          "updated_at": "2026-05-10T01:14:18.181306+09:00",
+          "state": "running",
+          "workspace_dir": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub"
+        },
+        "training_progress": {
+          "updated_at": null,
+          "state": null,
+          "history_len": 0
+        },
+        "latest_job": null,
+        "latest_success_job": null
+      }
+    },
+    "files": {
+      "pipeline_status": {
+        "path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\pipeline_status.json",
+        "exists": true,
+        "size": 609,
+        "updated_at": "2026-05-10T01:14:18.181307+09:00"
+      },
+      "training_progress": {
+        "path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\training_progress.json",
+        "exists": false,
+        "size": null,
+        "updated_at": null
+      },
+      "metrics": {
+        "path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\metrics.json",
+        "exists": false,
+        "size": null,
+        "updated_at": null
+      },
+      "launcher_history": {
+        "path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\launcher_history.json",
+        "exists": true,
+        "size": 81,
+        "updated_at": "2026-05-10T00:09:19.361629+09:00"
+      }
+    }
+  },
   "notes": [
-    "팀원은 이 Pages 주소만 열면 됩니다. live-status.json이 online으로 바뀌면 자동으로 실시간 대시보드로 이동합니다.",
-    "completed_warning은 학습 산출물 저장까지 완료되었지만 종료 단계에서만 경고 코드가 남은 상태를 뜻합니다.",
-    "이 JSON은 학습 종료 후 detectWarning 쪽 exporter가 자동으로 덮어쓰는 파일로 쓰는 것을 권장합니다."
+    "실시간 대시보드가 켜져 있으면 이 페이지는 live 화면으로 자동 전환됩니다.",
+    "경고 종료는 산출물 저장까지 완료되었지만 종료 단계에서만 경고 코드가 남은 상태입니다.",
+    "이 파일은 detectWarning 학습 결과에서 자동으로 생성된 최신 공유용 리포트입니다."
   ]
 }

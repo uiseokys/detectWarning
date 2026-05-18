@@ -76,6 +76,15 @@ def _float_text(value, digits: int = 4, default: str = "-") -> str:
         return _text(value, default)
 
 
+def _percent_text(value, digits: int = 1, default: str = "-") -> str:
+    if value in (None, ""):
+        return default
+    try:
+        return f"{float(value) * 100:.{digits}f}%"
+    except (TypeError, ValueError):
+        return _text(value, default)
+
+
 def _int_text(value, default: str = "0") -> str:
     if value in (None, ""):
         return default
@@ -98,6 +107,27 @@ def _join_count_map(items: dict | None) -> str:
     if not isinstance(items, dict) or not items:
         return "-"
     return ", ".join(f"{key} {value}" for key, value in sorted(items.items()))
+
+
+def _summary_total(summary: dict, *keys: str) -> int:
+    if not isinstance(summary, dict):
+        return 0
+    return sum(int((summary.get(key) or {}).get("total", 0) or 0) for key in keys)
+
+
+def _display_dataset_totals(dataset: dict, current_dataset: dict, guideline_quality: dict | None = None) -> tuple[int, int]:
+    guideline_quality = guideline_quality if isinstance(guideline_quality, dict) else {}
+    raw_total = max(
+        int((dataset.get("raw") or {}).get("total", 0) or 0),
+        int((current_dataset.get("raw") or {}).get("total", 0) or 0),
+        int(guideline_quality.get("source_videos") or 0),
+    )
+    prepared_total = max(
+        _summary_total(dataset, "prepared_train", "prepared_val", "prepared_test"),
+        _summary_total(current_dataset, "prepared_train", "prepared_val", "prepared_test"),
+        int(guideline_quality.get("total_clips") or 0),
+    )
+    return raw_total, prepared_total
 
 
 def _state_tone(state: str | None) -> str:
@@ -125,6 +155,18 @@ def _split_label(name: str | None) -> str:
     if normalized in SPLIT_LABELS:
         return SPLIT_LABELS[normalized]
     return _text(name)
+
+
+def _split_source_label(name: str | None, source: str) -> str:
+    normalized = str(name or "").strip().lower()
+    source = str(source or "").strip().lower()
+    if source == "current":
+        return "current manifest"
+    if normalized == "raw":
+        return "cumulative raw manifest"
+    if normalized.startswith("prepared_"):
+        return "active prepared manifest"
+    return "cumulative split manifest"
 
 
 def _resume_mode_label(value: str | None) -> str:
@@ -251,19 +293,11 @@ def _render_diagnostics_details(diagnostics: dict) -> str:
         pipeline_rows.append([_text("warning"), _text(warning)])
 
     return (
-        "<details class=\"detail-panel\">"
-        "<summary class=\"detail-summary\">진단 상세 보기</summary>"
-        "<div class=\"detail-body\">"
-        "<div class=\"detail-grid\">"
-        "<section class=\"mini-panel\">"
-        "<h3>파이프라인 진단</h3>"
-        + _render_table(["kind", "value"], pipeline_rows, "파이프라인 진단 정보가 없습니다.", compact=True)
-        + "</section>"
-        "<section class=\"mini-panel\">"
-        "<h3>파일 상태</h3>"
-        + _render_table(["file", "exists", "updated_at", "size", "path"], file_rows, "진단 파일 정보가 없습니다.", compact=True)
-        + "</section>"
-        "</div>"
+        "<details class=\"diagnostics-details\">"
+        "<summary>상세 진단</summary>"
+        "<div class=\"diagnostics-stack\">"
+        f"{_render_table(['항목', '값'], pipeline_rows, '파이프라인 진단 정보가 없습니다.', compact=True)}"
+        f"{_render_table(['파일', '존재', '갱신', '크기', '경로'], file_rows, '파일 진단 정보가 없습니다.', compact=True)}"
         "</div>"
         "</details>"
     )
@@ -273,13 +307,14 @@ def _render_actions_panel(
     default_datasetkey: str,
     controls_enabled: bool,
     controls_notice: str | None = None,
+    notification_settings: dict | None = None,
 ) -> str:
     if not controls_enabled:
-        notice = controls_notice or "이 설정에서는 브라우저에서 직접 실행을 지원하지 않습니다."
+        notice = controls_notice or "현재 설정에서는 브라우저에서 직접 실행을 지원하지 않습니다."
         detail = (
             "공유 링크에서는 진행 상황만 확인할 수 있습니다."
             if controls_notice
-            else "dataset_source가 <code>aihub_shell</code>일 때만 filekey 큐 제어를 사용할 수 있습니다."
+            else "dataset_source가 aihub_shell일 때만 filekey 작업 제어를 사용할 수 있습니다."
         )
         return (
             "<section class=\"panel sidebar-panel\">"
@@ -290,46 +325,105 @@ def _render_actions_panel(
             "</section>"
         )
 
+    datasetkey_value = default_datasetkey or "171"
+    notification_settings = notification_settings if isinstance(notification_settings, dict) else {}
+    notify_enabled = " checked" if notification_settings.get("enabled") else ""
+    notify_topic = _text(notification_settings.get("ntfy_topic"), "")
+    notify_server = _text(notification_settings.get("ntfy_server") or "https://ntfy.sh", "")
+    notify_last = _text(notification_settings.get("last_error") or notification_settings.get("last_sent_at") or "")
+    notify_on_values = set(
+        notification_settings.get("notify_on")
+        or ["started", "completed", "completed_warning", "error", "aborted"]
+    )
+    notify_started = " checked" if "started" in notify_on_values else ""
+    notify_completed = " checked" if "completed" in notify_on_values else ""
+    notify_warning = " checked" if "completed_warning" in notify_on_values else ""
+    notify_error = " checked" if "error" in notify_on_values else ""
+    notify_aborted = " checked" if "aborted" in notify_on_values else ""
+
     return (
         "<section class=\"panel sidebar-panel\">"
-        "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>datasetkey로 파일 목록을 불러온 뒤 선택한 filekey만 큐에 추가합니다.</p></div></div>"
+        "<div class=\"panel-head\"><div><h2>작업 제어</h2><p>현재 권장 방식만 실행합니다.</p></div></div>"
         "<div class=\"panel-body stack\">"
         "<form method=\"post\" action=\"/actions/start\" class=\"stack-form\" id=\"start-job-form\">"
         "<label class=\"field-label\">datasetkey"
-        f"<input type=\"text\" id=\"datasetkey-input\" name=\"datasetkey\" value=\"{_text(default_datasetkey, '')}\" placeholder=\"예: 171\" data-persist-key=\"dashboard.datasetkey\" />"
+        f"<input type=\"text\" id=\"datasetkey-input\" name=\"datasetkey\" value=\"{_text(datasetkey_value, '')}\" placeholder=\"예: 171\" data-persist-key=\"dashboard.datasetkey\" />"
         "</label>"
         "<label class=\"field-label\">AIHub API 키"
         "<input type=\"password\" id=\"api-key-input\" name=\"api_key\" value=\"\" placeholder=\"필요할 때만 입력\" data-persist-key=\"dashboard.api_key\" />"
         "</label>"
-        "<div class=\"filekey-lookup\" id=\"filekey-lookup-panel\">"
-        "<div class=\"filekey-lookup-head\">"
-        "<div><strong>AIHub 파일 목록</strong><span id=\"filekey-lookup-status\">datasetkey 대기 중</span></div>"
-        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-lookup-button\">목록 조회</button>"
-        "</div>"
-        "<div class=\"filekey-lookup-summary\" id=\"filekey-lookup-summary\"></div>"
-        "<div class=\"filekey-lookup-zip-groups\" id=\"filekey-lookup-zip-groups\"></div>"
-        "<div class=\"filekey-lookup-filters\" id=\"filekey-lookup-filters\"></div>"
-        "<div class=\"filekey-lookup-groups\" id=\"filekey-lookup-groups\"></div>"
-        "<div class=\"filekey-lookup-actions\">"
-        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-select-trainable-button\">학습 가능 전체 선택</button>"
-        "<button type=\"button\" class=\"secondary-button secondary-button-compact\" id=\"filekey-clear-selection-button\">선택 해제</button>"
-        "</div>"
-        "<div class=\"filekey-lookup-list\" id=\"filekey-lookup-list\"></div>"
-        "</div>"
-        "<input type=\"hidden\" id=\"filekeys-input\" name=\"filekeys\" value=\"\" />"
-        "<div class=\"action-grid\">"
-        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_extract_next\" value=\"1\">분포 맞춰 자동 추출</button>"
-        "<button type=\"submit\" class=\"primary-button\">선택한 filekey 큐 시작 / 추가</button>"
-        "<button type=\"submit\" class=\"secondary-button\" name=\"stage\" value=\"extract\">데이터 추출만</button>"
-        "</div>"
-        "<button type=\"submit\" class=\"secondary-button\" name=\"auto_enqueue_next\" value=\"1\">outside 추천 자동 시작</button>"
+        "<label class=\"field-label\">RGB/I3D 모델"
+        "<select name=\"rgb_model\"><option value=\"i3d_r50\">I3D R50</option><option value=\"r3d_18\">R3D-18 fallback</option><option value=\"r2plus1d_18\">R(2+1)D-18</option><option value=\"mc3_18\">MC3-18</option></select>"
+        "</label>"
+        "<label class=\"field-label\">abduction"
+        "<select id=\"abduction-mode-input\" name=\"abduction_mode\"><option value=\"include\">include</option><option value=\"exclude_abduction\">exclude</option></select>"
+        "</label>"
         "</form>"
-        "<div class=\"action-grid\">"
-        "<form method=\"post\" action=\"/actions/start\"><input type=\"hidden\" name=\"resume_only\" value=\"1\" /><input type=\"hidden\" name=\"auto_enqueue_next\" value=\"1\" /><button type=\"submit\" class=\"secondary-button\">outside 추천 자동 시작 재개</button></form>"
-        "<form method=\"post\" action=\"/actions/pause\"><button type=\"submit\" class=\"secondary-button secondary-button-warn\">현재 작업 후 중지</button></form>"
-        "<form method=\"post\" action=\"/actions/force-stop\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">지금 중단</button></form>"
-        "<form method=\"post\" action=\"/actions/reset\"><button type=\"submit\" class=\"secondary-button secondary-button-danger\">처음부터 다시 시작</button></form>"
+        "<div class=\"action-grid primary-action-grid\">"
+        "<button type=\"submit\" form=\"start-job-form\" class=\"primary-button\" name=\"auto_extract_next\" value=\"1\">분포 맞춰 자동추출</button>"
+        "<form method=\"post\" action=\"/actions/guideline-pipeline\" class=\"stack-form compact-action-form\">"
+        "<input type=\"hidden\" name=\"skip_guideline\" value=\"1\" />"
+        "<input type=\"hidden\" name=\"include_rgb\" value=\"0\" />"
+        "<input type=\"hidden\" name=\"start_train\" value=\"1\" />"
+        "<input type=\"hidden\" name=\"abduction_mode\" value=\"include\" data-copy-from=\"#abduction-mode-input\" />"
+        "<button type=\"submit\" class=\"secondary-button\">추출된 데이터로 학습 시작</button>"
+        "</form>"
         "</div>"
+        "<form method=\"post\" action=\"/actions/performance-plan\" class=\"stack-form\">"
+        "<input type=\"hidden\" name=\"datasetkey\" value=\"" + _text(datasetkey_value, "") + "\" data-copy-from=\"#datasetkey-input\" />"
+        "<input type=\"hidden\" name=\"api_key\" value=\"\" data-copy-from=\"#api-key-input\" />"
+        "<input type=\"hidden\" name=\"rgb_model\" value=\"i3d_r50\" />"
+        "<input type=\"hidden\" name=\"target_metric\" value=\"accuracy\" />"
+        "<input type=\"hidden\" name=\"abduction_mode\" value=\"include\" data-copy-from=\"#abduction-mode-input\" />"
+        "<label class=\"field-label\">최고 성능 플랜 기간"
+        "<input type=\"number\" name=\"days\" value=\"12\" min=\"1\" max=\"14\" />"
+        "</label>"
+        "<label class=\"field-label\">auto-tune trial"
+        "<input type=\"number\" name=\"trials\" value=\"24\" min=\"1\" max=\"96\" />"
+        "</label>"
+        "<button type=\"submit\" class=\"primary-button\">11~12일 최고성능 자동 플랜 시작</button>"
+        "</form>"
+        "<form method=\"post\" action=\"/actions/restart-guideline\" class=\"stack-form\">"
+        "<input type=\"hidden\" name=\"source\" value=\"cumulative\" />"
+        "<input type=\"hidden\" name=\"include_rgb\" value=\"1\" />"
+        "<input type=\"hidden\" name=\"start_train\" value=\"0\" />"
+        "<input type=\"hidden\" name=\"cleanup_after\" value=\"1\" />"
+        "<button type=\"submit\" class=\"secondary-button secondary-button-warn\">guideline 재시작</button>"
+        "</form>"
+        "<form method=\"post\" action=\"/actions/restart-rgb\" class=\"stack-form\">"
+        "<input type=\"hidden\" name=\"rgb_model\" value=\"i3d_r50\" />"
+        "<input type=\"hidden\" name=\"start_train\" value=\"0\" />"
+        "<input type=\"hidden\" name=\"cleanup_after\" value=\"1\" />"
+        "<button type=\"submit\" class=\"secondary-button secondary-button-warn\">RGB/I3D부터 재시작</button>"
+        "</form>"
+        "<form method=\"post\" action=\"/actions/stop-after-queue\" class=\"stack-form\">"
+        "<button type=\"submit\" class=\"secondary-button secondary-button-warn\">이번 큐 이후 전처리 중단</button>"
+        "</form>"
+        "<form method=\"post\" action=\"/actions/reset\" class=\"stack-form\">"
+        "<button type=\"submit\" class=\"secondary-button secondary-button-danger\">초기화</button>"
+        "</form>"
+        "<form method=\"post\" action=\"/actions/notifications\" class=\"stack-form\">"
+        "<label class=\"field-label\"><span><input type=\"checkbox\" name=\"enabled\" value=\"1\"" + notify_enabled + " /> iPhone 푸시 알림</span></label>"
+        "<input type=\"hidden\" name=\"provider\" value=\"ntfy\" />"
+        "<label class=\"field-label\">ntfy topic"
+        f"<input type=\"text\" name=\"ntfy_topic\" value=\"{notify_topic}\" placeholder=\"예: detectwarning-myphone\" />"
+        "</label>"
+        "<label class=\"field-label\">ntfy server"
+        f"<input type=\"text\" name=\"ntfy_server\" value=\"{notify_server}\" placeholder=\"https://ntfy.sh\" />"
+        "</label>"
+        "<div class=\"checkbox-row\">"
+        f"<label><input type=\"checkbox\" name=\"notify_on\" value=\"started\"{notify_started} /> 시작</label>"
+        f"<label><input type=\"checkbox\" name=\"notify_on\" value=\"completed\"{notify_completed} /> 완료</label>"
+        f"<label><input type=\"checkbox\" name=\"notify_on\" value=\"completed_warning\"{notify_warning} /> 경고</label>"
+        f"<label><input type=\"checkbox\" name=\"notify_on\" value=\"error\"{notify_error} /> 실패</label>"
+        f"<label><input type=\"checkbox\" name=\"notify_on\" value=\"aborted\"{notify_aborted} /> 중단</label>"
+        "</div>"
+        "<div class=\"button-row\">"
+        "<button type=\"submit\" class=\"secondary-button\" name=\"mode\" value=\"save\">알림 저장</button>"
+        "<button type=\"submit\" class=\"secondary-button secondary-button-warn\" name=\"mode\" value=\"test\">테스트</button>"
+        "</div>"
+        f"<p class=\"muted-block\">{notify_last}</p>"
+        "</form>"
         "</div>"
         "</section>"
     )
@@ -395,6 +489,20 @@ def _render_queue_panel(
         percent = 0.0
     progress_label = _text(current_job_progress.get("label"), "대기 중")
     progress_detail = _text(current_job_progress.get("detail"), "대기 중인 작업이 없으면 여기에 현재 작업 단계가 표시됩니다.")
+    predownload = launcher.get("predownload") if isinstance(launcher.get("predownload"), dict) else {}
+    predownload_running = predownload.get("running") if isinstance(predownload.get("running"), list) else []
+    predownload_completed = predownload.get("completed") if isinstance(predownload.get("completed"), list) else []
+    predownload_failed = predownload.get("failed") if isinstance(predownload.get("failed"), list) else []
+    predownload_running_text = ", ".join(
+        _text(item.get("filekey"), "")
+        for item in predownload_running[:3]
+        if isinstance(item, dict) and item.get("filekey")
+    )
+    predownload_note = (
+        f"실행 중: {predownload_running_text}"
+        if predownload_running_text
+        else _text(predownload.get("pause_reason"), "현재 병렬 다운로드 없음")
+    )
     queue_items = []
     for job in pending_jobs:
         if not isinstance(job, dict):
@@ -429,6 +537,12 @@ def _render_queue_panel(
         f"<div class=\"queue-summary-tile\"><span>완료</span><strong>{_int_text(queue_progress.get('completed'))}</strong></div>"
         f"<div class=\"queue-summary-tile\"><span>실패</span><strong>{_int_text(queue_progress.get('failed'))}</strong></div>"
         "</div>"
+        "<div class=\"queue-summary-grid\">"
+        f"<div class=\"queue-summary-tile\"><span>병렬 다운로드</span><strong>{len(predownload_running)} / {_int_text(predownload.get('max_parallel'))}</strong></div>"
+        f"<div class=\"queue-summary-tile\"><span>미리받기 완료</span><strong>{len(predownload_completed)}</strong></div>"
+        f"<div class=\"queue-summary-tile\"><span>미리받기 실패</span><strong>{len(predownload_failed)}</strong></div>"
+        f"<div class=\"queue-summary-tile\"><span>여유 공간</span><strong>{_text(predownload.get('free_gb'))}GB</strong></div>"
+        "</div>"
         "<div class=\"queue-progress-card\">"
         "<div class=\"queue-progress-head\">"
         "<div class=\"queue-progress-copy\">"
@@ -441,6 +555,7 @@ def _render_queue_panel(
         f"<span class=\"queue-progress-fill\" style=\"width:{percent:.1f}%\"></span>"
         "</div>"
         f"<div class=\"queue-copy\">{progress_detail}</div>"
+        f"<div class=\"queue-copy\">병렬 다운로드: {predownload_note}</div>"
         "</div>"
         f"<ul class=\"queue-list\">{queue_html}</ul>"
         "</div>"
@@ -608,12 +723,413 @@ def _render_insights_panel(insights: dict | None) -> str:
     """
 
 
+def _render_guideline_quality_panel(quality: dict | None) -> str:
+    quality = quality if isinstance(quality, dict) else {}
+    health = str(quality.get("health") or "pending")
+    notes = quality.get("notes") or []
+    note_html = "".join(f"<li>{_text(note)}</li>" for note in notes) or "<li>추출 품질 경고가 없습니다.</li>"
+    label_counts = _join_count_map(quality.get("by_label") or {})
+    split_counts = _join_count_map(quality.get("by_split") or {})
+    role_counts = _join_count_map(quality.get("by_role") or {})
+    rgb_models = _join_count_map(quality.get("rgb_feature_models") or {})
+    filekey_rows = []
+    for item in (quality.get("by_filekey") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        filekey_rows.append(
+            [
+                _text(item.get("filekey")),
+                _int_text(item.get("total")),
+                _int_text(item.get("danger")),
+                _int_text(item.get("normal")),
+                _percent_text(item.get("normal_ratio")),
+                _percent_text(item.get("xml_match_ratio")),
+                _int_text(item.get("xml_missing")),
+                _int_text(item.get("rgb_ready")),
+                _int_text(item.get("rgb_missing")),
+                _int_text(item.get("low_weight")),
+                _int_text(item.get("person_retry_success")),
+                _text(_join_count_map(item.get("labels") or {})),
+            ]
+        )
+    filekey_table = _render_table(
+        [
+            "filekey",
+            "clip",
+            "danger",
+            "normal",
+            "normal %",
+            "XML %",
+            "XML miss",
+            "RGB ok",
+            "RGB miss",
+            "low weight",
+            "retry ok",
+            "labels",
+        ],
+        filekey_rows,
+        "filekey별 clip 통계가 아직 없습니다.",
+        compact=True,
+    )
+    return f"""
+      <section class="panel" id="guideline-quality">
+        <div class="panel-head">
+          <div>
+            <h2>추출/학습 품질</h2>
+            <p>현재 방식의 clip, normal, RGB/I3D, pose 품질을 바로 확인합니다.</p>
+          </div>
+          <span class="status-badge {_state_tone(health)}">{_text(health)}</span>
+        </div>
+        <div class="panel-body">
+          <div class="key-metric-grid">
+            <div><span>전체 clip</span><strong>{_int_text(quality.get('total_clips'))}</strong></div>
+            <div><span>RGB ready</span><strong>{_percent_text(quality.get('rgb_ready_ratio'))}</strong></div>
+            <div><span>normal target</span><strong>{_percent_text(quality.get('target_normal_ratio'))}</strong></div>
+            <div><span>filekey</span><strong>{_int_text(quality.get('filekey_count'))}</strong></div>
+            <div><span>normal 비율</span><strong>{_percent_text(quality.get('normal_ratio'))}</strong></div>
+            <div><span>XML 매칭</span><strong>{_percent_text(quality.get('xml_match_ratio'))}</strong></div>
+            <div><span>평균 pose frame</span><strong>{_float_text(quality.get('avg_valid_frames'), digits=2)}</strong></div>
+            <div><span>평균 pose conf</span><strong>{_float_text(quality.get('avg_pose_confidence'), digits=3)}</strong></div>
+            <div><span>낮은 pose clip</span><strong>{_int_text(quality.get('low_pose_clips'))}</strong></div>
+            <div><span>RGB fallback</span><strong>{_int_text(quality.get('rgb_only_fallback'))}</strong></div>
+            <div><span>person retry 성공</span><strong>{_int_text(quality.get('person_retry_success'))}</strong></div>
+            <div><span>낮은 weight</span><strong>{_int_text(quality.get('low_weight_clips'))}</strong></div>
+            <div><span>불균형 비율</span><strong>{_float_text(quality.get('imbalance_ratio'), digits=2)}</strong></div>
+          </div>
+          <div class="content-row">
+            <div class="mini-panel"><h3>split</h3><p class="muted-block">{_text(split_counts)}</p></div>
+            <div class="mini-panel"><h3>label</h3><p class="muted-block">{_text(label_counts)}</p></div>
+            <div class="mini-panel"><h3>role</h3><p class="muted-block">{_text(role_counts)}</p></div>
+            <div class="mini-panel"><h3>RGB/I3D model</h3><p class="muted-block">{_text(rgb_models)}</p></div>
+          </div>
+          {filekey_table}
+          <ul class="banner-list">{note_html}</ul>
+        </div>
+      </section>
+    """
+
+
+def _render_final_model_summary_panel(summary: dict | None) -> str:
+    summary = summary if isinstance(summary, dict) else {}
+    pose = summary.get("pose") if isinstance(summary.get("pose"), dict) else {}
+    ensemble = summary.get("ensemble") if isinstance(summary.get("ensemble"), dict) else {}
+    hybrid = summary.get("hybrid") if isinstance(summary.get("hybrid"), dict) else {}
+    rows = [
+        _final_model_row(pose),
+        _final_model_row(ensemble),
+        _final_model_row(hybrid),
+    ]
+    hybrid_detail = "-"
+    if hybrid.get("available"):
+        hybrid_detail = (
+            f"feature {_float_text(hybrid.get('feature_weight'), digits=3)} / "
+            f"pose {_float_text(hybrid.get('neural_weight'), digits=3)} / "
+            f"{_text(hybrid.get('feature_model') or '-')}"
+        )
+    return f"""
+      <section class="panel" id="final-model-summary">
+        <div class="panel-head">
+          <div>
+            <h2>최종 모델 성능</h2>
+            <p>pose-only와 RGB/I3D hybrid 결과를 분리해서 보여줍니다. 제출 기준은 hybrid입니다.</p>
+          </div>
+          <span class="status-badge {_state_tone('completed' if hybrid.get('available') else 'warning')}">{_text(summary.get('recommended_name') or '-')}</span>
+        </div>
+        <div class="panel-body">
+          <div class="key-metric-grid">
+            <div><span>판단 기준</span><strong>{_text(summary.get('recommended_name') or '-')}</strong></div>
+            <div><span>최종 accuracy</span><strong>{_float_text(summary.get('recommended_accuracy'))}</strong></div>
+            <div><span>최종 macro F1</span><strong>{_float_text(summary.get('recommended_macro_f1'))}</strong></div>
+            <div><span>support F1</span><strong>{_float_text(summary.get('recommended_macro_f1_supported'))}</strong></div>
+            <div><span>hybrid 구성</span><strong>{hybrid_detail}</strong></div>
+          </div>
+          {_render_table(["model", "val acc", "val F1", "support F1", "balanced", "test acc", "test F1", "test support F1", "source"], rows, "아직 최종 모델 성능 파일이 없습니다.", compact=True)}
+          {_render_final_model_visuals(summary)}
+          <p class="muted-block">{_text(summary.get('note') or '')}</p>
+        </div>
+      </section>
+    """
+
+
+def _render_task_performance_panel(summary: dict | None) -> str:
+    summary = summary if isinstance(summary, dict) else {}
+    detection = summary.get("detection") if isinstance(summary.get("detection"), dict) else {}
+    classification = summary.get("classification") if isinstance(summary.get("classification"), dict) else {}
+    pose_classification = (
+        summary.get("pose_classification") if isinstance(summary.get("pose_classification"), dict) else {}
+    )
+    derived = summary.get("derived_from_final_model") if isinstance(summary.get("derived_from_final_model"), dict) else {}
+    derived_test = derived.get("holdout_test") if isinstance(derived.get("holdout_test"), dict) else {}
+    derived_val = derived.get("validation") if isinstance(derived.get("validation"), dict) else {}
+    detection_best = _task_metric_source(detection, derived_test.get("detection") or derived_val.get("detection") or {})
+    classification_best = _task_metric_source(
+        classification,
+        derived_test.get("classification") or derived_val.get("classification") or {},
+    )
+    pose_classification_best = _task_metric_source(pose_classification, {})
+    rows = [
+        _task_performance_row("Detection", detection, detection_best, ("accuracy", "precision", "recall", "f1")),
+        _task_performance_row("RGB/I3D classification", classification, classification_best, ("macro_precision", "macro_recall", "macro_f1", "weighted_f1")),
+        _task_performance_row("Pose classification", pose_classification, pose_classification_best, ("macro_precision", "macro_recall", "macro_f1", "weighted_f1")),
+    ]
+    detection_bars = [
+        ("accuracy", _ratio_int(detection_best.get("accuracy"))),
+        ("abnormal recall", _ratio_int(detection_best.get("recall"))),
+        ("abnormal F1", _ratio_int(detection_best.get("f1"))),
+        ("false alarm", _ratio_int(detection_best.get("false_alarm_rate"))),
+        ("miss rate", _ratio_int(detection_best.get("miss_rate"))),
+    ]
+    classification_bars = [
+        ("macro precision", _ratio_int(classification_best.get("macro_precision"))),
+        ("macro recall", _ratio_int(classification_best.get("macro_recall"))),
+        ("macro F1", _ratio_int(classification_best.get("macro_f1"))),
+        ("weighted F1", _ratio_int(classification_best.get("weighted_f1"))),
+    ]
+    pose_classification_bars = [
+        ("macro precision", _ratio_int(pose_classification_best.get("macro_precision"))),
+        ("macro recall", _ratio_int(pose_classification_best.get("macro_recall"))),
+        ("macro F1", _ratio_int(pose_classification_best.get("macro_f1"))),
+        ("weighted F1", _ratio_int(pose_classification_best.get("weighted_f1"))),
+    ]
+    pose_confusion_html = _render_task_confusion_matrix(pose_classification, title="Pose 4-class confusion matrix")
+    return f"""
+      <section class="panel" id="task-performance-summary">
+        <div class="panel-head">
+          <div>
+            <h2>Detection / Classification</h2>
+            <p>Shows normal-vs-abnormal detection and abnormal 4-class classification separately.</p>
+          </div>
+          <span class="status-badge {_state_tone('completed' if detection_best or classification_best or pose_classification_best else 'warning')}">two-stage</span>
+        </div>
+        <div class="panel-body">
+          <div class="key-metric-grid">
+            <div><span>Detection abnormal recall</span><strong>{_float_text(detection_best.get('recall'))}</strong></div>
+            <div><span>Detection abnormal F1</span><strong>{_float_text(detection_best.get('f1'))}</strong></div>
+            <div><span>False alarm rate</span><strong>{_float_text(detection_best.get('false_alarm_rate'))}</strong></div>
+            <div><span>Miss rate</span><strong>{_float_text(detection_best.get('miss_rate'))}</strong></div>
+            <div><span>RGB/I3D macro F1</span><strong>{_float_text(classification_best.get('macro_f1'))}</strong></div>
+            <div><span>Pose macro F1</span><strong>{_float_text(pose_classification_best.get('macro_f1'))}</strong></div>
+          </div>
+          {_render_table(["task", "model/source", "samples", "metric A", "metric B", "metric C", "metric D"], rows, "No dedicated detection/classification metrics yet.", compact=True)}
+          <div class="content-row">
+            {_render_ratio_bar_chart("Detection metrics", "Checks missed abnormal clips and normal false alarms.", [(label, value) for label, value in detection_bars if value is not None])}
+            {_render_ratio_bar_chart("RGB/I3D classification", "Classifies the 4 abnormal action types after detection.", [(label, value) for label, value in classification_bars if value is not None])}
+            {_render_ratio_bar_chart("Pose classification", "Classifies only pose-ready abnormal clips, excluding normal.", [(label, value) for label, value in pose_classification_bars if value is not None])}
+          </div>
+          {pose_confusion_html}
+          <p class="muted-block">{_text(summary.get('note') or '')}</p>
+        </div>
+      </section>
+    """
+
+
+def _task_metric_source(task_entry: dict, fallback: dict) -> dict:
+    if task_entry.get("available"):
+        holdout = task_entry.get("holdout_test") if isinstance(task_entry.get("holdout_test"), dict) else {}
+        validation = task_entry.get("validation") if isinstance(task_entry.get("validation"), dict) else {}
+        source = holdout or validation
+        if task_entry.get("task") == "detection" and isinstance(source.get("detection"), dict):
+            return source.get("detection") or {}
+        if task_entry.get("task") in {"classification", "pose_classification"} and isinstance(source.get("classification"), dict):
+            return source.get("classification") or {}
+        return source
+    return fallback if isinstance(fallback, dict) else {}
+
+def _task_performance_row(title: str, task_entry: dict, metrics: dict, keys: tuple[str, str, str, str]) -> list[str]:
+    model = task_entry.get("model") if task_entry.get("available") else "final model derived"
+    threshold = _coerce_float(task_entry.get("threshold"))
+    if threshold is not None:
+        model = f"{model} @ {_float_text(threshold, digits=3)}"
+    samples = "-"
+    if task_entry.get("available"):
+        samples = f"{_int_text(task_entry.get('train_samples'))}/{_int_text(task_entry.get('val_samples'))}/{_int_text(task_entry.get('test_samples'))}"
+    return [
+        title,
+        _text(model or "-"),
+        samples,
+        _float_text(metrics.get(keys[0])),
+        _float_text(metrics.get(keys[1])),
+        _float_text(metrics.get(keys[2])),
+        _float_text(metrics.get(keys[3])),
+    ]
+
+
+def _render_task_confusion_matrix(task_entry: dict, *, title: str) -> str:
+    if not isinstance(task_entry, dict) or not task_entry.get("available"):
+        return ""
+    labels = [str(label) for label in task_entry.get("labels", []) if str(label)]
+    source = task_entry.get("holdout_test") if isinstance(task_entry.get("holdout_test"), dict) else {}
+    if not source:
+        source = task_entry.get("validation") if isinstance(task_entry.get("validation"), dict) else {}
+    confusion = source.get("confusion_matrix") if isinstance(source, dict) else None
+    if not labels or not isinstance(confusion, list) or not confusion:
+        return ""
+    return (
+        "<div class=\"task-confusion-block\">"
+        f"<h3>{_text(title)}</h3>"
+        "<p class=\"muted-block\">This matrix is built from the dedicated task labels only, so normal is intentionally excluded.</p>"
+        f"{_render_confusion_matrix(labels, confusion)}"
+        "</div>"
+    )
+
+
+def _render_abnormal_confusion_matrix(labels: list[str], confusion: list[list[int]] | None) -> str:
+    filtered_labels, filtered_confusion = _drop_confusion_label(labels, confusion, label_to_drop="normal")
+    if filtered_labels and filtered_confusion:
+        return _render_confusion_matrix(
+            filtered_labels,
+            filtered_confusion,
+            title="Abnormal 4-class confusion matrix",
+            subtitle="Normal is hidden here. Use detection metrics above for normal-vs-abnormal performance.",
+        )
+    return _render_confusion_matrix(labels, confusion)
+
+
+def _drop_confusion_label(
+    labels: list[str],
+    confusion: list[list[int]] | None,
+    *,
+    label_to_drop: str,
+) -> tuple[list[str], list[list[int]] | None]:
+    if not isinstance(labels, list) or not isinstance(confusion, list) or not confusion:
+        return labels, confusion
+    normalized_labels = [str(label) for label in labels]
+    try:
+        drop_index = normalized_labels.index(label_to_drop)
+    except ValueError:
+        return labels, confusion
+    keep_indices = [index for index in range(len(normalized_labels)) if index != drop_index]
+    if not keep_indices:
+        return labels, confusion
+    filtered_confusion: list[list[int]] = []
+    for row_index in keep_indices:
+        raw_row = confusion[row_index] if row_index < len(confusion) and isinstance(confusion[row_index], list) else []
+        filtered_row = []
+        for col_index in keep_indices:
+            try:
+                filtered_row.append(int(raw_row[col_index] if col_index < len(raw_row) else 0))
+            except (TypeError, ValueError):
+                filtered_row.append(0)
+        filtered_confusion.append(filtered_row)
+    return [normalized_labels[index] for index in keep_indices], filtered_confusion
+
+
+def _ratio_int(value) -> int | None:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return None
+    return int(round(max(0.0, min(1.0, coerced)) * 1000))
+
+
+def _final_model_row(entry: dict) -> list[str]:
+    entry = entry or {}
+    if not entry.get("available"):
+        return [_text(entry.get("name") or "-"), "-", "-", "-", "-", "-", "-", "-", "없음"]
+    return [
+        _text(entry.get("name") or "-"),
+        _float_text(entry.get("accuracy")),
+        _float_text(entry.get("macro_f1")),
+        _float_text(entry.get("macro_f1_supported")),
+        _float_text(entry.get("balanced_accuracy")),
+        _float_text(entry.get("test_accuracy")),
+        _float_text(entry.get("test_macro_f1")),
+        _float_text(entry.get("test_macro_f1_supported")),
+        _text(entry.get("source_path") or "-"),
+    ]
+
+
+def _render_final_model_visuals(summary: dict) -> str:
+    summary = summary or {}
+    entries = [
+        summary.get("pose") if isinstance(summary.get("pose"), dict) else {},
+        summary.get("ensemble") if isinstance(summary.get("ensemble"), dict) else {},
+        summary.get("hybrid") if isinstance(summary.get("hybrid"), dict) else {},
+    ]
+    metric_entries: list[tuple[str, int]] = []
+    f1_entries: list[tuple[str, int]] = []
+    for entry in entries:
+        if not entry.get("available"):
+            continue
+        name = str(entry.get("name") or "-")
+        accuracy = _coerce_float(entry.get("test_accuracy") if entry.get("test_accuracy") is not None else entry.get("accuracy"))
+        macro_f1 = _coerce_float(entry.get("test_macro_f1") if entry.get("test_macro_f1") is not None else entry.get("macro_f1"))
+        supported_f1 = _coerce_float(
+            entry.get("test_macro_f1_supported")
+            if entry.get("test_macro_f1_supported") is not None
+            else entry.get("macro_f1_supported")
+        )
+        if accuracy is not None:
+            metric_entries.append((name, int(round(max(0.0, min(1.0, accuracy)) * 1000))))
+        if macro_f1 is not None:
+            f1_entries.append((name, int(round(max(0.0, min(1.0, macro_f1)) * 1000))))
+        if supported_f1 is not None:
+            f1_entries.append((f"{name} support", int(round(max(0.0, min(1.0, supported_f1)) * 1000))))
+    hybrid = summary.get("hybrid") if isinstance(summary.get("hybrid"), dict) else {}
+    weight_entries: list[tuple[str, int]] = []
+    if hybrid.get("available"):
+        feature_weight = _coerce_float(hybrid.get("feature_weight"))
+        neural_weight = _coerce_float(hybrid.get("neural_weight"))
+        if feature_weight is not None:
+            weight_entries.append(("RGB/I3D", int(round(max(0.0, min(1.0, feature_weight)) * 1000))))
+        if neural_weight is not None:
+            weight_entries.append(("Pose", int(round(max(0.0, min(1.0, neural_weight)) * 1000))))
+    if not metric_entries and not f1_entries and not weight_entries:
+        return ""
+    return (
+        "<div class=\"content-row\">"
+        + _render_ratio_bar_chart("모델별 accuracy", "값은 0.000~1.000 기준입니다.", metric_entries)
+        + _render_ratio_bar_chart("모델별 macro F1", "값은 0.000~1.000 기준입니다.", f1_entries)
+        + _render_ratio_bar_chart("Hybrid 비중", "RGB/I3D feature와 pose neural 확률이 섞인 비율입니다.", weight_entries)
+        + "</div>"
+    )
+
+
+def _render_ratio_bar_chart(title: str, subtitle: str, entries: list[tuple[str, int]]) -> str:
+    if not entries:
+        return (
+            "<div class=\"mini-panel\">"
+            f"<h3>{_text(title)}</h3>"
+            f"<p class=\"muted-block\">{_text(subtitle)}</p>"
+            "<div class=\"chart-empty\">표시할 값이 없습니다.</div>"
+            "</div>"
+        )
+    rows = []
+    max_value = 1000
+    for label, value in entries:
+        safe_value = max(0, min(int(value), 1000))
+        width = safe_value / max_value * 100.0
+        rows.append(
+            "<div class=\"bar-row\">"
+            "<div class=\"bar-meta\">"
+            f"<span>{_text(label)}</span>"
+            f"<strong>{safe_value / 1000:.3f}</strong>"
+            "</div>"
+            "<div class=\"bar-track\">"
+            f"<div class=\"bar-fill\" style=\"width:{width:.2f}%\"></div>"
+            "</div>"
+            "</div>"
+        )
+    return (
+        "<div class=\"mini-panel\">"
+        f"<h3>{_text(title)}</h3>"
+        f"<p class=\"muted-block\">{_text(subtitle)}</p>"
+        "<div class=\"bar-chart\">"
+        + "".join(rows)
+        + "</div></div>"
+    )
+
+
 def _render_main_live_sections(
     *,
     summary_cards: str,
     insights: dict,
+    final_model_summary: dict,
+    task_performance_summary: dict,
+    guideline_quality: dict,
     performance_chart_html: str,
     loss_chart_html: str,
+    learning_rate_chart_html: str,
+    loss_gap_chart_html: str,
     distribution_chart_html: str,
     progress: dict,
     latest: dict,
@@ -628,6 +1144,7 @@ def _render_main_live_sections(
     prepared_pose_rows: list[dict[str, str]],
     history_rows: list[dict[str, str]],
     per_class_rows: list[dict[str, str]],
+    per_class_metric_chart_html: str,
     confusion_matrix_html: str,
     recent_job_rows: list[dict[str, str]],
     issue_rows: list[dict[str, str]],
@@ -640,11 +1157,19 @@ def _render_main_live_sections(
             {summary_cards}
           </section>
 
+          {_render_final_model_summary_panel(final_model_summary)}
+
+          {_render_task_performance_panel(task_performance_summary)}
+
+          {_render_guideline_quality_panel(guideline_quality)}
+
           {_render_insights_panel(insights)}
 
           <section class="chart-grid" id="training-charts">
             {performance_chart_html}
             {loss_chart_html}
+            {learning_rate_chart_html}
+            {loss_gap_chart_html}
             {distribution_chart_html}
           </section>
 
@@ -680,9 +1205,9 @@ def _render_main_live_sections(
 
           <section class="content-row" id="dataset">
             <article class="panel">
-              <div class="panel-head"><div><h2>누적 데이터셋</h2><p>cumulative manifests 기준입니다.</p></div></div>
+              <div class="panel-head"><div><h2>데이터셋 분포</h2><p>pose, guideline/RGB, active 기준을 분리해서 보여줍니다.</p></div></div>
               <div class="panel-body">
-                {_render_table(["split", "total", "labels"], dataset_rows, "누적 데이터셋이 없습니다.")}
+                {_render_table(["source", "split", "total", "labels"], dataset_rows, "데이터셋 분포가 없습니다.")}
               </div>
             </article>
             <article class="panel">
@@ -711,6 +1236,7 @@ def _render_main_live_sections(
             <article class="panel panel-span-full">
               <div class="panel-head"><div><h2>클래스별 지표</h2><p>최종 검증 결과를 클래스별로 바로 읽을 수 있게 정리했습니다.</p></div></div>
               <div class="panel-body">
+                {per_class_metric_chart_html}
                 {_render_table(["label", "precision", "recall", "f1", "support"], per_class_rows, "클래스별 지표가 없습니다.")}
               </div>
             </article>
@@ -741,19 +1267,30 @@ def _render_main_live_sections(
 
 def _render_logs(logs: dict) -> str:
     sections = []
-    for key, title, opened in (
+    predownload_payload = logs.get("predownload") or {}
+    log_sections = [
         ("current", "현재 로그", True),
+        ("predownload", "병렬 다운로드 로그", bool(predownload_payload.get("running_count"))),
         ("latest_completed", "최근 완료 로그", False),
         ("latest_error", "최근 오류 로그", False),
-    ):
+    ]
+    for key, title, opened in log_sections:
         payload = logs.get(key) or {}
         body = _text(payload.get("tail"), "표시할 로그가 없습니다.")
         open_attr = " open" if opened else ""
+        if key == "predownload":
+            meta = (
+                f"running {_int_text(payload.get('running_count'))}/{_int_text(payload.get('max_parallel'))} "
+                f"/ completed {_int_text(payload.get('completed_count'))} "
+                f"/ failed {_int_text(payload.get('failed_count'))}"
+            )
+        else:
+            meta = f"filekey {_text(payload.get('filekey'))} / datasetkey {_text(payload.get('datasetkey'))}"
         sections.append(
             f"<details class=\"log-card\" data-log-key=\"{_text(key)}\"{open_attr}>"
             f"<summary>{_text(title)}</summary>"
             "<div class=\"detail-body\">"
-            f"<div class=\"muted-block\">filekey {_text(payload.get('filekey'))} / datasetkey {_text(payload.get('datasetkey'))}</div>"
+            f"<div class=\"muted-block\">{meta}</div>"
             f"<pre class=\"log-box\">{body}</pre>"
             "</div>"
             "</details>"
@@ -1630,6 +2167,13 @@ def _render_live_refresh_script() -> str:
     }
     setFormPending(form, true);
     try {
+      form.querySelectorAll('input[type="hidden"][data-copy-from]').forEach(function (input) {
+        var selector = input.getAttribute('data-copy-from');
+        var source = selector ? document.querySelector(selector) : null;
+        if (source && 'value' in source) {
+          input.value = source.value || '';
+        }
+      });
       var formData = new FormData(form);
       var encodedBody = new URLSearchParams();
       formData.forEach(function (value, key) {
@@ -1722,17 +2266,48 @@ def _coerce_float(value) -> float | None:
         return None
 
 
-def _build_dataset_rows(dataset_summary: dict) -> list[list[str]]:
+def _build_dataset_rows(dataset_summary: dict, *, source: str = "cumulative") -> list[list[str]]:
     rows: list[list[str]] = []
     for key in SPLIT_SEQUENCE:
         info = dataset_summary.get(key) or {}
         rows.append(
             [
-                _split_label(key),
+                (
+                    f"<strong>{_split_label(key)}</strong>"
+                    f"<span class=\"table-source\">{_text(_split_source_label(key, source))}</span>"
+                ),
                 _int_text(info.get("total"), "0"),
                 _text(_join_label_counts(info), "-"),
             ]
         )
+    return rows
+
+
+def _build_distribution_source_rows(distribution_sources: dict) -> list[list[str]]:
+    rows: list[list[str]] = []
+    source_specs = (
+        ("cumulative", "누적 원본/Pose", SPLIT_SEQUENCE),
+        ("guideline", "Guideline/RGB clip", ("prepared_train", "prepared_val", "prepared_test")),
+        ("active", "학습 active", ("prepared_train", "prepared_val", "prepared_test")),
+        ("current", "현재 작업", SPLIT_SEQUENCE),
+    )
+    for source_key, source_label, split_keys in source_specs:
+        source_summary = distribution_sources.get(source_key) or {}
+        if not isinstance(source_summary, dict):
+            continue
+        for split_key in split_keys:
+            info = source_summary.get(split_key) or {}
+            total = int(info.get("total", 0) or 0)
+            if total <= 0:
+                continue
+            rows.append(
+                [
+                    _text(source_label),
+                    _text(_split_label(split_key)),
+                    _int_text(total, "0"),
+                    _text(_join_label_counts(info), "-"),
+                ]
+            )
     return rows
 
 
@@ -1760,6 +2335,8 @@ def _build_history_bundle(progress: dict, metrics: dict) -> dict:
     val_f1_values: list[float | None] = []
     train_loss_values: list[float | None] = []
     val_loss_values: list[float | None] = []
+    learning_rate_values: list[float | None] = []
+    loss_gap_values: list[float | None] = []
 
     normalized_rows: list[dict] = []
     for row in list(source_rows)[-20:]:
@@ -1771,12 +2348,16 @@ def _build_history_bundle(progress: dict, metrics: dict) -> dict:
         val_loss = _coerce_float(row.get("val_loss"))
         val_accuracy = _coerce_float(row.get("val_accuracy"))
         val_macro_f1 = _coerce_float(row.get("val_macro_f1"))
+        learning_rate = _coerce_float(row.get("learning_rate"))
+        loss_gap = (val_loss - train_loss) if val_loss is not None and train_loss is not None else None
 
         epoch_labels.append(epoch_label)
         train_loss_values.append(train_loss)
         val_loss_values.append(val_loss)
         val_accuracy_values.append(val_accuracy)
         val_f1_values.append(val_macro_f1)
+        learning_rate_values.append(learning_rate)
+        loss_gap_values.append(loss_gap)
         history_rows.append(
             [
                 epoch_label,
@@ -1796,6 +2377,8 @@ def _build_history_bundle(progress: dict, metrics: dict) -> dict:
         "val_loss_values": val_loss_values,
         "val_accuracy_values": val_accuracy_values,
         "val_f1_values": val_f1_values,
+        "learning_rate_values": learning_rate_values,
+        "loss_gap_values": loss_gap_values,
     }
 
 
@@ -1825,6 +2408,38 @@ def _build_per_class_rows(final_validation: dict, labels: list[str], support_map
             ]
         )
     return rows
+
+
+def _render_per_class_metric_chart(final_validation: dict, labels: list[str], support_map: dict[int, int]) -> str:
+    entries = []
+    for index, row in enumerate(final_validation.get("per_class") or []):
+        if not isinstance(row, dict):
+            continue
+        class_index = int(row.get("class_index", index) or index)
+        label = labels[class_index] if 0 <= class_index < len(labels) else row.get("label") or class_index
+        f1 = _coerce_float(row.get("f1")) or 0.0
+        recall = _coerce_float(row.get("recall")) or 0.0
+        precision = _coerce_float(row.get("precision")) or 0.0
+        support = int(support_map.get(class_index, 0) or row.get("support") or 0)
+        entries.append((str(label), precision, recall, f1, support))
+    if not entries:
+        return "<div class=\"chart-empty\">클래스별 그래프가 아직 없습니다.</div>"
+    rows = []
+    for label, precision, recall, f1, support in entries:
+        width = max(0.0, min(float(f1), 1.0)) * 100
+        rows.append(
+            "<div class=\"class-bar-row\">"
+            f"<div class=\"class-bar-label\">{_text(label)}</div>"
+            "<div class=\"class-bar-stack\">"
+            f"<div class=\"class-bar-track\"><div class=\"class-bar-fill\" style=\"width:{width:.2f}%;background:linear-gradient(90deg,#22c55e,#2563eb);\"></div></div>"
+            "<div class=\"class-bar-values\">"
+            f"<span><strong>F1</strong> {f1:.3f}</span>"
+            f"<span><strong>Recall</strong> {recall:.3f}</span>"
+            f"<span><strong>Precision</strong> {precision:.3f}</span>"
+            f"<span><strong>Support</strong> {support}</span>"
+            "</div></div></div>"
+        )
+    return "<div class=\"class-bars\">" + "".join(rows) + "</div>"
 
 
 def _build_recent_job_rows(completed_jobs: list[dict], limit: int = 20) -> list[list[str]]:
@@ -2061,7 +2676,13 @@ def _render_distribution_chart(title: str, subtitle: str, entries: list[tuple[st
     )
 
 
-def _render_confusion_matrix(labels: list[str], confusion: list[list[int]] | None) -> str:
+def _render_confusion_matrix(
+    labels: list[str],
+    confusion: list[list[int]] | None,
+    *,
+    title: str = "Confusion matrix",
+    subtitle: str = "Rows are actual labels and columns are predictions.",
+) -> str:
     if not isinstance(confusion, list) or not confusion:
         return (
             "<article class=\"panel chart-panel chart-panel-span\">"
@@ -2759,6 +3380,11 @@ def _styles() -> str:
     .action-grid form {
       margin: 0;
     }
+    .primary-action-grid > .primary-button,
+    .compact-action-form .secondary-button {
+      width: 100%;
+      height: 100%;
+    }
     .secondary-button {
       width: 100%;
       padding: 11px 12px;
@@ -3214,6 +3840,49 @@ def _styles() -> str:
       text-align: center;
       font-weight: 700;
     }
+    .class-bars {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .class-bar-row {
+      display: grid;
+      grid-template-columns: minmax(92px, 0.22fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+    .class-bar-label {
+      color: var(--ink);
+      font-size: 12.5px;
+      font-weight: 800;
+      word-break: break-word;
+    }
+    .class-bar-stack {
+      display: grid;
+      gap: 5px;
+    }
+    .class-bar-track {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(226,232,240,0.92);
+    }
+    .class-bar-fill {
+      height: 100%;
+      border-radius: inherit;
+    }
+    .class-bar-values {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      color: #64748b;
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .class-bar-values strong {
+      color: var(--ink);
+      font-weight: 800;
+    }
     .bar-chart {
       display: grid;
       gap: 12px;
@@ -3482,6 +4151,14 @@ def _styles() -> str:
     }
     .data-table tbody tr:last-child td {
       border-bottom: none;
+    }
+    .table-source {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 3px;
+      font-weight: 600;
     }
     .data-table-compact {
       min-width: 0;
@@ -3761,23 +4438,31 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
     completed_jobs = launcher.get("completed_jobs") or []
 
-    raw_total = int(((dataset.get("raw") or {}).get("total") or 0))
-    prepared_total = sum(
-        int(((dataset.get(key) or {}).get("total") or 0))
-        for key in ("prepared_train", "prepared_val", "prepared_test")
+    raw_total, prepared_total = _display_dataset_totals(
+        dataset,
+        current_dataset,
+        overview.get("guideline_quality") or {},
     )
     updated_at = progress.get("updated_at") or pipeline.get("updated_at") or "-"
     latest = progress.get("latest") or {}
     latest_loss = _float_text(latest.get("val_loss"))
-    dataset_rows = _build_dataset_rows(dataset)
-    current_dataset_rows = _build_dataset_rows(current_dataset)
+    distribution_sources = overview.get("distribution_sources") or {}
+    dataset_rows = (
+        _build_distribution_source_rows(distribution_sources)
+        if distribution_sources
+        else [
+            [_text("데이터셋"), *row]
+            for row in _build_dataset_rows(dataset, source="cumulative")
+        ]
+    )
+    current_dataset_rows = _build_dataset_rows(current_dataset, source="current")
     prepared_pose_rows = _build_prepared_pose_rows(prepared_pose_items)
     history_bundle = _build_history_bundle(progress, metrics)
     history_rows = history_bundle["rows"]
     confusion = final_validation.get("confusion_matrix") or []
     support_map = _build_support_map(confusion if isinstance(confusion, list) else None)
     per_class_rows = _build_per_class_rows(final_validation, labels, support_map)
-    confusion_matrix_html = _render_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
+    confusion_matrix_html = _render_abnormal_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
     recent_job_rows = _build_recent_job_rows(completed_jobs)
     issue_rows = _build_issue_rows(skip_report.get("issues") or [])
     train_distribution = progress.get("train_distribution") or metrics.get("train_distribution") or {}
@@ -3787,6 +4472,8 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
     val_f1_values = history_bundle["val_f1_values"]
     train_loss_values = history_bundle["train_loss_values"]
     val_loss_values = history_bundle["val_loss_values"]
+    learning_rate_values = history_bundle["learning_rate_values"]
+    loss_gap_values = history_bundle["loss_gap_values"]
     distribution_entries = _build_distribution_entries(dataset, labels)
     performance_chart_html = _render_line_chart(
         "성능 추이",
@@ -3808,6 +4495,20 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
             ("학습 손실", "#2563eb", train_loss_values),
             ("검증 손실", "#f97316", val_loss_values),
         ],
+        decimals=4,
+    )
+    learning_rate_chart_html = _render_line_chart(
+        "Learning Rate",
+        "epoch별 learning rate 변화입니다.",
+        epoch_labels,
+        [("learning rate", "#7c3aed", learning_rate_values)],
+        decimals=6,
+    )
+    loss_gap_chart_html = _render_line_chart(
+        "Loss Gap",
+        "validation loss - train loss 추이입니다.",
+        epoch_labels,
+        [("val - train", "#f97316", loss_gap_values)],
         decimals=4,
     )
     distribution_chart_html = _render_distribution_chart(
@@ -3856,8 +4557,13 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
         "main_live_sections": _render_main_live_sections(
             summary_cards=_render_summary_cards(summary_cards),
             insights=insights,
+            final_model_summary=overview.get("final_model_summary") or {},
+            task_performance_summary=overview.get("task_performance_summary") or {},
+            guideline_quality=overview.get("guideline_quality") or {},
             performance_chart_html=performance_chart_html,
             loss_chart_html=loss_chart_html,
+            learning_rate_chart_html=learning_rate_chart_html,
+            loss_gap_chart_html=loss_gap_chart_html,
             distribution_chart_html=distribution_chart_html,
             progress=progress,
             latest=latest,
@@ -3872,6 +4578,7 @@ def render_dashboard_live_fragments(overview: dict) -> dict[str, str]:
             prepared_pose_rows=prepared_pose_rows,
             history_rows=history_rows,
             per_class_rows=per_class_rows,
+            per_class_metric_chart_html=_render_per_class_metric_chart(final_validation, labels, support_map),
             confusion_matrix_html=confusion_matrix_html,
             recent_job_rows=recent_job_rows,
             issue_rows=issue_rows,
@@ -3909,6 +4616,7 @@ def render_dashboard_page(
     gpu = overview.get("gpu") or {}
     dataset = overview.get("dataset") or {}
     current_dataset = overview.get("current_dataset") or {}
+    guideline_quality = overview.get("guideline_quality") or {}
     prepared_pose_items = overview.get("prepared_pose_items") or []
     diagnostics = overview.get("diagnostics") or {}
     logs = overview.get("logs") or {}
@@ -3921,11 +4629,7 @@ def render_dashboard_page(
     final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
     completed_jobs = launcher.get("completed_jobs") or []
 
-    raw_total = int(((dataset.get("raw") or {}).get("total") or 0))
-    prepared_total = sum(
-        int(((dataset.get(key) or {}).get("total") or 0))
-        for key in ("prepared_train", "prepared_val", "prepared_test")
-    )
+    raw_total, prepared_total = _display_dataset_totals(dataset, current_dataset, guideline_quality)
     latest = progress.get("latest") or {}
     updated_at = progress.get("updated_at") or pipeline.get("updated_at") or "-"
     latest_loss = _float_text(latest.get("val_loss"))
@@ -3962,8 +4666,16 @@ def render_dashboard_page(
         continual_state=continual_state,
         element_id="hero-kpis",
     )
-    dataset_rows = _build_dataset_rows(dataset)
-    current_dataset_rows = _build_dataset_rows(current_dataset)
+    distribution_sources = overview.get("distribution_sources") or {}
+    dataset_rows = (
+        _build_distribution_source_rows(distribution_sources)
+        if distribution_sources
+        else [
+            [_text("데이터셋"), *row]
+            for row in _build_dataset_rows(dataset, source="cumulative")
+        ]
+    )
+    current_dataset_rows = _build_dataset_rows(current_dataset, source="current")
     prepared_pose_rows = _build_prepared_pose_rows(prepared_pose_items)
 
     history_bundle = _build_history_bundle(progress, metrics)
@@ -3972,7 +4684,7 @@ def render_dashboard_page(
     confusion = final_validation.get("confusion_matrix") or []
     support_map = _build_support_map(confusion if isinstance(confusion, list) else None)
     per_class_rows = _build_per_class_rows(final_validation, labels, support_map)
-    confusion_matrix_html = _render_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
+    confusion_matrix_html = _render_abnormal_confusion_matrix(labels, confusion if isinstance(confusion, list) else None)
 
     recent_job_rows = _build_recent_job_rows(completed_jobs)
     issue_rows = _build_issue_rows(skip_report.get("issues") or [])
@@ -3985,6 +4697,8 @@ def render_dashboard_page(
     val_f1_values = history_bundle["val_f1_values"]
     train_loss_values = history_bundle["train_loss_values"]
     val_loss_values = history_bundle["val_loss_values"]
+    learning_rate_values = history_bundle["learning_rate_values"]
+    loss_gap_values = history_bundle["loss_gap_values"]
 
     distribution_entries = _build_distribution_entries(dataset, labels)
 
@@ -4010,6 +4724,20 @@ def render_dashboard_page(
         ],
         decimals=4,
     )
+    learning_rate_chart_html = _render_line_chart(
+        "Learning Rate",
+        "epoch별 learning rate 변화입니다.",
+        epoch_labels,
+        [("learning rate", "#7c3aed", learning_rate_values)],
+        decimals=6,
+    )
+    loss_gap_chart_html = _render_line_chart(
+        "Loss Gap",
+        "validation loss - train loss 추이입니다.",
+        epoch_labels,
+        [("val - train", "#f97316", loss_gap_values)],
+        decimals=4,
+    )
     distribution_chart_html = _render_distribution_chart(
         "학습 데이터 분포",
         "전처리된 학습 세트 기준 클래스별 샘플 수입니다.",
@@ -4018,8 +4746,13 @@ def render_dashboard_page(
     main_live_sections_html = _render_main_live_sections(
         summary_cards=summary_cards,
         insights=insights,
+        final_model_summary=overview.get("final_model_summary") or {},
+        task_performance_summary=overview.get("task_performance_summary") or {},
+        guideline_quality=guideline_quality,
         performance_chart_html=performance_chart_html,
         loss_chart_html=loss_chart_html,
+        learning_rate_chart_html=learning_rate_chart_html,
+        loss_gap_chart_html=loss_gap_chart_html,
         distribution_chart_html=distribution_chart_html,
         progress=progress,
         latest=latest,
@@ -4034,6 +4767,7 @@ def render_dashboard_page(
         prepared_pose_rows=prepared_pose_rows,
         history_rows=history_rows,
         per_class_rows=per_class_rows,
+        per_class_metric_chart_html=_render_per_class_metric_chart(final_validation, labels, support_map),
         confusion_matrix_html=confusion_matrix_html,
         recent_job_rows=recent_job_rows,
         issue_rows=issue_rows,
@@ -4084,7 +4818,7 @@ def render_dashboard_page(
 
       <div class="layout">
         <aside class="sidebar">
-          {_render_actions_panel(default_datasetkey, controls_enabled, controls_notice)}
+          {_render_actions_panel(default_datasetkey, controls_enabled, controls_notice, launcher.get("notification_settings") or {})}
           {_render_queue_panel(launcher, current_job_progress, queue_progress, element_id="queue-panel")}
           {_render_system_panel(overview, config_path, artifacts, gpu, progress, queue_progress, element_id="system-panel")}
         </aside>

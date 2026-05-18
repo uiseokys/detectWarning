@@ -7,155 +7,78 @@
   <style>
     :root {
       --bg: #07111d;
-      --bg-deep: #0b1627;
-      --text: #0f172a;
-      --muted: #66758b;
-      --line: rgba(148, 163, 184, 0.18);
-      --card: rgba(255, 255, 255, 0.96);
-      --card-soft: rgba(247, 250, 252, 0.92);
-      --card-dark: rgba(10, 20, 36, 0.64);
-      --accent: #38bdf8;
-      --accent-strong: #2563eb;
-      --good: #10b981;
-      --warn: #f59e0b;
-      --danger: #ef4444;
-      --radius-xl: 26px;
-      --radius-lg: 22px;
-      --radius-md: 18px;
-      --radius-sm: 14px;
-      --shadow-shell: 0 28px 72px rgba(2, 8, 23, 0.32);
-      --shadow-card: 0 18px 42px rgba(15, 23, 42, 0.10);
+      --panel: rgba(255, 255, 255, 0.96);
+      --panel-soft: rgba(248, 250, 252, 0.92);
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: rgba(148, 163, 184, 0.24);
+      --blue: #2563eb;
+      --cyan: #0891b2;
+      --green: #059669;
+      --amber: #d97706;
+      --red: #dc2626;
+      --shadow: 0 24px 70px rgba(2, 8, 23, 0.30);
     }
 
-    * {
-      box-sizing: border-box;
-    }
-
-    html {
-      scroll-behavior: smooth;
-    }
-
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
     body {
       margin: 0;
       min-height: 100vh;
       color: #e2e8f0;
-      font-family: "SF Pro Display", "Pretendard", "Apple SD Gothic Neo", sans-serif;
+      font-family: "Pretendard", "Apple SD Gothic Neo", "Segoe UI", sans-serif;
       background:
-        radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 24%),
-        radial-gradient(circle at top right, rgba(37, 99, 235, 0.14), transparent 28%),
-        linear-gradient(180deg, #06101d 0%, #0a1322 45%, #0d1727 100%);
+        radial-gradient(circle at 12% 0%, rgba(8, 145, 178, 0.18), transparent 28%),
+        radial-gradient(circle at 88% 8%, rgba(37, 99, 235, 0.14), transparent 32%),
+        linear-gradient(180deg, #06101d 0%, #0b1627 48%, #0d1727 100%);
     }
+    a { color: inherit; text-decoration: none; }
 
-    a {
-      color: inherit;
-      text-decoration: none;
-    }
-
-    .page {
-      max-width: 1540px;
-      margin: 0 auto;
-      padding: 24px;
-    }
-
+    .page { max-width: 1540px; margin: 0 auto; padding: 24px; }
     .shell {
-      position: relative;
-      overflow: hidden;
-      border-radius: 34px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background:
-        radial-gradient(circle at top right, rgba(56, 189, 248, 0.10), transparent 32%),
-        linear-gradient(180deg, rgba(8, 16, 29, 0.94), rgba(10, 20, 36, 0.92));
-      box-shadow: var(--shadow-shell);
-      padding: 24px;
-    }
-
-    .shell::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background:
-        radial-gradient(circle at 12% 10%, rgba(255,255,255,0.05), transparent 18%),
-        linear-gradient(135deg, rgba(255,255,255,0.02), transparent 44%);
-      pointer-events: none;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 28px;
+      background: linear-gradient(180deg, rgba(8, 16, 29, 0.94), rgba(10, 20, 36, 0.92));
+      box-shadow: var(--shadow);
+      padding: 22px;
     }
 
     .topbar {
-      position: relative;
-      z-index: 1;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 18px;
       align-items: center;
-      margin-bottom: 18px;
-      padding: 20px 22px;
-      border-radius: 28px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background: linear-gradient(135deg, rgba(9, 18, 33, 0.88), rgba(15, 23, 42, 0.72));
-      backdrop-filter: blur(12px);
+      padding: 20px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 20px;
+      background: rgba(15, 23, 42, 0.76);
+      margin-bottom: 16px;
     }
-
-    .brand-kicker {
-      margin-bottom: 8px;
-      color: #7dd3fc;
+    .kicker {
+      margin-bottom: 7px;
+      color: #67e8f9;
       font-size: 11px;
       font-weight: 800;
-      letter-spacing: 0.12em;
+      letter-spacing: 0.08em;
       text-transform: uppercase;
     }
-
-    h1 {
-      margin: 0;
-      font-size: 34px;
-      line-height: 1;
-      letter-spacing: -0.05em;
-    }
-
-    .brand-copy {
-      margin-top: 8px;
-      color: rgba(226, 232, 240, 0.70);
-      font-size: 14px;
-    }
-
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-
-    .live-stack {
-      display: grid;
-      gap: 6px;
-      justify-items: end;
-      min-width: 220px;
-    }
-
-    .live-title {
-      font-size: 15px;
-      font-weight: 800;
-      color: #f8fafc;
-    }
-
-    .live-copy {
-      color: rgba(226, 232, 240, 0.68);
-      font-size: 12px;
-      line-height: 1.5;
-      text-align: right;
-    }
-
-    .status-pill {
+    h1 { margin: 0; font-size: 34px; line-height: 1.08; letter-spacing: 0; }
+    .subcopy { margin-top: 8px; color: rgba(226, 232, 240, 0.72); font-size: 14px; }
+    .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
+    .live-stack { display: grid; gap: 6px; justify-items: end; min-width: 230px; }
+    .live-title { font-size: 15px; font-weight: 800; }
+    .live-copy { max-width: 360px; color: rgba(226, 232, 240, 0.70); font-size: 12px; line-height: 1.45; text-align: right; }
+    .status-pill, .badge {
       display: inline-flex;
       align-items: center;
       gap: 8px;
       width: fit-content;
-      padding: 10px 14px;
+      padding: 8px 12px;
       border-radius: 999px;
       border: 1px solid transparent;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 800;
     }
-
     .status-pill::before {
       content: "";
       width: 8px;
@@ -163,443 +86,161 @@
       border-radius: 50%;
       background: currentColor;
     }
-
-    .tone-online {
-      color: var(--good);
-      background: rgba(16, 185, 129, 0.12);
-      border-color: rgba(16, 185, 129, 0.22);
-    }
-
-    .tone-offline {
-      color: #cbd5e1;
-      background: rgba(148, 163, 184, 0.12);
-      border-color: rgba(148, 163, 184, 0.20);
-    }
-
-    .tone-warning {
-      color: var(--warn);
-      background: rgba(245, 158, 11, 0.12);
-      border-color: rgba(245, 158, 11, 0.22);
-    }
-
+    .tone-online, .badge-good { color: var(--green); background: rgba(5, 150, 105, 0.12); border-color: rgba(5, 150, 105, 0.22); }
+    .tone-warning, .badge-warn { color: var(--amber); background: rgba(217, 119, 6, 0.12); border-color: rgba(217, 119, 6, 0.22); }
+    .tone-offline, .badge-neutral { color: #cbd5e1; background: rgba(148, 163, 184, 0.12); border-color: rgba(148, 163, 184, 0.20); }
+    .badge-danger { color: var(--red); background: rgba(220, 38, 38, 0.12); border-color: rgba(220, 38, 38, 0.22); }
     .button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
-      min-height: 44px;
-      padding: 0 16px;
-      border-radius: 14px;
-      border: 1px solid transparent;
-      font-size: 14px;
-      font-weight: 800;
-      transition: transform 0.16s ease, opacity 0.16s ease, background 0.16s ease;
-    }
-
-    .button:hover {
-      transform: translateY(-1px);
-    }
-
-    .button-primary {
-      color: #ffffff;
-      background: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%);
-      box-shadow: 0 16px 24px rgba(37, 99, 235, 0.24);
-    }
-
-    .button-secondary {
-      color: #dbeafe;
-      background: rgba(255,255,255,0.06);
-      border-color: rgba(148, 163, 184, 0.16);
-    }
-
-    .metrics {
-      position: relative;
-      z-index: 1;
-      display: grid;
-      grid-template-columns: 1.25fr repeat(4, minmax(0, 1fr));
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-
-    .card,
-    .panel {
-      border-radius: var(--radius-lg);
-      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(245,248,252,0.95));
-      border: 1px solid rgba(203, 213, 225, 0.70);
-      box-shadow: var(--shadow-card);
-      color: var(--text);
-    }
-
-    .card {
-      min-height: 138px;
-      padding: 20px;
-    }
-
-    .card-primary {
-      background:
-        radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 36%),
-        linear-gradient(180deg, rgba(255,255,255,0.99), rgba(244,248,252,0.96));
-    }
-
-    .label {
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-    }
-
-    .value {
-      margin-bottom: 8px;
-      font-size: 32px;
-      font-weight: 800;
-      letter-spacing: -0.05em;
-      line-height: 1.04;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .subvalue {
-      color: var(--muted);
+      min-height: 40px;
+      padding: 0 14px;
+      border-radius: 12px;
       font-size: 13px;
-      line-height: 1.65;
-    }
-
-    .section {
-      position: relative;
-      z-index: 1;
-      margin-bottom: 18px;
-    }
-
-    .section-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-
-    .section-title {
-      margin: 0;
-      font-size: 18px;
       font-weight: 800;
-      letter-spacing: -0.03em;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(255, 255, 255, 0.06);
     }
+    .button-primary { color: #fff; border-color: transparent; background: linear-gradient(135deg, #0891b2, #2563eb); }
 
-    .section-tag {
-      display: inline-flex;
-      align-items: center;
-      padding: 8px 12px;
+    .nav {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 0 0 16px;
+    }
+    .nav a {
+      padding: 9px 12px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.08);
+      color: rgba(226, 232, 240, 0.82);
+      background: rgba(255, 255, 255, 0.06);
       border: 1px solid rgba(148, 163, 184, 0.14);
-      color: #cbd5e1;
       font-size: 12px;
       font-weight: 800;
     }
 
-    .chart-grid {
+    .kpi-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
+      grid-template-columns: 1.35fr repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
     }
+    .card, .panel, .mini {
+      color: var(--ink);
+      background: var(--panel);
+      border: 1px solid rgba(226, 232, 240, 0.92);
+      border-radius: 8px;
+      box-shadow: 0 14px 32px rgba(15, 23, 42, 0.08);
+    }
+    .card { min-height: 126px; padding: 16px; display: grid; align-content: space-between; gap: 8px; }
+    .card-primary { color: #f8fafc; background: linear-gradient(135deg, rgba(8, 145, 178, 0.94), rgba(37, 99, 235, 0.92)); border-color: rgba(255,255,255,0.16); }
+    .label { color: var(--muted); font-size: 12px; font-weight: 800; }
+    .card-primary .label { color: rgba(240, 249, 255, 0.72); }
+    .value { font-size: 26px; font-weight: 900; line-height: 1.05; word-break: keep-all; }
+    .subvalue { color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .card-primary .subvalue { color: rgba(240, 249, 255, 0.78); }
 
-    .info-grid {
+    .main-grid {
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: minmax(0, 1.2fr) minmax(340px, 0.8fr);
       gap: 16px;
+      align-items: start;
     }
-
+    .stack { display: grid; gap: 16px; }
+    .section { scroll-margin-top: 18px; }
+    .panel { overflow: hidden; }
     .panel-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 18px 22px;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
-      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(247,250,253,0.86));
+      padding: 15px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-soft);
     }
-
-    .panel-title {
-      margin: 0;
-      font-size: 18px;
-      font-weight: 800;
-      letter-spacing: -0.03em;
-    }
-
-    .panel-body {
-      padding: 20px 22px 22px;
-    }
-
-    .chart-wrap {
-      padding: 14px;
-      border-radius: 18px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background:
-        radial-gradient(circle at top right, rgba(37, 99, 235, 0.10), transparent 36%),
-        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
-    }
-
-    .chart-wrap.loss {
-      background:
-        radial-gradient(circle at top right, rgba(245, 158, 11, 0.10), transparent 36%),
-        linear-gradient(180deg, rgba(248,250,252,0.98), rgba(243,247,251,0.94));
-    }
-
-    .chart {
-      width: 100%;
-      height: 250px;
-      display: block;
-    }
-
-    .legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 14px;
+    .panel-title { margin: 0; font-size: 16px; color: var(--ink); }
+    .panel-copy { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .panel-body { padding: 16px; }
+    .mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .mini { padding: 12px; box-shadow: none; background: #f8fafc; }
+    .mini-label { color: var(--muted); font-size: 11px; font-weight: 800; }
+    .mini-value { margin-top: 7px; color: var(--ink); font-size: 18px; font-weight: 900; word-break: break-word; }
+    .detail-box, .notes-box {
       margin-top: 12px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .legend span {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .legend span::before {
-      content: "";
-      width: 12px;
-      height: 3px;
-      border-radius: 999px;
-      background: currentColor;
-    }
-
-    .legend .blue { color: #2563eb; }
-    .legend .green { color: #10b981; }
-    .legend .orange { color: #f59e0b; }
-
-    .meta-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-
-    .mini {
-      padding: 14px 16px;
-      border-radius: 16px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background: linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
-    }
-
-    .mini-label {
-      margin-bottom: 8px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-    }
-
-    .mini-value {
-      font-size: 21px;
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      line-height: 1.2;
-      color: var(--text);
+      padding: 12px;
+      border-radius: 8px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      color: #334155;
+      font-size: 13px;
+      line-height: 1.7;
       word-break: break-word;
     }
-
-    .detail-box,
-    .notes-box {
-      padding: 16px 18px;
-      border-radius: 18px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background: linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
-      color: var(--muted);
-      line-height: 1.7;
-      font-size: 13px;
-    }
-
-    .notes-box ul {
-      margin: 0;
-      padding-left: 18px;
-    }
-
-    .stack {
-      display: grid;
-      gap: 16px;
-    }
-
-    .table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-
-    .table th,
-    .table td {
-      padding: 12px 10px;
-      text-align: left;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
-      vertical-align: top;
-    }
-
-    .table th {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-    }
-
-    .table tbody tr:hover {
-      background: rgba(37, 99, 235, 0.04);
-    }
-
-    .table td.numeric,
-    .table th.numeric {
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .heatmap-wrap {
-      overflow-x: auto;
-      border-radius: 18px;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-      background: linear-gradient(180deg, rgba(248,250,253,0.94), rgba(244,248,252,0.88));
-      padding: 12px;
-    }
-
-    .heatmap-table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 6px;
-      min-width: 620px;
-      font-size: 13px;
-    }
-
-    .heatmap-table th {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      text-align: center;
-    }
-
-    .heat-cell {
-      min-width: 54px;
-      padding: 12px 10px;
-      text-align: center;
-      border-radius: 14px;
-      font-weight: 800;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .badge {
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
       padding: 7px 10px;
       border-radius: 999px;
+      background: #f1f5f9;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 800;
+      border: 1px solid var(--line);
+    }
+
+    .chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .chart-wrap { min-height: 260px; }
+    svg.chart { width: 100%; height: 260px; display: block; }
+    .axis-label { fill: #64748b; font-size: 11px; }
+    .legend { display: flex; gap: 14px; color: #475569; font-size: 12px; font-weight: 800; }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border-radius: 2px;
+      vertical-align: -1px;
+      background: currentColor;
+    }
+    .blue { color: var(--blue); }
+    .green { color: var(--green); }
+    .orange { color: var(--amber); }
+
+    .table-wrap { overflow-x: auto; }
+    .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .table th, .table td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .table th { color: #475569; font-size: 11px; text-transform: uppercase; }
+    .numeric { text-align: right !important; font-variant-numeric: tabular-nums; }
+    .heatmap { display: grid; gap: 4px; min-width: 380px; }
+    .heatmap-row { display: grid; grid-template-columns: 110px repeat(var(--cols), minmax(44px, 1fr)); gap: 4px; }
+    .heatmap-cell, .heatmap-label {
+      min-height: 36px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
       font-size: 12px;
       font-weight: 800;
     }
+    .heatmap-label { color: #475569; background: #f1f5f9; }
+    .heatmap-cell { color: #0f172a; background: rgba(37, 99, 235, 0.10); }
+    .empty { color: var(--muted); font-size: 13px; }
+    .footer { padding: 22px 4px 4px; color: rgba(226, 232, 240, 0.58); font-size: 12px; }
 
-    .badge::before {
-      content: "";
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: currentColor;
+    @media (max-width: 1180px) {
+      .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .main-grid { grid-template-columns: 1fr; }
     }
-
-    .badge-completed {
-      color: var(--good);
-      background: rgba(16, 185, 129, 0.12);
-    }
-
-    .badge-warning {
-      color: var(--warn);
-      background: rgba(245, 158, 11, 0.12);
-    }
-
-    .badge-offline {
-      color: var(--muted);
-      background: rgba(148, 163, 184, 0.12);
-    }
-
-    .footer {
-      position: relative;
-      z-index: 1;
-      margin-top: 8px;
-      color: rgba(226, 232, 240, 0.50);
-      font-size: 12px;
-      text-align: center;
-    }
-
-    @media (max-width: 1320px) {
-      .metrics,
-      .chart-grid,
-      .info-grid,
-      .meta-grid {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .metrics .card:first-child {
-        grid-column: span 2;
-      }
-    }
-
-    @media (max-width: 940px) {
-      .topbar,
-      .metrics,
-      .chart-grid,
-      .info-grid,
-      .meta-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .top-actions {
-        justify-content: flex-start;
-      }
-
-      .live-stack {
-        justify-items: start;
-      }
-
-      .live-copy {
-        text-align: left;
-      }
-    }
-
-    @media (max-width: 720px) {
-      .page {
-        padding: 16px;
-      }
-
-      .shell {
-        padding: 16px;
-      }
-
-      .topbar,
-      .card,
-      .panel-head,
-      .panel-body {
-        padding-left: 16px;
-        padding-right: 16px;
-      }
-
-      h1 {
-        font-size: 28px;
-      }
-
-      .value {
-        font-size: 28px;
-      }
+    @media (max-width: 760px) {
+      .page { padding: 12px; }
+      .shell { padding: 14px; border-radius: 18px; }
+      .topbar { grid-template-columns: 1fr; }
+      .top-actions, .live-stack { justify-items: start; justify-content: start; }
+      .live-copy { text-align: left; }
+      h1 { font-size: 28px; }
+      .kpi-grid, .chart-grid, .mini-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -608,224 +249,192 @@
     <div class="shell">
       <header class="topbar">
         <div>
-          <div class="brand-kicker">Team View</div>
+          <div class="kicker">Offline and Live Viewer</div>
           <h1>detectWarning Dashboard</h1>
-          <div class="brand-copy">최신 결과와 실시간 상태</div>
+          <div class="subcopy">온라인 대시보드와 같은 지표를 보여주고, 연결이 끊기면 마지막 결과 리포트를 유지합니다.</div>
         </div>
         <div class="top-actions">
           <div class="live-stack">
             <div class="live-title" id="liveStateTitle">상태 확인 중</div>
             <div class="status-pill tone-offline" id="liveStatePill">offline</div>
             <div class="live-copy" id="liveStateMessage">상태를 불러오는 중입니다.</div>
-            <div class="live-copy" id="redirectMessage">실시간 연결 시 자동 이동합니다.</div>
+            <div class="live-copy" id="redirectMessage">온라인 연결이 있으면 실시간 화면으로 이동할 수 있습니다.</div>
           </div>
           <a class="button button-primary" id="liveLink" href="#" target="_blank" rel="noreferrer" style="display:none;">실시간 보기</a>
-          <a class="button button-secondary" href="#report">결과 보기</a>
+          <a class="button" href="#report">결과 보기</a>
         </div>
       </header>
 
-      <section class="metrics">
+      <nav class="nav">
+        <a href="#overview">개요</a>
+        <a href="#training">학습</a>
+        <a href="#quality">품질</a>
+        <a href="#validation">검증</a>
+        <a href="#dataset">데이터셋</a>
+        <a href="#jobs">작업</a>
+      </nav>
+
+      <section class="kpi-grid" id="overview">
         <article class="card card-primary">
-          <div class="label">현재 상태</div>
+          <div class="label">파이프라인</div>
           <div class="value" id="latestJobState">-</div>
           <div class="subvalue" id="latestJobMessage">최신 작업 상태를 불러오는 중입니다.</div>
         </article>
         <article class="card">
-          <div class="label">Best Validation Macro F1</div>
+          <div class="label">Best Macro F1</div>
           <div class="value" id="bestF1">-</div>
           <div class="subvalue" id="bestEpoch">best epoch -</div>
         </article>
         <article class="card">
-          <div class="label">최종 Accuracy / Macro F1</div>
+          <div class="label">Final Accuracy</div>
           <div class="value" id="finalAccuracy">-</div>
           <div class="subvalue" id="finalMacroF1">macro F1 -</div>
         </article>
         <article class="card">
-          <div class="label">최근 업데이트</div>
+          <div class="label">데이터셋</div>
+          <div class="value" id="sampleTotals">-</div>
+          <div class="subvalue">train / val / test</div>
+        </article>
+        <article class="card">
+          <div class="label">병렬 다운로드</div>
+          <div class="value" id="predownloadState">-</div>
+          <div class="subvalue" id="predownloadDetail">현재 상태 없음</div>
+        </article>
+        <article class="card">
+          <div class="label">최근 갱신</div>
           <div class="value" id="updatedAt">-</div>
           <div class="subvalue" id="projectName">-</div>
         </article>
-        <article class="card">
-          <div class="label">최근 작업</div>
-          <div class="value" id="jobDuration">-</div>
-          <div class="subvalue" id="jobRange">-</div>
-        </article>
       </section>
 
-      <section class="section" id="report">
-        <div class="section-head">
-          <h2 class="section-title">성능 추이</h2>
-          <div class="section-tag">Metrics</div>
-        </div>
-        <div class="chart-grid">
-          <article class="panel">
-            <div class="panel-head">
-              <h3 class="panel-title">Validation</h3>
-            </div>
-            <div class="panel-body">
-              <div class="chart-wrap">
-                <svg class="chart" id="metricChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
-                <div class="legend">
-                  <span class="blue">Accuracy</span>
-                  <span class="green">Macro F1</span>
-                </div>
-              </div>
-            </div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <h3 class="panel-title">Loss</h3>
-            </div>
-            <div class="panel-body">
-              <div class="chart-wrap loss">
-                <svg class="chart" id="lossChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
-                <div class="legend">
-                  <span class="blue">Train Loss</span>
-                  <span class="orange">Validation Loss</span>
-                </div>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <section class="section">
-        <div class="section-head">
-          <h2 class="section-title">진단 요약</h2>
-          <div class="section-tag">Diagnostics</div>
-        </div>
-        <div class="meta-grid">
-          <div class="mini">
-            <div class="mini-label">Validation Samples</div>
-            <div class="mini-value" id="valSampleTotal">-</div>
-          </div>
-          <div class="mini">
-            <div class="mini-label">Class Coverage</div>
-            <div class="mini-value" id="classCoverage">-</div>
-          </div>
-          <div class="mini">
-            <div class="mini-label">Dominant Class</div>
-            <div class="mini-value" id="dominantClass">-</div>
-          </div>
-          <div class="mini">
-            <div class="mini-label">Issues</div>
-            <div class="mini-value" id="issueSummary">-</div>
-          </div>
-        </div>
-      </section>
-
-      <section class="section">
-        <div class="section-head">
-          <h2 class="section-title">클래스별 성능</h2>
-          <div class="section-tag">Per Class</div>
-        </div>
+      <main class="main-grid">
         <div class="stack">
-          <article class="panel">
-            <div class="panel-body">
-              <table class="table">
-                <thead>
-                  <tr>
-                    <th>클래스</th>
-                    <th class="numeric">Precision</th>
-                    <th class="numeric">Recall</th>
-                    <th class="numeric">F1</th>
-                    <th class="numeric">Support</th>
-                  </tr>
-                </thead>
-                <tbody id="classTable"></tbody>
-              </table>
-            </div>
-          </article>
-
-          <article class="panel">
+          <section class="section panel" id="training">
             <div class="panel-head">
-              <h3 class="panel-title">Confusion Matrix</h3>
+              <div>
+                <h2 class="panel-title">학습 추이</h2>
+                <p class="panel-copy">온라인 대시보드와 같은 validation/loss 흐름을 정적 리포트에서도 확인합니다.</p>
+              </div>
+              <span class="badge badge-neutral" id="resumeState">-</span>
             </div>
             <div class="panel-body">
-              <div class="heatmap-wrap" id="confusionMatrixWrap">표시할 confusion matrix가 없습니다.</div>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <section class="section">
-        <div class="section-head">
-          <h2 class="section-title">작업 정보</h2>
-          <div class="section-tag">Summary</div>
-        </div>
-        <div class="info-grid">
-          <article class="panel">
-            <div class="panel-body">
-              <div class="meta-grid">
-                <div class="mini">
-                  <div class="mini-label">Train / Val / Test</div>
-                  <div class="mini-value" id="sampleTotals">-</div>
+              <div class="chart-grid">
+                <div>
+                  <div class="chart-wrap"><svg class="chart" id="metricChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg></div>
+                  <div class="legend"><span class="blue">Accuracy</span><span class="green">Macro F1</span></div>
                 </div>
-                <div class="mini">
-                  <div class="mini-label">학습 방식</div>
-                  <div class="mini-value" id="resumeState">-</div>
-                </div>
-                <div class="mini">
-                  <div class="mini-label">누적 Prepared</div>
-                  <div class="mini-value" id="continualTotals">-</div>
-                </div>
-                <div class="mini">
-                  <div class="mini-label">Artifacts</div>
-                  <div class="mini-value" id="artifactSummary">-</div>
+                <div>
+                  <div class="chart-wrap"><svg class="chart" id="lossChart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg></div>
+                  <div class="legend"><span class="blue">Train Loss</span><span class="orange">Validation Loss</span></div>
                 </div>
               </div>
-              <div class="detail-box" id="jobDetailBox">최근 작업 정보를 불러오는 중입니다.</div>
             </div>
-          </article>
+          </section>
 
-          <article class="panel">
-            <div class="panel-body">
-              <div class="notes-box" id="notesBox">메모를 불러오는 중입니다.</div>
+          <section class="section panel" id="validation">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">검증 결과</h2>
+                <p class="panel-copy">클래스별 성능과 confusion matrix를 함께 봅니다.</p>
+              </div>
+              <span class="badge badge-neutral" id="classCoverage">-</span>
             </div>
-          </article>
-        </div>
-      </section>
+            <div class="panel-body stack">
+              <div class="mini-grid">
+                <div class="mini"><div class="mini-label">Validation Samples</div><div class="mini-value" id="valSampleTotal">-</div></div>
+                <div class="mini"><div class="mini-label">Dominant Class</div><div class="mini-value" id="dominantClass">-</div></div>
+                <div class="mini"><div class="mini-label">Issues</div><div class="mini-value" id="issueSummary">-</div></div>
+                <div class="mini"><div class="mini-label">Job Duration</div><div class="mini-value" id="jobDuration">-</div></div>
+              </div>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead><tr><th>Class</th><th class="numeric">Precision</th><th class="numeric">Recall</th><th class="numeric">F1</th><th class="numeric">Support</th></tr></thead>
+                  <tbody id="classTable"></tbody>
+                </table>
+              </div>
+              <div class="table-wrap" id="confusionMatrixWrap"><div class="empty">표시할 confusion matrix가 없습니다.</div></div>
+            </div>
+          </section>
 
-      <section class="section">
-        <div class="section-head">
-          <h2 class="section-title">데이터 구성</h2>
-          <div class="section-tag">Dataset</div>
-        </div>
-        <div class="info-grid">
-          <article class="panel">
-            <div class="panel-body">
+          <section class="section panel" id="dataset">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">데이터셋 구성</h2>
+                <p class="panel-copy">누적 manifest와 현재 작업 manifest를 같이 확인합니다.</p>
+              </div>
+              <span class="badge badge-neutral" id="continualTotals">-</span>
+            </div>
+            <div class="panel-body table-wrap">
               <table class="table">
-                <thead>
-                  <tr>
-                    <th>구간</th>
-                    <th class="numeric">Total</th>
-                    <th>클래스 구성</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>구간</th><th class="numeric">Total</th><th>클래스 구성</th></tr></thead>
                 <tbody id="datasetBreakdownTable"></tbody>
               </table>
             </div>
-          </article>
+          </section>
+        </div>
 
-          <article class="panel">
+        <aside class="stack">
+          <section class="section panel" id="quality">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">추출 품질</h2>
+                <p class="panel-copy">guideline clips, RGB/I3D, fallback, normal 비율을 온라인과 같은 기준으로 봅니다.</p>
+              </div>
+              <span class="badge badge-neutral" id="qualityHealth">-</span>
+            </div>
             <div class="panel-body">
+              <div class="mini-grid">
+                <div class="mini"><div class="mini-label">Normal Ratio</div><div class="mini-value" id="normalRatio">-</div></div>
+                <div class="mini"><div class="mini-label">RGB Ready</div><div class="mini-value" id="rgbReadyRatio">-</div></div>
+                <div class="mini"><div class="mini-label">RGB Fallback</div><div class="mini-value" id="rgbFallback">-</div></div>
+                <div class="mini"><div class="mini-label">Person Retry</div><div class="mini-value" id="personRetry">-</div></div>
+              </div>
+              <div class="notes-box" id="qualityNotes">품질 요약을 불러오는 중입니다.</div>
+            </div>
+          </section>
+
+          <section class="section panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">현재 작업</h2>
+                <p class="panel-copy">온라인이면 live overview, 오프라인이면 마지막 완료 작업 기준입니다.</p>
+              </div>
+              <span class="badge badge-neutral" id="artifactSummary">-</span>
+            </div>
+            <div class="panel-body">
+              <div class="mini-grid">
+                <div class="mini"><div class="mini-label">Current Filekey</div><div class="mini-value" id="currentFilekey">-</div></div>
+                <div class="mini"><div class="mini-label">Queue</div><div class="mini-value" id="queueSummary">-</div></div>
+                <div class="mini"><div class="mini-label">Range</div><div class="mini-value" id="jobRange">-</div></div>
+                <div class="mini"><div class="mini-label">Artifacts</div><div class="mini-value" id="artifactMini">-</div></div>
+              </div>
+              <div class="detail-box" id="jobDetailBox">작업 정보를 불러오는 중입니다.</div>
+            </div>
+          </section>
+
+          <section class="section panel" id="jobs">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">최근 작업</h2>
+                <p class="panel-copy">완료/실패/대기 이력을 빠르게 확인합니다.</p>
+              </div>
+            </div>
+            <div class="panel-body table-wrap">
               <table class="table">
-                <thead>
-                  <tr>
-                    <th>filekey</th>
-                    <th>상태</th>
-                    <th>시간</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>filekey</th><th>상태</th><th>시간</th></tr></thead>
                 <tbody id="recentJobsTable"></tbody>
               </table>
             </div>
-          </article>
-        </div>
-      </section>
+          </section>
 
-      <div class="footer">detectWarning team result dashboard</div>
+          <section class="panel">
+            <div class="panel-head"><h2 class="panel-title">메모</h2></div>
+            <div class="panel-body"><div class="notes-box" id="notesBox">메모를 불러오는 중입니다.</div></div>
+          </section>
+        </aside>
+      </main>
+
+      <div class="footer">detectWarning shared offline dashboard</div>
     </div>
   </div>
 
@@ -848,19 +457,12 @@
     let lastReportFetchedAt = 0;
     let latestResolvedStatus = null;
 
+    const $ = (id) => document.getElementById(id);
+
     async function fetchJson(path) {
       const response = await fetch(path, { cache: "no-cache" });
-      if (!response.ok) {
-        throw new Error("데이터를 불러오지 못했습니다.");
-      }
+      if (!response.ok) throw new Error("데이터를 불러오지 못했습니다.");
       return response.json();
-    }
-
-    function formatNumber(value, digits = 4) {
-      if (value === null || value === undefined || value === "") return "-";
-      const num = Number(value);
-      if (Number.isNaN(num)) return String(value);
-      return num.toFixed(digits);
     }
 
     function escapeHtml(value) {
@@ -869,237 +471,236 @@
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#39;");
+        .replaceAll("'", "&#039;");
     }
-
+    function formatNumber(value, digits = 4) {
+      if (value === null || value === undefined || value === "") return "-";
+      const num = Number(value);
+      if (Number.isNaN(num)) return "-";
+      return num.toFixed(digits);
+    }
+    function formatPercent(value, digits = 1) {
+      if (value === null || value === undefined || value === "") return "-";
+      const num = Number(value);
+      if (Number.isNaN(num)) return "-";
+      return `${(num * 100).toFixed(digits)}%`;
+    }
     function formatDateTime(value) {
       if (!value) return "-";
       const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString("ko-KR", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false
-      });
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
     }
-
     function formatDuration(minutes) {
       if (minutes === null || minutes === undefined || minutes === "") return "-";
-      const mins = Number(minutes);
-      if (Number.isNaN(mins)) return String(minutes);
-      if (mins >= 60) {
-        const hours = Math.floor(mins / 60);
-        const remain = mins % 60;
-        return `${hours}시간 ${remain}분`;
-      }
-      return `${mins}분`;
+      const total = Math.max(0, Math.round(Number(minutes) * 60));
+      if (Number.isNaN(total)) return "-";
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      if (h > 0) return `${h}시간 ${m}분`;
+      return `${m}분`;
     }
-
     function formatSecondsDuration(seconds) {
       if (seconds === null || seconds === undefined || seconds === "") return "-";
-      const total = Number(seconds);
-      if (Number.isNaN(total)) return String(seconds);
-      const rounded = Math.max(0, Math.round(total));
-      const hours = Math.floor(rounded / 3600);
-      const minutes = Math.floor((rounded % 3600) / 60);
-      const secs = rounded % 60;
-      if (hours > 0) return `${hours}시간 ${minutes}분`;
-      if (minutes > 0) return `${minutes}분 ${secs}초`;
-      return `${secs}초`;
+      const total = Math.max(0, Math.round(Number(seconds)));
+      if (Number.isNaN(total)) return "-";
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return `${h}시간 ${m}분`;
+      if (m > 0) return `${m}분 ${s}초`;
+      return `${s}초`;
     }
-
-    function formatDistributionSummary(distribution) {
-      if (!distribution) return "-";
-      const severity = String(distribution.severity || "ok");
-      const covered = `${distribution.covered ?? 0}/${distribution.total ?? 0}`;
-      const ratio = distribution.imbalance_ratio !== null && distribution.imbalance_ratio !== undefined
-        ? `ratio ${Number(distribution.imbalance_ratio).toFixed(2)}`
-        : "ratio -";
-      return `${severity} · ${covered} · ${ratio}`;
-    }
-
-    function formatStageTimingSummary(stageTimings) {
-      const stages = stageTimings?.ordered || [];
-      const parts = stages
-        .filter((row) => row.stage !== "total" && row.duration_seconds !== null && row.duration_seconds !== undefined)
-        .map((row) => `${row.stage} ${formatSecondsDuration(row.duration_seconds)}`);
-      return parts.length ? parts.join(" · ") : "-";
-    }
-
     function stateLabel(state) {
-      if (state === "completed") return "완료";
-      if (state === "completed_warning") return "경고 종료";
-      if (state === "running") return "실행 중";
-      if (state === "paused") return "일시 정지";
-      if (state === "aborted") return "강제 중단";
-      if (state === "error") return "오류";
-      return state || "-";
+      const key = String(state || "").toLowerCase();
+      return {
+        completed: "완료",
+        completed_warning: "경고 포함 완료",
+        data_ready: "데이터 준비",
+        deferred: "학습 대기",
+        waiting_for_data: "데이터 누적 대기",
+        online: "온라인",
+        running: "실행 중",
+        queued: "대기 중",
+        paused: "일시 중지",
+        prepare: "전처리",
+        download: "다운로드",
+        train: "학습 중",
+        warning: "주의",
+        error: "오류",
+        aborted: "중단됨",
+        offline: "오프라인",
+        idle: "대기",
+        starting: "시작 중"
+      }[key] || (state || "-");
     }
-
     function stateClass(state) {
-      if (state === "completed") return "badge badge-completed";
-      if (state === "completed_warning") return "badge badge-warning";
-      return "badge badge-offline";
+      const key = String(state || "").toLowerCase();
+      if (["completed", "completed_warning", "online", "data_ready"].includes(key)) return "badge badge-good";
+      if (["running", "queued", "prepare", "download", "train", "starting"].includes(key)) return "badge badge-neutral";
+      if (["warning", "paused", "waiting_for_data", "deferred"].includes(key)) return "badge badge-warn";
+      if (["error", "aborted", "offline"].includes(key)) return "badge badge-danger";
+      return "badge badge-neutral";
+    }
+    function formatCountMap(items) {
+      if (!items || typeof items !== "object") return "-";
+      const entries = Object.entries(items).filter(([, value]) => Number(value || 0) > 0);
+      return entries.length ? entries.map(([key, value]) => `${key} ${value}`).join(", ") : "-";
+    }
+    function formatDistributionSummary(payload) {
+      if (!payload || typeof payload !== "object") return "-";
+      return [
+        `total ${payload.total_samples ?? "-"}`,
+        `min ${payload.min_count ?? "-"}`,
+        `max ${payload.max_count ?? "-"}`,
+        `ratio ${payload.imbalance_ratio ?? "-"}`
+      ].join(" / ");
+    }
+    function setText(id, value) {
+      const node = $(id);
+      if (node) node.textContent = value ?? "-";
+    }
+    function setHtml(id, value) {
+      const node = $(id);
+      if (node) node.innerHTML = value ?? "";
     }
 
-    function renderPolylineChart(svgId, history, keys, colors, maxValue, emptyText) {
-      const svg = document.getElementById(svgId);
-      if (!history || !history.length) {
-        svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="16">${escapeHtml(emptyText)}</text>`;
+    function chartPolyline(points, width, height, pad, maxValue) {
+      if (!points.length) return "";
+      const innerW = width - pad * 2;
+      const innerH = height - pad * 2;
+      return points.map((value, index) => {
+        const x = pad + (points.length === 1 ? innerW / 2 : innerW * index / (points.length - 1));
+        const y = height - pad - (Math.max(0, Number(value || 0)) / maxValue) * innerH;
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      }).join(" ");
+    }
+    function renderLineChart(svgId, history, series) {
+      const svg = $(svgId);
+      if (!svg) return;
+      const rows = Array.isArray(history) ? history : [];
+      if (!rows.length) {
+        svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="axis-label">표시할 기록이 없습니다.</text>';
         return;
       }
-
-      const width = 800;
-      const height = 260;
-      const padLeft = 50;
-      const padRight = 20;
-      const padTop = 16;
-      const padBottom = 30;
-      const innerW = width - padLeft - padRight;
-      const innerH = height - padTop - padBottom;
-      const maxX = Math.max(history.length - 1, 1);
-
-      const gridLines = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-        const y = padTop + (1 - ratio) * innerH;
-        const label = (maxValue * ratio).toFixed(maxValue <= 1 ? 2 : 3);
-        return `
-          <line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(148,163,184,0.18)" />
-          <text x="8" y="${y + 4}" fill="#94a3b8" font-size="11">${label}</text>
-        `;
+      const width = 800, height = 260, pad = 34;
+      const values = series.flatMap((item) => rows.map((row) => Number(row[item.key] ?? row[item.alt] ?? 0))).filter((v) => !Number.isNaN(v));
+      const maxValue = Math.max(1, ...values);
+      const paths = series.map((item) => {
+        const points = rows.map((row) => row[item.key] ?? row[item.alt] ?? 0);
+        return `<polyline fill="none" stroke="${item.color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" points="${chartPolyline(points, width, height, pad, maxValue)}"></polyline>`;
       }).join("");
-
-      const xLabels = history.map((row, index) => {
-        const x = padLeft + (index / maxX) * innerW;
-        return `<text x="${x}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${row.epoch}</text>`;
+      const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = height - pad - ratio * (height - pad * 2);
+        return `<line x1="${pad}" x2="${width - pad}" y1="${y}" y2="${y}" stroke="rgba(100,116,139,0.18)" />`;
       }).join("");
-
-      const lines = keys.map((key, index) => {
-        const points = history.map((row, rowIndex) => {
-          const x = padLeft + (rowIndex / maxX) * innerW;
-          const raw = Number(row[key] || 0);
-          const normalized = Math.max(0, Math.min(1, raw / maxValue));
-          const y = padTop + (1 - normalized) * innerH;
-          return `${x},${y}`;
-        }).join(" ");
-        return `<polyline fill="none" stroke="${colors[index]}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${points}"></polyline>`;
-      }).join("");
-
-      svg.innerHTML = `${gridLines}${lines}${xLabels}`;
+      svg.innerHTML = `${grid}${paths}<text x="${pad}" y="${height - 8}" class="axis-label">epoch 1</text><text x="${width - pad}" y="${height - 8}" text-anchor="end" class="axis-label">epoch ${rows.length}</text>`;
     }
-
     function renderMetricChart(history) {
-      renderPolylineChart(
-        "metricChart",
-        history,
-        ["val_accuracy", "val_macro_f1"],
-        ["#2563eb", "#10b981"],
-        1,
-        "표시할 성능 기록이 없습니다"
-      );
+      renderLineChart("metricChart", history, [
+        { key: "val_accuracy", alt: "accuracy", color: "#2563eb" },
+        { key: "val_macro_f1", alt: "macro_f1", color: "#059669" }
+      ]);
     }
-
     function renderLossChart(history) {
-      const maxLoss = history && history.length
-        ? Math.max(0.001, ...history.flatMap((row) => [Number(row.train_loss || 0), Number(row.val_loss || 0)]))
-        : 1;
-      renderPolylineChart(
-        "lossChart",
-        history,
-        ["train_loss", "val_loss"],
-        ["#2563eb", "#f59e0b"],
-        maxLoss,
-        "표시할 loss 기록이 없습니다"
-      );
+      renderLineChart("lossChart", history, [
+        { key: "train_loss", color: "#2563eb" },
+        { key: "val_loss", color: "#d97706" }
+      ]);
     }
-
     function renderClassTable(rows) {
-      const tbody = document.getElementById("classTable");
-      if (!rows || !rows.length) {
-        tbody.innerHTML = '<tr><td colspan="5">클래스별 지표가 없습니다.</td></tr>';
-        return;
-      }
-      tbody.innerHTML = rows.map((row) => `
-        <tr>
-          <td>${escapeHtml(row.label || "-")}</td>
-          <td class="numeric">${formatNumber(row.precision, 3)}</td>
-          <td class="numeric">${formatNumber(row.recall, 3)}</td>
-          <td class="numeric">${formatNumber(row.f1, 3)}</td>
-          <td class="numeric">${row.support ?? 0}</td>
-        </tr>
-      `).join("");
-    }
-
-    function renderConfusionMatrix(labels, confusionMatrix) {
-      const wrap = document.getElementById("confusionMatrixWrap");
-      const labelsList = Array.isArray(labels) ? labels : [];
-      const matrix = Array.isArray(confusionMatrix) ? confusionMatrix : [];
-      if (!wrap) return;
-      if (!labelsList.length || !matrix.length) {
-        wrap.textContent = "표시할 confusion matrix가 없습니다.";
-        return;
-      }
-      const maxValue = Math.max(1, ...matrix.flatMap((row) => Array.isArray(row) ? row.map((value) => Number(value || 0)) : [0]));
-      const headerCells = labelsList.map((label) => `<th>${escapeHtml(label)}</th>`).join("");
-      const bodyRows = matrix.map((row, rowIndex) => {
-        const label = labelsList[rowIndex] || `class_${rowIndex}`;
-        const cells = row.map((value) => {
-          const numeric = Number(value || 0);
-          const intensity = Math.max(0, Math.min(1, numeric / maxValue));
-          const bg = `rgba(37, 99, 235, ${0.06 + intensity * 0.44})`;
-          const color = intensity > 0.55 ? '#eff6ff' : '#0f172a';
-          return `<td class="heat-cell" style="background:${bg};color:${color};">${numeric}</td>`;
-        }).join("");
-        return `<tr><th>${escapeHtml(label)}</th>${cells}</tr>`;
-      }).join("");
-      wrap.innerHTML = `
-        <table class="heatmap-table">
-          <thead>
-            <tr>
-              <th>True \\ Pred</th>
-              ${headerCells}
-            </tr>
-          </thead>
-          <tbody>${bodyRows}</tbody>
-        </table>
-      `;
-    }
-
-    function renderDatasetBreakdown(dataset) {
-      const tbody = document.getElementById("datasetBreakdownTable");
+      const tbody = $("classTable");
       if (!tbody) return;
-      const sections = ["raw", "train", "val", "test", "prepared_train", "prepared_val", "prepared_test"];
-      const rows = sections.map((key) => {
-        const info = dataset?.[key];
-        if (!info || !info.total) return "";
-        const labels = Object.entries(info.by_label || {})
-          .map(([label, count]) => `${escapeHtml(label)} ${count}`)
-          .join(" / ");
-        return `
-          <tr>
-            <td>${escapeHtml(key)}</td>
-            <td class="numeric">${info.total}</td>
-            <td>${labels || "-"}</td>
-          </tr>
-        `;
-      }).filter(Boolean);
-      tbody.innerHTML = rows.length ? rows.join("") : '<tr><td colspan="3">데이터 구성이 없습니다.</td></tr>';
+      const items = Array.isArray(rows) ? rows : [];
+      tbody.innerHTML = items.length ? items.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.label ?? row.class_index ?? "-")}</td>
+          <td class="numeric">${formatNumber(row.precision, 4)}</td>
+          <td class="numeric">${formatNumber(row.recall, 4)}</td>
+          <td class="numeric">${formatNumber(row.f1, 4)}</td>
+          <td class="numeric">${row.support ?? "-"}</td>
+        </tr>`).join("") : '<tr><td colspan="5">클래스별 지표가 없습니다.</td></tr>';
     }
-
+    function renderConfusionMatrix(labels, matrix) {
+      const wrap = $("confusionMatrixWrap");
+      if (!wrap) return;
+      if (!Array.isArray(matrix) || !matrix.length) {
+        wrap.innerHTML = '<div class="empty">표시할 confusion matrix가 없습니다.</div>';
+        return;
+      }
+      const safeLabels = Array.isArray(labels) && labels.length ? labels : matrix.map((_, i) => `class ${i}`);
+      const maxValue = Math.max(1, ...matrix.flat().map((v) => Number(v || 0)));
+      const header = `<div class="heatmap-row" style="--cols:${safeLabels.length}"><div></div>${safeLabels.map((label) => `<div class="heatmap-label">${escapeHtml(label)}</div>`).join("")}</div>`;
+      const rows = matrix.map((row, rowIndex) => `<div class="heatmap-row" style="--cols:${safeLabels.length}">
+        <div class="heatmap-label">${escapeHtml(safeLabels[rowIndex] || `class ${rowIndex}`)}</div>
+        ${safeLabels.map((_, colIndex) => {
+          const value = Number((row || [])[colIndex] || 0);
+          const alpha = 0.08 + 0.62 * (value / maxValue);
+          return `<div class="heatmap-cell" style="background:rgba(37,99,235,${alpha.toFixed(3)})">${value}</div>`;
+        }).join("")}
+      </div>`).join("");
+      wrap.innerHTML = `<div class="heatmap">${header}${rows}</div>`;
+    }
+    function renderDatasetBreakdown(dataset, currentDataset) {
+      const tbody = $("datasetBreakdownTable");
+      if (!tbody) return;
+      const specs = [
+        ["raw", "원본"],
+        ["train", "학습 split"],
+        ["val", "검증 split"],
+        ["test", "테스트 split"],
+        ["prepared_train", "전처리 학습"],
+        ["prepared_val", "전처리 검증"],
+        ["prepared_test", "전처리 테스트"],
+        ["current_raw", "현재 원본"],
+        ["current_prepared_train", "현재 전처리 학습"],
+        ["current_prepared_val", "현재 전처리 검증"],
+        ["current_prepared_test", "현재 전처리 테스트"]
+      ];
+      const merged = { ...(dataset || {}) };
+      if (currentDataset) {
+        for (const [key, value] of Object.entries(currentDataset)) merged[`current_${key}`] = value;
+      }
+      const rows = specs.map(([key, label]) => {
+        const info = merged[key];
+        if (!info) return "";
+        return `<tr><td>${label}</td><td class="numeric">${info.total ?? 0}</td><td>${escapeHtml(formatCountMap(info.by_label))}</td></tr>`;
+      }).filter(Boolean);
+      tbody.innerHTML = rows.length ? rows.join("") : '<tr><td colspan="3">데이터셋 구성이 없습니다.</td></tr>';
+    }
     function renderRecentJobs(jobs) {
-      const tbody = document.getElementById("recentJobsTable");
+      const tbody = $("recentJobsTable");
       if (!tbody) return;
       const rows = Array.isArray(jobs) ? jobs : [];
       tbody.innerHTML = rows.length ? rows.map((job) => `
         <tr>
           <td>${escapeHtml(job.filekey || "-")}</td>
-          <td>${stateLabel(job.state)}</td>
+          <td><span class="${stateClass(job.state)}">${stateLabel(job.state)}</span></td>
           <td>${formatDateTime(job.finished_at || job.started_at)}</td>
-        </tr>
-      `).join("") : '<tr><td colspan="3">최근 작업 기록이 없습니다.</td></tr>';
+        </tr>`).join("") : '<tr><td colspan="3">최근 작업 기록이 없습니다.</td></tr>';
+    }
+    function renderQuality(quality) {
+      const q = quality && typeof quality === "object" ? quality : {};
+      const health = q.health || "-";
+      setHtml("qualityHealth", `<span class="${stateClass(health === "good" ? "completed" : health === "warning" ? "warning" : "idle")}">${escapeHtml(health)}</span>`);
+      setText("normalRatio", formatPercent(q.normal_ratio));
+      setText("rgbReadyRatio", formatPercent(q.rgb_ready_ratio));
+      setText("rgbFallback", q.rgb_only_fallback ?? "-");
+      const retryText = q.person_retry_attempted || q.person_retry_success
+        ? `${q.person_retry_success ?? 0} / ${q.person_retry_attempted ?? 0}`
+        : "-";
+      setText("personRetry", retryText);
+      const notes = Array.isArray(q.notes) ? q.notes : [];
+      setHtml("qualityNotes", notes.length ? `<ul>${notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>` : "표시할 품질 메모가 없습니다.");
+    }
+    function renderPredownload(predownload) {
+      const p = predownload && typeof predownload === "object" ? predownload : {};
+      const running = Array.isArray(p.running) ? p.running : [];
+      const completed = Array.isArray(p.completed) ? p.completed : [];
+      const failed = Array.isArray(p.failed) ? p.failed : [];
+      setText("predownloadState", `${running.length} / ${p.max_parallel ?? 0}`);
+      const runningKeys = running.map((item) => item && item.filekey).filter(Boolean).slice(0, 3).join(", ");
+      setText("predownloadDetail", runningKeys ? `실행 중 ${runningKeys}` : (p.pause_reason || `완료 ${completed.length} / 실패 ${failed.length}`));
     }
 
     function renderReport(report) {
@@ -1112,37 +713,30 @@
       const valDistribution = report.val_distribution || {};
       const stageTimings = report.stage_timings || {};
 
-      document.getElementById("latestJobState").innerHTML =
-        `<span class="${stateClass(latestJob.state)}">${stateLabel(latestJob.state)}</span>`;
-      document.getElementById("latestJobMessage").textContent =
-        latestJob.message || "최신 작업 메시지가 없습니다.";
-      document.getElementById("bestF1").textContent = formatNumber(summary.best_val_macro_f1, 4);
-      document.getElementById("bestEpoch").textContent = `best epoch ${summary.best_epoch ?? "-"}`;
-      document.getElementById("finalAccuracy").textContent = formatNumber(summary.final_accuracy, 4);
-      document.getElementById("finalMacroF1").textContent = `macro F1 ${formatNumber(summary.final_macro_f1, 4)}`;
-      document.getElementById("sampleTotals").textContent =
-        `${summary.train_samples ?? 0} / ${summary.val_samples ?? 0} / ${summary.test_samples ?? 0}`;
-      document.getElementById("resumeState").textContent =
-        summary.resumed_from_checkpoint ? "resume" : "fresh";
-      document.getElementById("continualTotals").textContent =
-        `${continualState.prepared_train_total ?? summary.train_samples ?? 0} / ${continualState.prepared_val_total ?? summary.val_samples ?? 0} / ${continualState.prepared_test_total ?? summary.test_samples ?? 0}`;
-      document.getElementById("artifactSummary").textContent =
-        `${artifacts.has_model ? "model" : "-"} · ${artifacts.has_metrics ? "metrics" : "-"} · ${artifacts.has_labels ? "labels" : "-"}`;
-      document.getElementById("updatedAt").textContent = formatDateTime(report.updated_at);
-      document.getElementById("projectName").textContent = report.project_name || "-";
-      document.getElementById("jobDuration").textContent = formatDuration(latestJob.duration_minutes);
-      document.getElementById("jobRange").textContent =
-        `${formatDateTime(latestJob.started_at)} ~ ${formatDateTime(latestJob.finished_at)}`;
-      document.getElementById("valSampleTotal").textContent = summary.val_sample_total ?? "-";
-      document.getElementById("classCoverage").textContent =
-        `${summary.class_coverage?.covered ?? 0} / ${summary.class_coverage?.total ?? 0}`;
-      document.getElementById("dominantClass").textContent =
-        summary.dominant_class ? `${summary.dominant_class} (${summary.dominant_class_support ?? 0})` : "-";
-      document.getElementById("issueSummary").textContent =
-        `${issues.total ?? 0} · broken ${issues.broken ?? 0} · skipped ${issues.skipped ?? 0}`;
-
-      document.getElementById("jobDetailBox").innerHTML = `
-        상태: ${stateLabel(latestJob.state)}<br />
+      setHtml("latestJobState", `<span class="${stateClass(latestJob.state)}">${stateLabel(latestJob.state)}</span>`);
+      setText("latestJobMessage", latestJob.message || "최신 작업 메시지가 없습니다.");
+      setText("bestF1", formatNumber(summary.best_val_macro_f1, 4));
+      setText("bestEpoch", `best epoch ${summary.best_epoch ?? "-"}`);
+      setText("finalAccuracy", formatNumber(summary.final_accuracy, 4));
+      setText("finalMacroF1", `macro F1 ${formatNumber(summary.final_macro_f1, 4)}`);
+      setText("sampleTotals", `${summary.train_samples ?? 0} / ${summary.val_samples ?? 0} / ${summary.test_samples ?? 0}`);
+      setText("resumeState", summary.resumed_from_checkpoint ? "resume" : "fresh");
+      setText("continualTotals", `${continualState.prepared_train_total ?? summary.train_samples ?? 0} / ${continualState.prepared_val_total ?? summary.val_samples ?? 0} / ${continualState.prepared_test_total ?? summary.test_samples ?? 0}`);
+      const artifactText = `${artifacts.has_model ? "model" : "-"} / ${artifacts.has_metrics ? "metrics" : "-"} / ${artifacts.has_labels ? "labels" : "-"}`;
+      setText("artifactSummary", artifactText);
+      setText("artifactMini", artifactText);
+      setText("updatedAt", formatDateTime(report.updated_at));
+      setText("projectName", report.project_name || "-");
+      setText("jobDuration", formatDuration(latestJob.duration_minutes));
+      setText("jobRange", `${formatDateTime(latestJob.started_at)} ~ ${formatDateTime(latestJob.finished_at)}`);
+      setText("currentFilekey", latestJob.filekey || "-");
+      setText("queueSummary", "offline");
+      setText("valSampleTotal", summary.val_sample_total ?? "-");
+      setHtml("classCoverage", `<span class="badge badge-neutral">${summary.class_coverage?.covered ?? 0} / ${summary.class_coverage?.total ?? 0}</span>`);
+      setText("dominantClass", summary.dominant_class ? `${summary.dominant_class} (${summary.dominant_class_support ?? 0})` : "-");
+      setText("issueSummary", `${issues.total_issues ?? issues.total ?? 0} / broken ${issues.broken_count ?? issues.broken ?? 0} / skipped ${issues.skipped_count ?? issues.skipped ?? 0}`);
+      setHtml("jobDetailBox", `
+        상태: ${escapeHtml(stateLabel(latestJob.state))}<br />
         datasetkey: ${escapeHtml(latestJob.datasetkey || "-")}<br />
         filekey: ${escapeHtml(latestJob.filekey || "-")}<br />
         시작: ${formatDateTime(latestJob.started_at)}<br />
@@ -1153,24 +747,26 @@
         train 분포: ${escapeHtml(formatDistributionSummary(trainDistribution))}<br />
         val 분포: ${escapeHtml(formatDistributionSummary(valDistribution))}<br />
         모델: ${escapeHtml(artifacts.best_model || "-")}<br />
-        메트릭: ${escapeHtml(artifacts.metrics || "-")}<br />
-        라벨: ${escapeHtml(artifacts.labels || "-")}<br /><br />
+        metrics: ${escapeHtml(artifacts.metrics || "-")}<br /><br />
         ${escapeHtml(latestJob.message || "상세 메시지가 없습니다.")}
-      `;
-
+      `);
       const notes = report.notes || [];
-      document.getElementById("notesBox").innerHTML = notes.length
-        ? `<ul>${notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>`
-        : "메모가 없습니다.";
-
+      setHtml("notesBox", notes.length ? `<ul>${notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>` : "메모가 없습니다.");
+      renderQuality(report.guideline_quality || {});
+      renderPredownload(report.predownload || {});
       renderMetricChart(report.history || []);
       renderLossChart(report.history || []);
       renderClassTable(report.per_class || []);
       renderConfusionMatrix(report.labels || [], report.confusion_matrix || []);
-      renderDatasetBreakdown(report.dataset || {});
+      renderDatasetBreakdown(report.dataset || {}, report.current_dataset || {});
       renderRecentJobs(report.recent_jobs || []);
     }
 
+    function formatStageTimingSummary(stageTimings) {
+      if (!stageTimings || typeof stageTimings !== "object") return "-";
+      const entries = Object.entries(stageTimings).filter(([, value]) => value !== null && value !== undefined);
+      return entries.length ? entries.map(([key, value]) => `${key} ${formatSecondsDuration(value)}`).join(" / ") : "-";
+    }
     function readStoredJson(key) {
       try {
         const raw = window.localStorage.getItem(key);
@@ -1179,46 +775,41 @@
         return null;
       }
     }
-
     function writeStoredJson(key, value) {
-      try {
-        window.localStorage.setItem(key, JSON.stringify(value));
-      } catch (_) {}
+      try { window.localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
     }
-
     function clearLiveRedirect() {
-      if (redirectTimer) {
-        clearInterval(redirectTimer);
-      }
+      if (redirectTimer) clearInterval(redirectTimer);
       redirectTimer = null;
       redirectTarget = "";
     }
-
     function getTimestampAgeMs(value) {
       if (!value) return null;
       const time = new Date(value).getTime();
       if (Number.isNaN(time)) return null;
       return Math.max(0, Date.now() - time);
     }
-
+    function buildViewerLiveUrl(url) {
+      if (!url) return url;
+      try {
+        const target = new URL(url);
+        target.searchParams.set("viewer", "1");
+        return target.toString();
+      } catch (_) {
+        return `${url}${url.includes("?") ? "&" : "?"}viewer=1`;
+      }
+    }
     function startLiveRedirect(status) {
       if (status.status !== "online" || !status.live_url) return;
-
       const liveUrl = buildViewerLiveUrl(status.live_url);
-      if (redirectTimer && redirectTarget === liveUrl) {
-        return;
-      }
-
+      if (redirectTimer && redirectTarget === liveUrl) return;
       clearLiveRedirect();
       redirectTarget = liveUrl;
-
       const delay = Number(status.redirect_delay_seconds || 3);
       let countdown = Number.isNaN(delay) ? 3 : delay;
-      const message = document.getElementById("redirectMessage");
-
+      const message = $("redirectMessage");
       message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
-
-      const timer = setInterval(() => {
+      redirectTimer = setInterval(() => {
         countdown -= 1;
         if (countdown <= 0) {
           clearLiveRedirect();
@@ -1227,74 +818,38 @@
         }
         message.textContent = `${countdown}초 후 실시간 대시보드로 이동합니다.`;
       }, 1000);
-
-      redirectTimer = timer;
     }
-
-    function buildViewerLiveUrl(url) {
-      if (!url) return url;
-      try {
-        const target = new URL(url);
-        target.searchParams.set("viewer", "1");
-        return target.toString();
-      } catch (_) {
-        const joiner = url.includes("?") ? "&" : "?";
-        return `${url}${joiner}viewer=1`;
-      }
-    }
-
     function normalizeLiveStatus(status) {
       const stored = readStoredJson(LIVE_STATUS_STORAGE_KEY) || {};
-      const merged = {
-        ...stored,
-        ...(status || {})
-      };
+      const merged = { ...stored, ...(status || {}) };
       merged.status = String(merged.status || "offline").toLowerCase();
       merged.live_url = String(merged.live_url || stored.live_url || "").trim();
       merged.redirect_delay_seconds = Number(merged.redirect_delay_seconds || 3) || 3;
       return merged;
     }
-
     function getStatusRevision(status) {
-      return [
-        status?.status || "offline",
-        status?.updated_at || "",
-        status?.live_url || "",
-        status?.message || ""
-      ].join("|");
+      return [status?.status || "offline", status?.updated_at || "", status?.live_url || "", status?.message || ""].join("|");
     }
-
     function getReportRevision(report) {
       const latestJob = report?.latest_job || {};
-      return [
-        report?.updated_at || "",
-        latestJob.filekey || "",
-        latestJob.finished_at || latestJob.started_at || "",
-        report?.summary?.best_val_macro_f1 ?? ""
-      ].join("|");
+      return [report?.updated_at || "", latestJob.filekey || "", latestJob.finished_at || latestJob.started_at || "", report?.summary?.best_val_macro_f1 ?? ""].join("|");
     }
-
     function computeStatusRefreshMs(status) {
       if (!status) return STATUS_REFRESH_WARNING_MS;
       if (status.status === "online") return STATUS_REFRESH_ONLINE_MS;
       if (status.status === "warning") return STATUS_REFRESH_WARNING_MS;
       return STATUS_REFRESH_OFFLINE_MS;
     }
-
     function computeReportRefreshMs(status) {
       if (!status) return REPORT_REFRESH_WARNING_MS;
       if (status.status === "online") return REPORT_REFRESH_ONLINE_MS;
       if (status.status === "warning") return REPORT_REFRESH_WARNING_MS;
       return REPORT_REFRESH_OFFLINE_MS;
     }
-
     function scheduleNextRefresh(status) {
-      if (refreshTimer) {
-        clearTimeout(refreshTimer);
-      }
+      if (refreshTimer) clearTimeout(refreshTimer);
       refreshTimer = setTimeout(refreshDashboard, computeStatusRefreshMs(status));
     }
-
     async function probeLiveUrl(url, timeoutMs = 1200) {
       if (!url) return false;
       const controller = new AbortController();
@@ -1302,14 +857,8 @@
       try {
         const probeUrl = new URL("/api/live-ping", buildViewerLiveUrl(url));
         probeUrl.searchParams.set("_t", String(Date.now()));
-        const response = await fetch(probeUrl.toString(), {
-          method: "GET",
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (!response.ok) {
-          return false;
-        }
+        const response = await fetch(probeUrl.toString(), { method: "GET", cache: "no-store", signal: controller.signal });
+        if (!response.ok) return false;
         const payload = await response.json().catch(() => null);
         return !!(payload && payload.ok);
       } catch (_) {
@@ -1318,164 +867,112 @@
         clearTimeout(timer);
       }
     }
-
     async function resolveLiveStatus(status) {
       const normalized = normalizeLiveStatus(status);
       const statusAgeMs = getTimestampAgeMs(normalized.updated_at);
-      const hasFreshOfflineSignal =
-        normalized.status === "offline" &&
-        statusAgeMs !== null &&
-        statusAgeMs <= OFFLINE_GRACE_MS;
-
-      if (!normalized.live_url) {
+      const freshOffline = normalized.status === "offline" && statusAgeMs !== null && statusAgeMs <= OFFLINE_GRACE_MS;
+      if (!normalized.live_url || freshOffline) {
         writeStoredJson(LIVE_STATUS_STORAGE_KEY, normalized);
         return normalized;
       }
-
-      if (hasFreshOfflineSignal) {
-        writeStoredJson(LIVE_STATUS_STORAGE_KEY, normalized);
-        return normalized;
-      }
-
       const reachable = await probeLiveUrl(normalized.live_url);
       if (reachable) {
         const resolved = {
           ...normalized,
           status: "online",
           updated_at: normalized.updated_at || new Date().toISOString(),
-          message: normalized.status === "online"
-            ? (normalized.message || "실시간 대시보드를 사용할 수 있습니다.")
-            : "실시간 연결을 확인했습니다.",
+          message: normalized.status === "online" ? (normalized.message || "실시간 대시보드를 사용할 수 있습니다.") : "실시간 연결을 확인했습니다."
         };
         writeStoredJson(LIVE_STATUS_STORAGE_KEY, resolved);
         return resolved;
       }
-
       if (normalized.status === "online") {
-        return {
-          ...normalized,
-          status: "warning",
-          message: "실시간 주소를 확인 중입니다.",
-        };
+        return { ...normalized, status: "warning", message: "실시간 주소를 확인 중입니다." };
       }
-
       writeStoredJson(LIVE_STATUS_STORAGE_KEY, normalized);
       return normalized;
     }
-
     async function fetchLiveOverview(status) {
       if (!status || !status.live_url) return null;
       try {
         const overviewUrl = new URL("/api/overview", buildViewerLiveUrl(status.live_url));
         overviewUrl.searchParams.set("lite", "1");
-        const response = await fetch(overviewUrl.toString(), {
-          method: "GET",
-          cache: "no-cache",
-        });
-        if (!response.ok) {
-          return null;
-        }
+        const response = await fetch(overviewUrl.toString(), { method: "GET", cache: "no-cache" });
+        if (!response.ok) return null;
         return response.json();
       } catch (_) {
         return null;
       }
     }
-
-    function formatPercent(value) {
-      const num = Number(value || 0);
-      if (Number.isNaN(num)) return "-";
-      return `${(num * 100).toFixed(1)}%`;
-    }
-
     function renderLiveOverview(overview) {
       if (!overview || !overview.launcher) return;
       const launcher = overview.launcher || {};
       const progress = overview.current_job_progress || {};
       const currentDataset = overview.current_dataset || {};
-      const pipelineStatus = overview.pipeline_status || {};
+      const dataset = overview.dataset || {};
+      const pipeline = overview.pipeline_status || {};
       const queue = overview.queue_progress || {};
       const currentJob = launcher.current_job || {};
-
-      document.getElementById("latestJobState").innerHTML =
-        `<span class="${stateClass(launcher.state)}">${stateLabel(launcher.state)}</span>`;
-      document.getElementById("latestJobMessage").textContent =
-        launcher.message || progress.detail || "현재 실행 상태를 확인하는 중입니다.";
-
-      const preparedTrain = currentDataset.prepared_train?.total ?? 0;
-      const preparedVal = currentDataset.prepared_val?.total ?? 0;
-      const preparedTest = currentDataset.prepared_test?.total ?? 0;
-      document.getElementById("sampleTotals").textContent =
-        `${preparedTrain} / ${preparedVal} / ${preparedTest}`;
-      document.getElementById("resumeState").textContent =
-        progress.stage_label || stateLabel(launcher.state);
-      document.getElementById("continualTotals").textContent =
-        `${preparedTrain} / ${preparedVal} / ${preparedTest}`;
-      document.getElementById("artifactSummary").textContent = "live";
-
-      const progressText = progress.ratio !== undefined
-        ? `${formatPercent(progress.ratio)} · ${progress.stage_label || "-"}`
-        : (progress.stage_label || "-");
-      document.getElementById("jobDuration").textContent = progressText;
-      document.getElementById("jobRange").textContent =
-        `활성 ${queue.active ?? 0} · 대기 ${queue.pending ?? 0} · 완료 ${queue.completed ?? 0}`;
-
-      document.getElementById("updatedAt").textContent =
-        formatDateTime(pipelineStatus.updated_at || overview.training_progress?.updated_at || new Date().toISOString());
-      document.getElementById("projectName").textContent =
-        overview.workspace_name ? `${overview.workspace_name} · live` : "live";
-      document.getElementById("valSampleTotal").textContent =
-        (overview.dataset?.val?.total ?? overview.dataset?.prepared_val?.total ?? "-");
-      document.getElementById("classCoverage").textContent =
-        progress.labels && progress.labels.length ? `${progress.labels.length} / ${progress.labels.length}` : "-";
-      document.getElementById("dominantClass").textContent =
-        currentJob.filekey ? `filekey ${currentJob.filekey}` : "-";
+      const preparedTrain = currentDataset.prepared_train?.total ?? dataset.prepared_train?.total ?? 0;
+      const preparedVal = currentDataset.prepared_val?.total ?? dataset.prepared_val?.total ?? 0;
+      const preparedTest = currentDataset.prepared_test?.total ?? dataset.prepared_test?.total ?? 0;
+      setHtml("latestJobState", `<span class="${stateClass(launcher.state)}">${stateLabel(launcher.state)}</span>`);
+      setText("latestJobMessage", launcher.message || progress.detail || "현재 실행 상태를 확인하는 중입니다.");
+      setText("sampleTotals", `${preparedTrain} / ${preparedVal} / ${preparedTest}`);
+      setText("resumeState", progress.stage_label || stateLabel(launcher.state));
+      setText("continualTotals", `${preparedTrain} / ${preparedVal} / ${preparedTest}`);
+      setText("artifactSummary", "live");
+      setText("artifactMini", "live");
+      setText("jobDuration", progress.ratio !== undefined ? `${formatPercent(progress.ratio)} / ${progress.stage_label || "-"}` : (progress.stage_label || "-"));
+      setText("jobRange", `실행 ${queue.active ?? 0} / 대기 ${queue.pending ?? 0} / 완료 ${queue.completed ?? 0}`);
+      setText("updatedAt", formatDateTime(pipeline.updated_at || overview.training_progress?.updated_at || new Date().toISOString()));
+      setText("projectName", overview.workspace_name ? `${overview.workspace_name} / live` : "live");
+      setText("valSampleTotal", dataset.val?.total ?? dataset.prepared_val?.total ?? "-");
+      const labels = overview.target_labels || overview.training_progress?.labels || [];
+      setHtml("classCoverage", `<span class="badge badge-neutral">${labels.length || "-"} / ${labels.length || "-"}</span>`);
+      setText("dominantClass", currentJob.filekey ? `filekey ${currentJob.filekey}` : "-");
       const currentIssues = overview.skip_report?.summary || {};
-      document.getElementById("issueSummary").textContent =
-        `${currentIssues.total_issues ?? 0} · broken ${currentIssues.broken_count ?? 0} · skipped ${currentIssues.skipped_count ?? 0}`;
-
-      document.getElementById("jobDetailBox").innerHTML = `
-        상태: ${stateLabel(launcher.state)}<br />
-        단계: ${progress.stage_label || "-"}<br />
-        진행률: ${formatPercent(progress.ratio || 0)}<br />
+      setText("issueSummary", `${currentIssues.total_issues ?? 0} / broken ${currentIssues.broken_count ?? 0} / skipped ${currentIssues.skipped_count ?? 0}`);
+      setText("currentFilekey", currentJob.filekey || "-");
+      setText("queueSummary", `${queue.active ?? 0} / ${queue.pending ?? 0} / ${queue.completed ?? 0}`);
+      setHtml("jobDetailBox", `
+        상태: ${escapeHtml(stateLabel(launcher.state))}<br />
+        단계: ${escapeHtml(progress.stage_label || "-")}<br />
+        진행률: ${escapeHtml(formatPercent(progress.ratio || 0))}<br />
         datasetkey: ${escapeHtml(currentJob.datasetkey || overview.aihub?.datasetkey || "-")}<br />
         filekey: ${escapeHtml(currentJob.filekey || "-")}<br />
         raw / prepared: ${(currentDataset.raw?.total ?? 0)} / ${preparedTrain + preparedVal + preparedTest}<br />
-        큐: 활성 ${queue.active ?? 0}, 대기 ${queue.pending ?? 0}, 완료 ${queue.completed ?? 0}<br /><br />
+        큐: 실행 ${queue.active ?? 0}, 대기 ${queue.pending ?? 0}, 완료 ${queue.completed ?? 0}<br /><br />
         ${escapeHtml(launcher.message || progress.detail || "현재 작업 메시지가 없습니다.")}
-      `;
+      `);
+      renderQuality(overview.guideline_quality || {});
+      renderPredownload(launcher.predownload || {});
+      renderDatasetBreakdown(dataset, currentDataset);
     }
-
     function renderLiveStatus(status) {
-      const pill = document.getElementById("liveStatePill");
-      const title = document.getElementById("liveStateTitle");
-      const message = document.getElementById("liveStateMessage");
-      const detail = document.getElementById("redirectMessage");
-      const liveLink = document.getElementById("liveLink");
-
+      const pill = $("liveStatePill");
+      const title = $("liveStateTitle");
+      const message = $("liveStateMessage");
+      const detail = $("redirectMessage");
+      const liveLink = $("liveLink");
       if (status.status === "online" && status.live_url) {
         const liveUrl = buildViewerLiveUrl(status.live_url);
         pill.className = "status-pill tone-online";
         pill.textContent = "online";
         title.textContent = status.live_title || "실시간 연결 가능";
-        message.textContent = status.updated_at
-          ? `최근 갱신 ${formatDateTime(status.updated_at)}`
-          : (status.message || "실시간 대시보드가 연결되어 있습니다.");
+        message.textContent = status.updated_at ? `최근 갱신 ${formatDateTime(status.updated_at)}` : (status.message || "실시간 대시보드가 연결되어 있습니다.");
         detail.textContent = "실시간 화면을 사용할 수 있습니다.";
         liveLink.style.display = "inline-flex";
         liveLink.href = liveUrl;
         startLiveRedirect(status);
         return;
       }
-
       clearLiveRedirect();
-
       if (status.status === "warning") {
         pill.className = "status-pill tone-warning";
         pill.textContent = "warning";
         title.textContent = status.live_title || "실시간 연결 확인 중";
-        message.textContent = status.updated_at
-          ? `최근 갱신 ${formatDateTime(status.updated_at)}`
-          : (status.message || "실시간 대시보드 상태를 확인하는 중입니다.");
+        message.textContent = status.updated_at ? `최근 갱신 ${formatDateTime(status.updated_at)}` : (status.message || "실시간 상태를 확인하는 중입니다.");
         detail.textContent = status.message || "잠시 후 다시 확인합니다.";
         if (status.live_url) {
           liveLink.style.display = "inline-flex";
@@ -1486,33 +983,28 @@
         }
         return;
       }
-
       pill.className = "status-pill tone-offline";
       pill.textContent = "offline";
       title.textContent = status.offline_title || "오프라인 리포트";
-      message.textContent = status.updated_at
-        ? `최근 갱신 ${formatDateTime(status.updated_at)}`
-        : (status.message || "최신 결과를 표시합니다.");
-      detail.textContent = status.message || "실시간 연결이 활성화되면 자동으로 이동합니다.";
+      message.textContent = status.updated_at ? `최근 갱신 ${formatDateTime(status.updated_at)}` : (status.message || "최신 결과를 표시합니다.");
+      detail.textContent = status.message || "실시간 연결이 활성화되면 자동으로 확인합니다.";
       liveLink.style.display = "none";
       liveLink.href = "#";
     }
-
     function renderCachedState() {
       const cachedStatus = readStoredJson(LIVE_STATUS_STORAGE_KEY);
       const cachedReport = readStoredJson(REPORT_STORAGE_KEY);
       if (cachedStatus) {
-        const normalizedStatus = normalizeLiveStatus(cachedStatus);
-        latestResolvedStatus = normalizedStatus;
-        lastStatusRevision = getStatusRevision(normalizedStatus);
-        renderLiveStatus(normalizedStatus);
+        const normalized = normalizeLiveStatus(cachedStatus);
+        latestResolvedStatus = normalized;
+        lastStatusRevision = getStatusRevision(normalized);
+        renderLiveStatus(normalized);
       }
       if (cachedReport) {
         lastReportRevision = getReportRevision(cachedReport);
         renderReport(cachedReport);
       }
     }
-
     async function refreshDashboard() {
       if (document.hidden) {
         scheduleNextRefresh(latestResolvedStatus);
@@ -1528,11 +1020,9 @@
           renderLiveStatus(resolvedStatus);
           lastStatusRevision = statusRevision;
         }
-
         const now = Date.now();
         let report = readStoredJson(REPORT_STORAGE_KEY);
-        const shouldFetchReport =
-          !report || (now - lastReportFetchedAt) >= computeReportRefreshMs(resolvedStatus);
+        const shouldFetchReport = !report || (now - lastReportFetchedAt) >= computeReportRefreshMs(resolvedStatus);
         if (shouldFetchReport) {
           report = await fetchJson("./latest-result.json");
           lastReportFetchedAt = now;
@@ -1545,14 +1035,9 @@
             lastReportRevision = reportRevision;
           }
         }
-
         if (resolvedStatus.live_url && (resolvedStatus.status === "online" || resolvedStatus.status === "warning")) {
           const overview = await fetchLiveOverview(resolvedStatus);
-          if (
-            overview &&
-            overview.overview_revision &&
-            overview.overview_revision !== lastLiveOverviewRevision
-          ) {
+          if (overview && overview.overview_revision && overview.overview_revision !== lastLiveOverviewRevision) {
             renderLiveOverview(overview);
             lastLiveOverviewRevision = overview.overview_revision;
           }
@@ -1563,29 +1048,19 @@
         if (cachedStatus.live_url) {
           const reachable = await probeLiveUrl(cachedStatus.live_url, 1800);
           if (reachable) {
-            renderLiveStatus({
-              ...cachedStatus,
-              status: "online",
-              message: "저장된 실시간 주소로 연결을 확인했습니다.",
-            });
-            const overview = await fetchLiveOverview({
-              ...cachedStatus,
-              status: "online",
-            });
-            if (overview) {
-              renderLiveOverview(overview);
-            }
+            const onlineStatus = { ...cachedStatus, status: "online", message: "저장된 실시간 주소로 연결을 확인했습니다." };
+            renderLiveStatus(onlineStatus);
+            const overview = await fetchLiveOverview(onlineStatus);
+            if (overview) renderLiveOverview(overview);
+            scheduleNextRefresh(onlineStatus);
             return;
           }
         }
-
-        document.getElementById("liveStateTitle").textContent = "상태 확인 지연";
-        document.getElementById("liveStatePill").className = "status-pill tone-warning";
-        document.getElementById("liveStatePill").textContent = "warning";
-        document.getElementById("liveStateMessage").textContent =
-          error?.message || "상태를 읽지 못했습니다.";
-        document.getElementById("redirectMessage").textContent =
-          "잠시 후 자동으로 다시 확인합니다.";
+        $("liveStateTitle").textContent = "상태 확인 지연";
+        $("liveStatePill").className = "status-pill tone-warning";
+        $("liveStatePill").textContent = "warning";
+        $("liveStateMessage").textContent = error?.message || "상태를 읽지 못했습니다.";
+        $("redirectMessage").textContent = "잠시 후 자동으로 다시 확인합니다.";
       } finally {
         scheduleNextRefresh(latestResolvedStatus);
       }
@@ -1594,9 +1069,7 @@
     renderCachedState();
     refreshDashboard();
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) {
-        refreshDashboard();
-      }
+      if (!document.hidden) refreshDashboard();
     });
   </script>
 </body>

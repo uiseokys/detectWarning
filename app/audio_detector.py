@@ -43,6 +43,19 @@ def _speech_worker(
         )
         return
 
+    def normalize_audio_for_stt(audio, target_rms: float = 0.075, max_gain: float = 8.0):
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.size == 0:
+            return audio
+        audio = audio - float(np.mean(audio))
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0.98:
+            audio = audio / max(peak, 1e-6) * 0.96
+        rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+        if 0.0 < rms < target_rms:
+            audio = audio * min(target_rms / max(rms, 1e-6), max_gain)
+        return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+
     try:
         whisper_model = WhisperModel(
             model_size_or_path=model_size,
@@ -154,18 +167,44 @@ def _speech_worker(
                     )
                     continue
 
+                audio = normalize_audio_for_stt(audio)
                 try:
                     result_queue.put(SpeechResult(status="processing", audio_level=level))
-                    segments, _info = whisper_model.transcribe(
-                        audio,
-                        language=language,
-                        vad_filter=False,
-                        beam_size=beam_size,
-                        best_of=best_of,
-                        no_speech_threshold=no_speech_threshold,
-                        condition_on_previous_text=False,
-                        temperature=0.0,
+                    prompt = (
+                        "한국어 위험상황 감지 음성입니다. 살려주세요, 도와주세요, 경찰 불러주세요, "
+                        "하지 마세요, 그만해, 멈춰, 손대지 마, 놓아줘, 때리지 마, 끌고 가지 마, "
+                        "납치, 칼, 죽여버릴거야, 위험해요 같은 표현을 정확히 받아씁니다."
                     )
+                    try:
+                        segments, _info = whisper_model.transcribe(
+                            audio,
+                            language=language,
+                            vad_filter=True,
+                            vad_parameters={
+                                "threshold": 0.35,
+                                "min_speech_duration_ms": 160,
+                                "min_silence_duration_ms": 350,
+                                "speech_pad_ms": 220,
+                            },
+                            beam_size=beam_size,
+                            best_of=best_of,
+                            no_speech_threshold=no_speech_threshold,
+                            condition_on_previous_text=False,
+                            initial_prompt=prompt,
+                            temperature=0.0,
+                        )
+                    except Exception:
+                        segments, _info = whisper_model.transcribe(
+                            audio,
+                            language=language,
+                            vad_filter=False,
+                            beam_size=beam_size,
+                            best_of=best_of,
+                            no_speech_threshold=no_speech_threshold,
+                            condition_on_previous_text=False,
+                            initial_prompt=prompt,
+                            temperature=0.0,
+                        )
                     transcript = " ".join(
                         segment.text.strip() for segment in segments if segment.text.strip()
                     ).strip()

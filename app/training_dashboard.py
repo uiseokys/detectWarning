@@ -8,8 +8,8 @@ from html import escape
 import json
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -24,34 +24,74 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from action_training_pipeline import (
-    build_source_label_matchers,
     collect_aihub_file_entries,
+    cleanup_transient_job_data,
     extract_json_payload,
     fetch_aihub_file_tree,
     fetch_aihub_file_tree_via_shell,
     get_target_labels,
     load_config,
-    match_source_label_text,
     parse_aihub_file_tree_listing,
+    read_jsonl_entries,
+    remove_transient_path_with_retries,
     resolve_aihub_shell_path,
     resolve_paths,
+    write_jsonl_entries,
 )
+from dashboard_aihub import (
+    AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS,
+    AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS,
+    AIHUB_AUTO_RECOMMEND_MAX_PENDING,
+    AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
+    AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS,
+    AIHUB_PREPARED_JOB_STATES,
+    AIHUB_TRAINED_JOB_STATES,
+    aihub_entry_zip_group,
+    build_aihub_lookup_result,
+    build_auto_recommendation_policy,
+    build_diagnosis_label_priorities,
+    diagnosis_priority_for_label,
+    find_next_trainable_aihub_entry,
+    normalize_aihub_lookup_entries,
+    normalize_auto_recommendation_policy,
+    normalize_label_count_map,
+    normalize_recommendation_label,
+    normalize_recommendation_zip_groups,
+    optional_aihub_api_key,
+    recommendation_label,
+    recommendation_zip_scope_state,
+)
+from dashboard_gpu import query_gpu_status
+from dashboard_normal_ratio import apply_auto_normal_ratio_to_config
 from dashboard_runtime import (
     build_job,
     build_retry_job_from,
     classify_job_exit,
     collect_result_summary,
     current_timestamp,
-    decode_process_output,
     flush_pages_pushes,
     persist_launcher_history,
     read_log_preview,
     read_log_tail,
+    infer_dashboard_job_kind,
     snapshot_job,
     sync_pages_live,
     sync_pages_report,
     write_dashboard_status,
 )
+from dashboard_notifications import (
+    NOTIFICATION_DEFAULT_NTFY_SERVER,
+    build_job_notification_payload,
+    normalize_notification_settings,
+    notification_settings_public,
+    send_ntfy_notification,
+)
+from dashboard_performance_plan import (
+    build_auto_tune_dashboard_job,
+    normalize_performance_plan_request,
+    performance_plan_deadline_reached as plan_deadline_reached,
+)
+from dashboard_quality import build_guideline_quality_summary
 from reporting import (
     STATE_SCHEMA_VERSION,
     analyze_class_balance,
@@ -72,8 +112,6 @@ from training_dashboard_view import render_dashboard_live_fragments, render_dash
 
 FILEKEY_RANGE_PATTERN = re.compile(r"^(\d+)(?:~|[-–—])(\d+)$")
 MAX_FILEKEY_RANGE_SIZE = 1000
-GPU_STATUS_CACHE: dict[str, object] = {"timestamp": 0.0, "value": None}
-GPU_STATUS_CACHE_LOCK = threading.Lock()
 OVERVIEW_CACHE: dict[tuple, dict] = {}
 OVERVIEW_CACHE_LOCK = threading.Lock()
 NO_CACHE_HEADERS = {
@@ -84,6 +122,8 @@ NO_CACHE_HEADERS = {
 NOTICE_COOKIE_NAME = "dw_dashboard_notice"
 NOTICE_LEVEL_COOKIE_NAME = "dw_dashboard_notice_level"
 NOTICE_COOKIE_MAX_AGE_SECONDS = 30
+PREDOWNLOAD_COMPLETED_HISTORY_LIMIT = 128
+PREDOWNLOAD_FAILED_HISTORY_LIMIT = 32
 LIVE_URL_ENV_NAME = "DETECTWARNING_LIVE_URL"
 LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
 PUBLIC_VIEWER_HOST_SUFFIXES = (".trycloudflare.com", ".workers.dev")
@@ -105,885 +145,6 @@ OVERVIEW_CURRENT_DATASET_MANIFEST_SPECS = (
     ("prepared_val", "current_prepared_val"),
     ("prepared_test", "current_prepared_test"),
 )
-AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS = 15 * 60
-AIHUB_FILEKEY_LOOKUP_TEXT_KEYS = (
-    "source_label",
-    "source_alias",
-    "sourceLabel",
-    "sourceAlias",
-    "label",
-    "name",
-    "fileName",
-    "fileNm",
-    "filePath",
-    "path",
-)
-AIHUB_FILEKEY_LOOKUP_STATUS_KEYS = (
-    "trainable",
-    "trained",
-    "prepared",
-    "excluded",
-    "queued",
-    "running",
-    "unknown",
-)
-AIHUB_TRAINED_JOB_STATES = {"completed", "completed_warning"}
-AIHUB_PREPARED_JOB_STATES = {"data_ready", "deferred", "waiting_for_data"}
-AIHUB_ZIP_GROUP_ORDER = ("outsidedoor", "insidedoor", "inside_croki")
-AIHUB_AUTO_RECOMMEND_ZIP_GROUPS = ("outsidedoor",)
-AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS = ("insidedoor",)
-AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS = ("inside_croki",)
-AIHUB_AUTO_RECOMMEND_INSIDE_FALLBACK_LABELS = {
-    "abduction": "minority_or_diagnosed",
-    "collapse": "diagnosed",
-}
-AIHUB_AUTO_RECOMMEND_MAX_CLASS_RATIO = 1.5
-AIHUB_AUTO_RECOMMEND_MAX_PENDING = 1
-AIHUB_ZIP_GROUP_PATTERN = re.compile(
-    r"^(?P<group>outsidedoor|insidedoor|inside_croki)(?:[_-](?P<number>\d+))?",
-    re.IGNORECASE,
-)
-DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS = {
-    "critical": 160.0,
-    "warning": 100.0,
-    "warn": 100.0,
-    "watch": 45.0,
-    "good": 0.0,
-    "normal": 0.0,
-    "improving": 0.0,
-}
-DIAGNOSIS_EMPTY_CLASS_PRIORITY = 5000.0
-
-
-def optional_aihub_api_key(shell_config: dict, override: str = "") -> str:
-    explicit = str(override or "").strip()
-    if explicit:
-        return explicit
-    direct_key = str(shell_config.get("api_key", "")).strip()
-    if direct_key:
-        return direct_key
-    env_name = str(shell_config.get("api_key_env", "AIHUB_API_KEY")).strip()
-    return str(os.environ.get(env_name) or "").strip()
-
-
-def aihub_entry_text(entry: dict) -> str:
-    return " ".join(
-        str(entry.get(key) or "")
-        for key in AIHUB_FILEKEY_LOOKUP_TEXT_KEYS
-        if entry.get(key) not in (None, "")
-    )
-
-
-def aihub_filekey_sort_key(entry: dict) -> tuple[int, int | str]:
-    value = str(entry.get("filekey") or "").strip()
-    if value.isdigit():
-        return (0, int(value))
-    return (1, value)
-
-
-def classify_aihub_zip_name(value: str) -> dict:
-    raw_value = str(value or "").strip()
-    filename = re.split(r"[/\\]", raw_value)[-1].strip()
-    match = AIHUB_ZIP_GROUP_PATTERN.match(filename.lower())
-    if not match:
-        return {
-            "zip_group": "",
-            "zip_number": None,
-            "zip_filename": filename,
-        }
-    number_text = match.group("number")
-    return {
-        "zip_group": match.group("group").lower(),
-        "zip_number": int(number_text) if number_text else None,
-        "zip_filename": filename,
-    }
-
-
-def aihub_entry_zip_group(entry: dict) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    explicit_group = str(entry.get("zip_group") or "").strip().lower()
-    if explicit_group:
-        return explicit_group
-    for key in ("zip_filename", "name", "fileName", "fileNm", "filePath", "path"):
-        value = str(entry.get(key) or "").strip()
-        if not value:
-            continue
-        zip_group = classify_aihub_zip_name(value).get("zip_group")
-        if zip_group:
-            return str(zip_group)
-    return ""
-
-
-def aihub_entry_matches_zip_groups(entry: dict, allowed_zip_groups: set[str]) -> bool:
-    if not allowed_zip_groups:
-        return True
-    return aihub_entry_zip_group(entry) in allowed_zip_groups
-
-
-def normalize_recommendation_zip_groups(values) -> set[str]:
-    return {
-        str(value).strip().lower()
-        for value in (values or [])
-        if str(value).strip()
-    }
-
-
-def build_auto_recommendation_policy() -> dict:
-    return {
-        "primary_zip_groups": list(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS),
-        "fallback_zip_groups": list(AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS),
-        "excluded_zip_groups": list(AIHUB_AUTO_RECOMMEND_EXCLUDED_ZIP_GROUPS),
-        "inside_fallback_labels": dict(AIHUB_AUTO_RECOMMEND_INSIDE_FALLBACK_LABELS),
-        "max_class_ratio": AIHUB_AUTO_RECOMMEND_MAX_CLASS_RATIO,
-    }
-
-
-def normalize_auto_recommendation_policy(policy: dict | None) -> dict:
-    if not isinstance(policy, dict):
-        return {}
-    max_ratio = policy.get("max_class_ratio", 0)
-    try:
-        max_ratio = float(max_ratio or 0)
-    except (TypeError, ValueError):
-        max_ratio = 0.0
-    fallback_labels = policy.get("inside_fallback_labels")
-    if not isinstance(fallback_labels, dict):
-        fallback_labels = {}
-    return {
-        "primary_zip_groups": normalize_recommendation_zip_groups(policy.get("primary_zip_groups")),
-        "fallback_zip_groups": normalize_recommendation_zip_groups(policy.get("fallback_zip_groups")),
-        "excluded_zip_groups": normalize_recommendation_zip_groups(policy.get("excluded_zip_groups")),
-        "inside_fallback_labels": {
-            normalize_recommendation_label(label): str(mode or "").strip().lower()
-            for label, mode in fallback_labels.items()
-            if normalize_recommendation_label(label)
-        },
-        "max_class_ratio": max_ratio,
-    }
-
-
-def normalize_recommendation_label(value) -> str:
-    return str(value or "").strip().lower()
-
-
-def insight_level_weight(level) -> float:
-    return DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS.get(
-        str(level or "").strip().lower(),
-        DIAGNOSIS_RECOMMENDATION_LEVEL_WEIGHTS["watch"],
-    )
-
-
-def add_diagnosis_label_priority(
-    priorities: dict[str, dict],
-    label,
-    *,
-    weight: float,
-    reason: str,
-    level: str = "watch",
-) -> None:
-    normalized = normalize_recommendation_label(label)
-    if not normalized or weight <= 0:
-        return
-    payload = priorities.setdefault(
-        normalized,
-        {
-            "label": str(label).strip(),
-            "priority": 0.0,
-            "reasons": [],
-            "level": "good",
-        },
-    )
-    payload["priority"] = round(float(payload.get("priority", 0.0) or 0.0) + float(weight), 6)
-    if reason and reason not in payload["reasons"]:
-        payload["reasons"].append(reason)
-    if insight_level_weight(level) > insight_level_weight(payload.get("level")):
-        payload["level"] = str(level or "watch").strip().lower()
-
-
-def build_diagnosis_label_priorities(insights: dict | None) -> dict[str, dict]:
-    insights = insights if isinstance(insights, dict) else {}
-    priorities: dict[str, dict] = {}
-
-    for item in insights.get("class_insights") or []:
-        if not isinstance(item, dict):
-            continue
-        level = str(item.get("level") or "watch").strip().lower()
-        details = item.get("details") if isinstance(item.get("details"), dict) else {}
-        title = str(item.get("title") or "")
-        base_weight = insight_level_weight(level)
-        title_bonus = 40.0 if ("위험" in title or "danger" in title.lower()) else 0.0
-        label = details.get("label")
-        if label:
-            add_diagnosis_label_priority(
-                priorities,
-                label,
-                weight=base_weight + title_bonus,
-                reason=title or "class insight",
-                level=level,
-            )
-        for label in details.get("labels") or []:
-            add_diagnosis_label_priority(
-                priorities,
-                label,
-                weight=base_weight,
-                reason=title or "class insight",
-                level=level,
-            )
-
-    for item in insights.get("confusion_insights") or []:
-        if not isinstance(item, dict):
-            continue
-        level = str(item.get("level") or "watch").strip().lower()
-        details = item.get("details") if isinstance(item.get("details"), dict) else {}
-        title = str(item.get("title") or "")
-        base_weight = insight_level_weight(level)
-        source_label = details.get("from")
-        if source_label:
-            add_diagnosis_label_priority(
-                priorities,
-                source_label,
-                weight=base_weight + 25.0,
-                reason=title or "confusion insight",
-                level=level,
-            )
-        for label in details.get("labels") or []:
-            add_diagnosis_label_priority(
-                priorities,
-                label,
-                weight=base_weight,
-                reason=title or "confusion insight",
-                level=level,
-            )
-
-    for item in insights.get("diagnostics") or []:
-        if not isinstance(item, dict):
-            continue
-        level = str(item.get("level") or "watch").strip().lower()
-        details = item.get("details") if isinstance(item.get("details"), dict) else {}
-        title = str(item.get("title") or "")
-        base_weight = insight_level_weight(level)
-        for key in ("minority_label", "dominant_label"):
-            label = details.get(key)
-            if key == "dominant_label":
-                continue
-            if label:
-                add_diagnosis_label_priority(
-                    priorities,
-                    label,
-                    weight=base_weight * 0.7,
-                    reason=title or "distribution insight",
-                    level=level,
-                )
-        for label in details.get("empty_labels") or []:
-            add_diagnosis_label_priority(
-                priorities,
-                label,
-                weight=DIAGNOSIS_EMPTY_CLASS_PRIORITY + base_weight,
-                reason=title or "empty class",
-                level="critical",
-            )
-        for row in details.get("low_sample_labels") or []:
-            if isinstance(row, dict) and row.get("label"):
-                add_diagnosis_label_priority(
-                    priorities,
-                    row.get("label"),
-                    weight=base_weight * 0.8,
-                    reason=title or "low sample class",
-                    level=level,
-                )
-
-    for item in insights.get("data_quality_insights") or []:
-        if not isinstance(item, dict):
-            continue
-        details = item.get("details") if isinstance(item.get("details"), dict) else {}
-        label = details.get("label")
-        if label:
-            level = str(item.get("level") or "watch").strip().lower()
-            add_diagnosis_label_priority(
-                priorities,
-                label,
-                weight=insight_level_weight(level) * 0.45,
-                reason=str(item.get("title") or "data quality insight"),
-                level=level,
-            )
-
-    return priorities
-
-
-def diagnosis_priority_for_label(label, priorities: dict[str, dict]) -> dict:
-    return priorities.get(
-        normalize_recommendation_label(label),
-        {"label": str(label or "").strip(), "priority": 0.0, "reasons": [], "level": "good"},
-    )
-
-
-def normalize_label_count_map(counts: dict | None) -> Counter[str]:
-    normalized: Counter[str] = Counter()
-    if not isinstance(counts, dict):
-        return normalized
-    for label, count in counts.items():
-        label_key = str(label or "").strip()
-        if not label_key:
-            continue
-        try:
-            normalized[label_key] += max(int(count or 0), 0)
-        except (TypeError, ValueError):
-            continue
-    return normalized
-
-
-def normalize_split_label_counts(
-    prepared_label_counts: dict[str, int] | None,
-    prepared_split_label_counts: dict[str, dict[str, int]] | None,
-) -> dict[str, Counter[str]]:
-    if isinstance(prepared_split_label_counts, dict) and prepared_split_label_counts:
-        return {
-            str(split_name): normalize_label_count_map(counts if isinstance(counts, dict) else {})
-            for split_name, counts in prepared_split_label_counts.items()
-        }
-    fallback_counts = normalize_label_count_map(prepared_label_counts)
-    if not fallback_counts:
-        return {}
-    return {"train": Counter(fallback_counts), "val": Counter(fallback_counts)}
-
-
-def recommendation_coverage_score(
-    label: str,
-    *,
-    prepared_counts: Counter[str],
-    split_counts: dict[str, Counter[str]],
-    planned_count: int = 0,
-) -> dict:
-    train_count = int(split_counts.get("train", Counter()).get(label, 0) or 0)
-    val_count = int(split_counts.get("val", Counter()).get(label, 0) or 0)
-    total_count = int(prepared_counts.get(label, 0) or 0)
-    effective_train_count = train_count + max(int(planned_count or 0), 0)
-    effective_val_count = val_count + max(int(planned_count or 0), 0)
-    if effective_train_count <= 0 and effective_val_count <= 0:
-        coverage_rank = 0
-        coverage_state = "missing"
-    elif effective_train_count <= 0 or effective_val_count <= 0:
-        coverage_rank = 1
-        coverage_state = "split_incomplete"
-    else:
-        coverage_rank = 2
-        coverage_state = "covered"
-    return {
-        "coverage_rank": coverage_rank,
-        "coverage_state": coverage_state,
-        "train_count": train_count,
-        "val_count": val_count,
-        "prepared_count": total_count,
-        "train_balance_bucket": recommendation_count_bucket(train_count, 16),
-        "val_balance_bucket": recommendation_count_bucket(val_count, 4),
-        "prepared_balance_bucket": recommendation_count_bucket(total_count, 20),
-        "effective_train_count": effective_train_count,
-        "effective_val_count": effective_val_count,
-    }
-
-
-def recommendation_count_bucket(count: int, bucket_size: int) -> int:
-    return max(int(count or 0), 0) // max(int(bucket_size or 1), 1)
-
-
-def recommendation_effective_label_counts(
-    *,
-    prepared_counts: Counter[str],
-    planned_counts: Counter[str],
-    candidate_labels: set[str],
-) -> Counter[str]:
-    labels = {
-        str(label or "").strip()
-        for label in (*prepared_counts.keys(), *planned_counts.keys(), *candidate_labels)
-        if str(label or "").strip()
-    }
-    return Counter(
-        {
-            label: max(int(prepared_counts.get(label, 0) or 0), 0)
-            + max(int(planned_counts.get(label, 0) or 0), 0)
-            for label in labels
-        }
-    )
-
-
-def recommendation_minority_state(label: str, label_counts: Counter[str]) -> dict:
-    normalized_label = str(label or "").strip()
-    if not normalized_label or not label_counts:
-        return {"is_minority": False, "min_count": 0, "label_count": 0}
-    label_count = int(label_counts.get(normalized_label, 0) or 0)
-    min_count = min(int(count or 0) for count in label_counts.values())
-    return {
-        "is_minority": label_count <= min_count,
-        "min_count": min_count,
-        "label_count": label_count,
-    }
-
-
-def recommendation_balance_limit_state(
-    label: str,
-    label_counts: Counter[str],
-    *,
-    max_ratio: float,
-) -> dict:
-    normalized_label = str(label or "").strip()
-    if not normalized_label or max_ratio <= 0 or len(label_counts) < 2:
-        return {
-            "allowed": True,
-            "max_ratio": max_ratio,
-            "min_count": 0,
-            "label_count": int(label_counts.get(normalized_label, 0) or 0),
-            "projected_count": int(label_counts.get(normalized_label, 0) or 0) + 1,
-            "limit": None,
-            "reason": "",
-        }
-    label_count = int(label_counts.get(normalized_label, 0) or 0)
-    min_count = min(int(count or 0) for count in label_counts.values())
-    projected_count = label_count + 1
-    if label_count <= min_count:
-        allowed = True
-    elif min_count <= 0:
-        allowed = False
-    else:
-        allowed = label_count <= (float(min_count) * float(max_ratio))
-    return {
-        "allowed": allowed,
-        "max_ratio": max_ratio,
-        "min_count": min_count,
-        "label_count": label_count,
-        "projected_count": projected_count,
-        "limit": round(float(min_count) * float(max_ratio), 6) if min_count > 0 else 0,
-        "reason": "" if allowed else "class_ratio_limit",
-    }
-
-
-def recommendation_zip_scope_state(
-    entry: dict,
-    *,
-    allowed_groups: set[str],
-    policy: dict,
-    label: str,
-    primary_candidate_labels: set[str],
-    diagnosis_priority: dict,
-    label_counts: Counter[str],
-    strict_fallback: bool,
-) -> dict:
-    zip_group = aihub_entry_zip_group(entry) or str(entry.get("zip_group") or "").strip().lower()
-    if not policy:
-        return {
-            "allowed": aihub_entry_matches_zip_groups(entry, allowed_groups),
-            "zip_group": zip_group,
-            "scope_reason": "allowed_zip_group",
-        }
-
-    primary_groups = policy.get("primary_zip_groups") or allowed_groups
-    fallback_groups = policy.get("fallback_zip_groups") or set()
-    excluded_groups = policy.get("excluded_zip_groups") or set()
-    fallback_labels = policy.get("inside_fallback_labels") or {}
-    normalized_label = normalize_recommendation_label(label)
-    insight_priority = float(diagnosis_priority.get("priority", 0.0) or 0.0)
-    minority_state = recommendation_minority_state(label, label_counts)
-
-    if zip_group in excluded_groups:
-        return {"allowed": False, "zip_group": zip_group, "scope_reason": "excluded_zip_group"}
-    if not zip_group:
-        return {"allowed": False, "zip_group": zip_group, "scope_reason": "missing_zip_group"}
-    if not primary_groups or zip_group in primary_groups:
-        return {"allowed": True, "zip_group": zip_group, "scope_reason": "primary_zip_group"}
-    if zip_group not in fallback_groups:
-        return {"allowed": False, "zip_group": zip_group, "scope_reason": "unsupported_zip_group"}
-    fallback_mode = str(fallback_labels.get(normalized_label) or "").strip().lower()
-    if not fallback_mode:
-        return {"allowed": False, "zip_group": zip_group, "scope_reason": "fallback_label_not_allowed"}
-    if normalized_label in {normalize_recommendation_label(item) for item in primary_candidate_labels}:
-        return {"allowed": False, "zip_group": zip_group, "scope_reason": "primary_candidate_available"}
-    if not strict_fallback:
-        return {"allowed": True, "zip_group": zip_group, "scope_reason": "fallback_zip_group"}
-    if fallback_mode == "diagnosed" and insight_priority > 0:
-        return {"allowed": True, "zip_group": zip_group, "scope_reason": "diagnosed_fallback"}
-    if fallback_mode == "minority_or_diagnosed" and (
-        insight_priority > 0 or minority_state.get("is_minority")
-    ):
-        return {"allowed": True, "zip_group": zip_group, "scope_reason": "minority_or_diagnosed_fallback"}
-    return {"allowed": False, "zip_group": zip_group, "scope_reason": "fallback_condition_not_met"}
-
-
-def normalize_aihub_lookup_entries(
-    entries: list[dict],
-    *,
-    label_mapping: dict,
-    excluded_source_labels: list,
-    target_labels: list[str] | None = None,
-) -> list[dict]:
-    label_matchers = build_source_label_matchers(label_mapping.keys())
-    excluded_matchers = build_source_label_matchers(excluded_source_labels)
-    target_label_set = {
-        str(label).strip()
-        for label in (target_labels or [])
-        if str(label).strip()
-    }
-    normalized_entries: list[dict] = []
-
-    for entry in sorted(entries, key=aihub_filekey_sort_key):
-        if not isinstance(entry, dict):
-            continue
-        filekey = str(entry.get("filekey") or "").strip()
-        if not filekey:
-            continue
-
-        entry_text = aihub_entry_text(entry)
-        matched_source_label = match_source_label_text(entry_text, matchers=label_matchers)
-        excluded_source_label = match_source_label_text(entry_text, matchers=excluded_matchers)
-        mapped_target_label = str(label_mapping.get(matched_source_label) or "").strip()
-        out_of_scope_target_label = ""
-        if mapped_target_label and target_label_set and mapped_target_label not in target_label_set:
-            out_of_scope_target_label = mapped_target_label
-            target_label = ""
-        else:
-            target_label = mapped_target_label
-        source_label = str(entry.get("source_label") or entry.get("sourceLabel") or "").strip()
-        source_alias = str(entry.get("source_alias") or entry.get("sourceAlias") or "").strip()
-        name = str(
-            entry.get("name")
-            or entry.get("fileName")
-            or entry.get("fileNm")
-            or entry.get("filePath")
-            or entry.get("path")
-            or ""
-        ).strip()
-        zip_info = classify_aihub_zip_name(name)
-        if excluded_source_label or out_of_scope_target_label:
-            status = "excluded"
-        elif target_label:
-            status = "trainable"
-        else:
-            status = "unknown"
-
-        normalized_entries.append(
-            {
-                "filekey": filekey,
-                "name": name,
-                "source_label": source_label,
-                "source_alias": source_alias,
-                "matched_source_label": matched_source_label,
-                "target_label": target_label,
-                "excluded_source_label": excluded_source_label,
-                "out_of_scope_target_label": out_of_scope_target_label,
-                **zip_info,
-                "status": status,
-                "trainable": status == "trainable",
-                "selectable": status in {"trainable", "unknown"},
-            }
-        )
-
-    return normalized_entries
-
-
-def build_aihub_lookup_result(
-    *,
-    datasetkey: str,
-    source: str,
-    entries: list[dict],
-    cache_hit: bool,
-    target_labels: list[str] | None = None,
-) -> dict:
-    summary = {"total": len(entries)}
-    for key in AIHUB_FILEKEY_LOOKUP_STATUS_KEYS:
-        summary[key] = len([entry for entry in entries if entry.get("status") == key])
-    summary["selectable"] = len([entry for entry in entries if entry.get("selectable")])
-
-    return {
-        "ok": True,
-        "datasetkey": datasetkey,
-        "source": source,
-        "summary": summary,
-        "groups": summarize_aihub_lookup_groups(entries),
-        "zip_groups": summarize_aihub_zip_groups(entries),
-        "target_labels": [str(label) for label in (target_labels or [])],
-        "entries": entries,
-        "filekeys": [entry["filekey"] for entry in entries],
-        "trainable_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trainable"],
-        "selectable_filekeys": [entry["filekey"] for entry in entries if entry.get("selectable")],
-        "trained_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "trained"],
-        "prepared_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "prepared"],
-        "excluded_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "excluded"],
-        "unknown_filekeys": [entry["filekey"] for entry in entries if entry.get("status") == "unknown"],
-        "cache": {
-            "hit": bool(cache_hit),
-            "ttl_seconds": AIHUB_FILEKEY_LOOKUP_CACHE_SECONDS,
-        },
-    }
-
-
-def find_next_trainable_aihub_entry(
-    entries: list[dict],
-    *,
-    existing_filekeys: set[str] | None = None,
-    prepared_label_counts: dict[str, int] | None = None,
-    prepared_split_label_counts: dict[str, dict[str, int]] | None = None,
-    allowed_zip_groups: list[str] | tuple[str, ...] | set[str] | None = None,
-    insights: dict | None = None,
-    recommendation_policy: dict | None = None,
-) -> dict | None:
-    blocked = {str(filekey).strip() for filekey in (existing_filekeys or set()) if str(filekey).strip()}
-    allowed_groups = normalize_recommendation_zip_groups(allowed_zip_groups)
-    policy = normalize_auto_recommendation_policy(recommendation_policy)
-    prepared_counts = normalize_label_count_map(prepared_label_counts)
-    split_counts = normalize_split_label_counts(prepared_label_counts, prepared_split_label_counts)
-    diagnosis_priorities = build_diagnosis_label_priorities(insights)
-    primary_groups = policy.get("primary_zip_groups") or allowed_groups
-    excluded_groups = policy.get("excluded_zip_groups") or set()
-    primary_candidate_labels: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        filekey = str(entry.get("filekey") or "").strip()
-        if not filekey or filekey in blocked:
-            continue
-        if entry.get("status") != "trainable" or entry.get("selectable") is False:
-            continue
-        zip_group = aihub_entry_zip_group(entry)
-        if zip_group in excluded_groups:
-            continue
-        if aihub_entry_matches_zip_groups(entry, primary_groups):
-            primary_candidate_labels.add(recommendation_label(entry))
-
-    planned_counts: Counter[str] = Counter()
-    trained_counts: Counter[str] = Counter()
-    active_zip_counts: Counter[str] = Counter()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        label = recommendation_label(entry)
-        priority_payload = diagnosis_priority_for_label(label, diagnosis_priorities)
-        zip_scope = recommendation_zip_scope_state(
-            entry,
-            allowed_groups=allowed_groups,
-            policy=policy,
-            label=label,
-            primary_candidate_labels=primary_candidate_labels,
-            diagnosis_priority=priority_payload,
-            label_counts=Counter(),
-            strict_fallback=False,
-        )
-        if not zip_scope.get("allowed"):
-            continue
-        zip_group = str(zip_scope.get("zip_group") or entry.get("zip_group") or "기타")
-        status = str(entry.get("status") or "unknown")
-        if status in {"queued", "running"}:
-            planned_counts[label] += 1
-            active_zip_counts[zip_group] += 1
-        elif status == "trained":
-            trained_counts[label] += 1
-            active_zip_counts[zip_group] += 1
-        elif status == "prepared":
-            active_zip_counts[zip_group] += 1
-
-    candidate_labels: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        filekey = str(entry.get("filekey") or "").strip()
-        if not filekey or filekey in blocked:
-            continue
-        if entry.get("status") != "trainable" or entry.get("selectable") is False:
-            continue
-        label = recommendation_label(entry)
-        priority_payload = diagnosis_priority_for_label(label, diagnosis_priorities)
-        broad_scope = recommendation_zip_scope_state(
-            entry,
-            allowed_groups=allowed_groups,
-            policy=policy,
-            label=label,
-            primary_candidate_labels=primary_candidate_labels,
-            diagnosis_priority=priority_payload,
-            label_counts=Counter(),
-            strict_fallback=False,
-        )
-        if broad_scope.get("allowed"):
-            candidate_labels.add(label)
-    effective_label_counts = recommendation_effective_label_counts(
-        prepared_counts=prepared_counts,
-        planned_counts=planned_counts,
-        candidate_labels=candidate_labels,
-    )
-    max_class_ratio = float(policy.get("max_class_ratio", 0.0) or 0.0)
-
-    best: tuple[tuple, dict] | None = None
-    for order, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        filekey = str(entry.get("filekey") or "").strip()
-        if not filekey or filekey in blocked:
-            continue
-        if entry.get("status") == "trainable" and entry.get("selectable") is not False:
-            label = recommendation_label(entry)
-            diagnosis_priority = diagnosis_priority_for_label(label, diagnosis_priorities)
-            insight_priority = float(diagnosis_priority.get("priority", 0.0) or 0.0)
-            zip_scope = recommendation_zip_scope_state(
-                entry,
-                allowed_groups=allowed_groups,
-                policy=policy,
-                label=label,
-                primary_candidate_labels=primary_candidate_labels,
-                diagnosis_priority=diagnosis_priority,
-                label_counts=effective_label_counts,
-                strict_fallback=True,
-            )
-            if not zip_scope.get("allowed"):
-                continue
-            balance_limit = recommendation_balance_limit_state(
-                label,
-                effective_label_counts,
-                max_ratio=max_class_ratio,
-            )
-            if not balance_limit.get("allowed"):
-                continue
-            zip_group = str(zip_scope.get("zip_group") or entry.get("zip_group") or "기타")
-            planned_count = int(planned_counts[label])
-            trained_count = int(trained_counts[label])
-            active_zip_count = int(active_zip_counts[zip_group])
-            coverage_score = recommendation_coverage_score(
-                label,
-                prepared_counts=prepared_counts,
-                split_counts=split_counts,
-                planned_count=planned_count,
-            )
-            prepared_count = int(coverage_score["prepared_count"])
-            score = (
-                coverage_score["coverage_rank"],
-                planned_count,
-                coverage_score["val_balance_bucket"],
-                coverage_score["train_balance_bucket"],
-                coverage_score["prepared_balance_bucket"],
-                -insight_priority,
-                prepared_count + planned_count,
-                prepared_count,
-                trained_count,
-                active_zip_count,
-                aihub_filekey_sort_key(entry),
-                order,
-            )
-            candidate = {
-                **entry,
-                "recommendation_reason": "diagnosis_guided" if insight_priority > 0 else "class_balance",
-                "recommendation_scope": {
-                    "allowed_zip_groups": sorted(allowed_groups),
-                    "zip_group": zip_group,
-                    "scope_reason": zip_scope.get("scope_reason") or "",
-                    "primary_zip_groups": sorted(policy.get("primary_zip_groups") or allowed_groups),
-                    "fallback_zip_groups": sorted(policy.get("fallback_zip_groups") or []),
-                    "excluded_zip_groups": sorted(policy.get("excluded_zip_groups") or []),
-                },
-                "recommendation_score": {
-                    "target_label": label,
-                    "insight_priority": round(insight_priority, 6),
-                    "insight_reasons": list(diagnosis_priority.get("reasons") or [])[:4],
-                    "insight_level": diagnosis_priority.get("level") or "good",
-                    "prepared_count": prepared_count,
-                    "planned_count": planned_count,
-                    "trained_count": trained_count,
-                    "active_zip_count": active_zip_count,
-                    "coverage_state": coverage_score["coverage_state"],
-                    "train_count": coverage_score["train_count"],
-                    "val_count": coverage_score["val_count"],
-                    "train_balance_bucket": coverage_score["train_balance_bucket"],
-                    "val_balance_bucket": coverage_score["val_balance_bucket"],
-                    "prepared_balance_bucket": coverage_score["prepared_balance_bucket"],
-                    "balance_max_ratio": balance_limit.get("max_ratio"),
-                    "balance_min_count": balance_limit.get("min_count"),
-                    "balance_label_count": balance_limit.get("label_count"),
-                    "balance_projected_count": balance_limit.get("projected_count"),
-                    "balance_limit": balance_limit.get("limit"),
-                    "sort_order": order,
-                },
-            }
-            if best is None or score < best[0]:
-                best = (score, candidate)
-    return best[1] if best is not None else None
-
-
-def recommendation_label(entry: dict) -> str:
-    return str(
-        entry.get("target_label")
-        or entry.get("matched_source_label")
-        or entry.get("source_label")
-        or "unknown"
-    ).strip() or "unknown"
-
-
-def summarize_aihub_zip_groups(entries: list[dict]) -> list[dict]:
-    groups: dict[str, dict] = {
-        label: {
-            "label": label,
-            "total": 0,
-            "selectable": 0,
-            "trained": 0,
-            "prepared": 0,
-            "queued": 0,
-            "running": 0,
-            "excluded": 0,
-            "unknown": 0,
-        }
-        for label in AIHUB_ZIP_GROUP_ORDER
-    }
-    for entry in entries:
-        label = str(entry.get("zip_group") or "기타")
-        group = groups.setdefault(
-            label,
-            {
-                "label": label,
-                "total": 0,
-                "selectable": 0,
-                "trained": 0,
-                "prepared": 0,
-                "queued": 0,
-                "running": 0,
-                "excluded": 0,
-                "unknown": 0,
-            },
-        )
-        group["total"] += 1
-        if entry.get("selectable"):
-            group["selectable"] += 1
-        status = str(entry.get("status") or "unknown")
-        if status in {"trained", "prepared", "queued", "running", "excluded", "unknown"}:
-            group[status] += 1
-
-    ordered_labels = [*AIHUB_ZIP_GROUP_ORDER, *sorted(label for label in groups if label not in AIHUB_ZIP_GROUP_ORDER)]
-    return [groups[label] for label in ordered_labels if groups[label]["total"] > 0]
-
-
-def summarize_aihub_lookup_groups(entries: list[dict]) -> list[dict]:
-    groups: dict[str, dict] = {}
-    for entry in entries:
-        label = (
-            entry.get("source_label")
-            or entry.get("source_alias")
-            or entry.get("matched_source_label")
-            or "미분류"
-        )
-        group = groups.setdefault(
-            str(label),
-            {
-                "label": str(label),
-                "total": 0,
-                "trainable": 0,
-                "trained": 0,
-                "prepared": 0,
-                "queued": 0,
-                "running": 0,
-                "excluded": 0,
-                "unknown": 0,
-            },
-        )
-        group["total"] += 1
-        status = str(entry.get("status") or "unknown")
-        if status in {"trainable", "trained", "prepared", "queued", "running", "excluded", "unknown"}:
-            group[status] += 1
-    return sorted(groups.values(), key=lambda item: item["label"])
-
-
 def wants_json_response(request: Request | None) -> bool:
     if request is None:
         return False
@@ -1047,118 +208,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def query_gpu_status(*, cache_ttl_seconds: float = 5.0) -> dict:
-    now = time.time()
-    with GPU_STATUS_CACHE_LOCK:
-        cached_timestamp = float(GPU_STATUS_CACHE.get("timestamp") or 0.0)
-        cached_value = GPU_STATUS_CACHE.get("value")
-        if cached_value is not None and (now - cached_timestamp) <= cache_ttl_seconds:
-            return cached_value
-
-    nvidia_smi = shutil.which("nvidia-smi")
-    if not nvidia_smi:
-        result = {
-            "available": False,
-            "summary": "-",
-            "detail": "nvidia-smi를 찾지 못했습니다.",
-            "device_name": None,
-            "utilization_gpu": None,
-            "utilization_memory": None,
-            "memory_used_mb": None,
-            "memory_total_mb": None,
-            "memory_percent": None,
-            "temperature_c": None,
-            "devices": [],
-        }
-    else:
-        command = [
-            nvidia_smi,
-            "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                timeout=1.5,
-                check=True,
-            )
-            stdout = decode_process_output(completed.stdout)
-            devices = []
-            for raw_line in stdout.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = [part.strip() for part in line.split(",")]
-                if len(parts) < 7:
-                    continue
-                gpu_util = _parse_int_or_none(parts[2])
-                memory_util = _parse_int_or_none(parts[3])
-                memory_used = _parse_float_or_none(parts[4])
-                memory_total = _parse_float_or_none(parts[5])
-                temperature = _parse_int_or_none(parts[6])
-                memory_percent = None
-                if memory_used is not None and memory_total not in (None, 0):
-                    memory_percent = round((memory_used / memory_total) * 100.0, 1)
-                devices.append(
-                    {
-                        "index": _parse_int_or_none(parts[0]),
-                        "name": parts[1],
-                        "utilization_gpu": gpu_util,
-                        "utilization_memory": memory_util,
-                        "memory_used_mb": memory_used,
-                        "memory_total_mb": memory_total,
-                        "memory_percent": memory_percent,
-                        "temperature_c": temperature,
-                    }
-                )
-
-            primary = None
-            if devices:
-                primary = max(
-                    devices,
-                    key=lambda item: (
-                        item.get("utilization_gpu") or 0,
-                        item.get("memory_percent") or 0.0,
-                    ),
-                )
-
-            result = {
-                "available": bool(primary),
-                "summary": _build_gpu_summary(primary),
-                "detail": _build_gpu_detail(primary, device_count=len(devices)),
-                "device_index": primary.get("index") if primary else None,
-                "device_name": primary.get("name") if primary else None,
-                "utilization_gpu": primary.get("utilization_gpu") if primary else None,
-                "utilization_memory": primary.get("utilization_memory") if primary else None,
-                "memory_used_mb": primary.get("memory_used_mb") if primary else None,
-                "memory_total_mb": primary.get("memory_total_mb") if primary else None,
-                "memory_percent": primary.get("memory_percent") if primary else None,
-                "temperature_c": primary.get("temperature_c") if primary else None,
-                "devices": devices,
-            }
-        except (subprocess.SubprocessError, OSError):
-            result = {
-                "available": False,
-                "summary": "-",
-                "detail": "GPU 상태를 읽지 못했습니다.",
-                "device_index": None,
-                "device_name": None,
-                "utilization_gpu": None,
-                "utilization_memory": None,
-                "memory_used_mb": None,
-                "memory_total_mb": None,
-                "memory_percent": None,
-                "temperature_c": None,
-                "devices": [],
-            }
-
-    with GPU_STATUS_CACHE_LOCK:
-        GPU_STATUS_CACHE["timestamp"] = now
-        GPU_STATUS_CACHE["value"] = result
-    return result
-
-
 def resolve_allowed_origins(config: dict) -> list[str]:
     dashboard_config = config.get("dashboard", {})
     configured = dashboard_config.get("allowed_origins")
@@ -1184,6 +233,265 @@ def resolve_allowed_origins(config: dict) -> list[str]:
     return ["http://127.0.0.1:8010", "http://localhost:8010"]
 
 
+def apply_manifest_aware_training_overrides(runtime_config: dict, paths: dict, job: dict) -> dict:
+    stage = str(job.get("stage") or "").strip().lower()
+    job_kind = str(job.get("job_kind") or "").strip().lower()
+    if stage != "train" and job_kind != "auto_tune":
+        return {}
+
+    train_manifest = paths.get("active_prepared_train")
+    if not isinstance(train_manifest, Path) or not train_manifest.exists():
+        train_manifest = paths.get("guideline_prepared_train")
+    if not isinstance(train_manifest, Path) or not train_manifest.exists():
+        return {}
+
+    labels = [str(label) for label in get_target_labels(runtime_config)]
+    counts: Counter[str] = Counter()
+    pose_counts: Counter[str] = Counter()
+    rgb_counts: Counter[str] = Counter()
+    for row in read_jsonl_entries(train_manifest):
+        label = str(row.get("target_label") or "").strip()
+        if label not in labels:
+            continue
+        counts[label] += 1
+        pose_path = str(row.get("pose_path") or "").strip()
+        if pose_path and Path(pose_path).exists():
+            pose_counts[label] += 1
+        rgb_path = str(row.get("rgb_feature_path") or "").strip()
+        if rgb_path and Path(rgb_path).exists():
+            rgb_counts[label] += 1
+
+    trainable_counts = {label: int(pose_counts.get(label, 0) or counts.get(label, 0)) for label in labels}
+    nonzero_counts = [count for count in trainable_counts.values() if count > 0]
+    if len(nonzero_counts) <= 1:
+        return {}
+
+    manifest_multipliers: dict[str, float] = {}
+    if trainable_counts.get("abduction", 0) > 0:
+        manifest_multipliers["abduction"] = 1.75
+
+    training_config = runtime_config.setdefault("training", {})
+    merged_multipliers: dict[str, float] = dict(manifest_multipliers)
+    training_config["class_weight_multipliers"] = dict(
+        sorted(merged_multipliers.items(), key=lambda item: labels.index(item[0]) if item[0] in labels else len(labels))
+    )
+    training_config["balanced_sampler"] = True
+    training_config["class_weight"] = "balanced"
+    training_config["loss"] = "focal"
+    training_config["focal_gamma"] = 1.0
+    training_config["label_smoothing"] = 0.0
+    training_config["temporal_pooling"] = "mean"
+    training_config["learning_rate"] = 0.0003
+    training_config["selection_metric"] = "accuracy"
+    training_config["weight_decay"] = 0.003
+    training_config["dropout"] = 0.35
+    training_config["early_stopping_patience"] = max(
+        int(training_config.get("early_stopping_patience") or 0),
+        12,
+    )
+    training_config["overfit_guard_enabled"] = False
+    training_config["overfit_guard_min_epoch"] = 16
+    training_config["overfit_guard_loss_gap"] = 8.0
+    training_config["overfit_guard_patience"] = 3
+    training_config["max_duplicate_pose_label_samples"] = 0
+    adaptive_config = training_config.setdefault("adaptive_class_weighting", {})
+    if isinstance(adaptive_config, dict):
+        adaptive_config["enabled"] = False
+        adaptive_config["disabled_reason"] = (
+            "manifest_aware_training_uses_current_distribution_only; "
+            "previous metrics can be stale after label or manifest repairs"
+        )
+        adaptive_config["minority_count_multiplier"] = max(
+            float(adaptive_config.get("minority_count_multiplier") or 1.25),
+            1.5,
+        )
+        adaptive_config["max_multiplier"] = max(float(adaptive_config.get("max_multiplier") or 2.5), 2.5)
+
+    auto_tune_config = runtime_config.setdefault("auto_tune", {})
+    auto_tune_config["target_metric"] = "macro_f1_supported"
+    auto_tune_config["ensemble_enabled"] = True
+    auto_tune_config["hybrid_enabled"] = True
+    auto_tune_config["hybrid_feature_weight_max"] = max(
+        float(auto_tune_config.get("hybrid_feature_weight_max") or 0.45),
+        0.95,
+    )
+    auto_tune_config["hybrid_feature_weight_step"] = min(
+        float(auto_tune_config.get("hybrid_feature_weight_step") or 0.05),
+        0.025,
+    )
+    auto_tune_config["hybrid_temperature_values"] = sorted(
+        {
+            *[float(value) for value in auto_tune_config.get("hybrid_temperature_values", []) or []],
+            0.7,
+            0.8,
+            0.9,
+            1.0,
+            1.1,
+            1.25,
+            1.5,
+        }
+    )
+    auto_tune_config["hybrid_class_bias_multipliers"] = sorted(
+        {
+            *[float(value) for value in auto_tune_config.get("hybrid_class_bias_multipliers", []) or []],
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+            0.95,
+            1.0,
+            1.05,
+            1.1,
+            1.2,
+            1.3,
+            1.4,
+            1.6,
+            1.8,
+            2.0,
+        }
+    )
+    auto_tune_config["ensemble_temperature_values"] = sorted(
+        {
+            *[float(value) for value in auto_tune_config.get("ensemble_temperature_values", []) or []],
+            0.7,
+            0.8,
+            0.9,
+            1.0,
+            1.1,
+            1.25,
+            1.5,
+        }
+    )
+    auto_tune_config["ensemble_probability_power_values"] = sorted(
+        {
+            *[float(value) for value in auto_tune_config.get("ensemble_probability_power_values", []) or []],
+            0.7,
+            0.8,
+            0.9,
+            1.0,
+            1.1,
+            1.25,
+            1.5,
+            2.0,
+        }
+    )
+    auto_tune_config["ensemble_class_bias_multipliers"] = sorted(
+        {
+            *[float(value) for value in auto_tune_config.get("ensemble_class_bias_multipliers", []) or []],
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+            0.95,
+            1.0,
+            1.05,
+            1.1,
+            1.2,
+            1.3,
+            1.4,
+        }
+    )
+    auto_tune_config["promote_ensemble"] = True
+    auto_tune_config["promote_hybrid"] = True
+
+    total = sum(counts.values())
+    pose_ready = sum(pose_counts.values())
+    rgb_ready = sum(rgb_counts.values())
+    optimization = {
+        "enabled": True,
+        "source_manifest": str(train_manifest),
+        "counts": dict(counts),
+        "pose_ready_counts": dict(pose_counts),
+        "rgb_ready_counts": dict(rgb_counts),
+        "pose_ready_ratio": round(pose_ready / max(total, 1), 6),
+        "rgb_ready_ratio": round(rgb_ready / max(total, 1), 6),
+        "class_weight_multipliers": training_config.get("class_weight_multipliers") or {},
+        "pose_profile": {
+            "name": "legacy_focal_balanced_pose_plus_rgb_i3d",
+            "loss": training_config.get("loss"),
+            "class_weight": training_config.get("class_weight"),
+            "balanced_sampler": training_config.get("balanced_sampler"),
+            "temporal_pooling": training_config.get("temporal_pooling"),
+            "learning_rate": training_config.get("learning_rate"),
+            "max_duplicate_pose_label_samples": training_config.get("max_duplicate_pose_label_samples"),
+            "overfit_guard": {
+                "enabled": training_config.get("overfit_guard_enabled"),
+                "min_epoch": training_config.get("overfit_guard_min_epoch"),
+                "loss_gap": training_config.get("overfit_guard_loss_gap"),
+                "patience": training_config.get("overfit_guard_patience"),
+            },
+        },
+        "auto_tune_target_metric": auto_tune_config.get("target_metric"),
+    }
+    runtime_config["_manifest_training_optimization"] = optimization
+    return optimization
+
+
+def normalize_excluded_training_labels(value) -> list[str]:
+    if isinstance(value, str):
+        items = [item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = []
+    return sorted({item for item in items if item})
+
+
+def excluded_training_labels_from_payload(payload: dict) -> list[str]:
+    mode = str(payload.get("abduction_mode") or payload.get("training_label_mode") or "").strip().lower()
+    excluded = normalize_excluded_training_labels(payload.get("excluded_training_labels"))
+    if mode in {"exclude_abduction", "without_abduction", "no_abduction"}:
+        excluded.append("abduction")
+    if payload.get("exclude_abduction") is True or str(payload.get("exclude_abduction") or "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }:
+        excluded.append("abduction")
+    return normalize_excluded_training_labels(excluded)
+
+
+def apply_training_label_filter_to_runtime_config(runtime_config: dict, job: dict) -> dict:
+    excluded_labels = normalize_excluded_training_labels(job.get("excluded_training_labels"))
+    if not excluded_labels:
+        return {}
+    dataset_config = runtime_config.setdefault("dataset", {})
+    labels = [str(label) for label in get_target_labels(runtime_config)]
+    filtered_labels = [label for label in labels if label not in set(excluded_labels)]
+    if len(filtered_labels) < 2 or filtered_labels == labels:
+        return {}
+    dataset_config["target_labels"] = filtered_labels
+
+    training_config = runtime_config.setdefault("training", {})
+    multipliers = training_config.get("class_weight_multipliers")
+    if isinstance(multipliers, dict):
+        training_config["class_weight_multipliers"] = {
+            str(label): value
+            for label, value in multipliers.items()
+            if str(label) in filtered_labels
+        }
+
+    tasks_config = runtime_config.get("training_tasks")
+    if isinstance(tasks_config, dict):
+        pose_multipliers = tasks_config.get("pose_classification_class_weight_multipliers")
+        if isinstance(pose_multipliers, dict):
+            tasks_config["pose_classification_class_weight_multipliers"] = {
+                str(label): value
+                for label, value in pose_multipliers.items()
+                if str(label) in filtered_labels
+            }
+
+    payload = {
+        "enabled": True,
+        "excluded_labels": excluded_labels,
+        "labels_before": labels,
+        "labels_after": filtered_labels,
+    }
+    runtime_config["_training_label_filter"] = payload
+    return payload
+
+
 def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lite: bool = False) -> tuple:
     launcher_status = launcher_status or {}
     watched = [
@@ -1193,6 +501,13 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         paths["current_skip_report"],
         paths["cumulative_skip_report"],
         paths["artifacts_dir"] / "metrics.json",
+        paths["artifacts_dir"] / "hybrid_summary.json",
+        paths["artifacts_dir"] / "hybrid_metrics.json",
+        paths["artifacts_dir"] / "ensemble_summary.json",
+        paths["artifacts_dir"] / "specialized_tasks" / "summary.json",
+        paths["artifacts_dir"] / "specialized_tasks" / "detection" / "metrics.json",
+        paths["artifacts_dir"] / "specialized_tasks" / "classification" / "metrics.json",
+        paths["artifacts_dir"] / "specialized_tasks" / "pose_classification" / "metrics.json",
         paths["artifacts_dir"] / "labels.json",
         paths["raw_manifest"],
         paths["split_train"],
@@ -1201,6 +516,12 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         paths["prepared_train"],
         paths["prepared_val"],
         paths["prepared_test"],
+        paths["guideline_prepared_train"],
+        paths["guideline_prepared_val"],
+        paths["guideline_prepared_test"],
+        paths["active_prepared_train"],
+        paths["active_prepared_val"],
+        paths["active_prepared_test"],
         paths["current_raw_manifest"],
         paths["current_split_train"],
         paths["current_split_val"],
@@ -1226,15 +547,30 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
         None,
     )
     dynamic_log_paths = []
-    for candidate in (
-        current_job.get("log_path") if isinstance(current_job, dict) else None,
-        latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
-        latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None,
-    ):
-        if not candidate:
-            continue
-        path = Path(str(candidate))
-        dynamic_log_paths.append(build_file_signature(path))
+    predownload_status = launcher_status.get("predownload") or {}
+    predownload_running = predownload_status.get("running") if isinstance(predownload_status, dict) else []
+    predownload_completed = predownload_status.get("completed") if isinstance(predownload_status, dict) else []
+    predownload_failed = predownload_status.get("failed") if isinstance(predownload_status, dict) else []
+    if not lite:
+        for candidate in (
+            current_job.get("log_path") if isinstance(current_job, dict) else None,
+            latest_completed_job.get("log_path") if isinstance(latest_completed_job, dict) else None,
+            latest_error_job.get("log_path") if isinstance(latest_error_job, dict) else None,
+            *(
+                item.get("log_path")
+                for item in (predownload_running or [])[:4]
+                if isinstance(item, dict)
+            ),
+            *(
+                item.get("log_path")
+                for item in (predownload_failed or [])[:2]
+                if isinstance(item, dict)
+            ),
+        ):
+            if not candidate:
+                continue
+            path = Path(str(candidate))
+            dynamic_log_paths.append(build_file_signature(path))
     launcher_signature = (
         launcher_status.get("state"),
         tuple(
@@ -1252,73 +588,28 @@ def compute_overview_signature(paths: dict, launcher_status: dict | None, *, lit
             for key in ("datasetkey", "filekey", "started_at", "state", "message", "log_path")
             if key in current_job
         ),
+        tuple(
+            (job.get("datasetkey"), job.get("filekey"), job.get("state"), job.get("started_at"), job.get("log_path"))
+            for job in (predownload_running or [])[:8]
+            if isinstance(job, dict)
+        ),
+        tuple(
+            (job.get("datasetkey"), job.get("filekey"), job.get("state"), job.get("finished_at"), job.get("exit_code"))
+            for job in (predownload_completed or [])[-8:]
+            if isinstance(job, dict)
+        ),
+        tuple(
+            (job.get("datasetkey"), job.get("filekey"), job.get("state"), job.get("finished_at"), job.get("exit_code"))
+            for job in (predownload_failed or [])[:8]
+            if isinstance(job, dict)
+        ),
+        predownload_status.get("pause_reason") if isinstance(predownload_status, dict) else "",
         tuple(dynamic_log_paths),
         launcher_status.get("auto_start_enabled"),
         launcher_status.get("auto_enqueue_enabled"),
         launcher_status.get("auto_enqueue_datasetkey"),
     )
     return (tuple(file_signature), launcher_signature, lite)
-
-
-def _parse_int_or_none(value: str | None) -> int | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized or normalized.lower() in {"n/a", "[not supported]"}:
-        return None
-    try:
-        return int(float(normalized))
-    except ValueError:
-        return None
-
-
-def _parse_float_or_none(value: str | None) -> float | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized or normalized.lower() in {"n/a", "[not supported]"}:
-        return None
-    try:
-        return float(normalized)
-    except ValueError:
-        return None
-
-
-def _format_gib_from_mb(value_mb: float | None) -> str:
-    if value_mb is None:
-        return "-"
-    return f"{value_mb / 1024.0:.1f} GB"
-
-
-def _build_gpu_summary(primary: dict | None) -> str:
-    if not primary:
-        return "-"
-    gpu_util = primary.get("utilization_gpu")
-    if gpu_util is None:
-        return "-"
-    return f"{gpu_util}%"
-
-
-def _build_gpu_detail(primary: dict | None, *, device_count: int) -> str:
-    if not primary:
-        return "GPU 상태를 읽지 못했습니다."
-    memory_used = _format_gib_from_mb(primary.get("memory_used_mb"))
-    memory_total = _format_gib_from_mb(primary.get("memory_total_mb"))
-    memory_percent = primary.get("memory_percent")
-    temp = primary.get("temperature_c")
-    util_mem = primary.get("utilization_memory")
-    index = primary.get("index")
-    prefix = f"GPU {index}" if index is not None else "GPU"
-    suffix_parts = [f"VRAM {memory_used} / {memory_total}"]
-    if memory_percent is not None:
-        suffix_parts.append(f"{memory_percent:.1f}%")
-    if util_mem is not None:
-        suffix_parts.append(f"mem {util_mem}%")
-    if temp is not None:
-        suffix_parts.append(f"{temp}°C")
-    if device_count > 1:
-        suffix_parts.append(f"{device_count} GPUs")
-    return f"{prefix} | " + " | ".join(suffix_parts)
 
 
 def derive_stage_ratio(pipeline_status: dict | None, training_progress: dict | None) -> float:
@@ -1438,6 +729,10 @@ def overview_has_live_activity(overview: dict | None) -> bool:
     if isinstance(current_job, dict) and any(current_job.get(key) for key in ("filekey", "datasetkey", "log_path")):
         return True
 
+    predownload = launcher.get("predownload") if isinstance(launcher, dict) else {}
+    if isinstance(predownload, dict) and predownload.get("running"):
+        return True
+
     try:
         if int(queue_progress.get("active") or 0) > 0 or int(queue_progress.get("pending") or 0) > 0:
             return True
@@ -1462,6 +757,66 @@ def format_duration(seconds: int | float | None) -> str:
     if minutes > 0:
         return f"{minutes}분 {secs}초"
     return f"{secs}초"
+
+
+def build_predownload_log_payload(predownload: dict | None, get_log_tail) -> dict:
+    predownload = predownload if isinstance(predownload, dict) else {}
+    running = predownload.get("running") if isinstance(predownload.get("running"), list) else []
+    completed = predownload.get("completed") if isinstance(predownload.get("completed"), list) else []
+    failed = predownload.get("failed") if isinstance(predownload.get("failed"), list) else []
+    max_parallel = int(predownload.get("max_parallel") or 0)
+    pause_reason = str(predownload.get("pause_reason") or "").strip()
+    lines = [
+        "[predownload][status] "
+        f"running={len(running)}/{max_parallel or '-'} "
+        f"completed_recent={len(completed)} failed_recent={len(failed)} "
+        f"free_disk_gb={predownload.get('free_gb', '-')}"
+    ]
+    if pause_reason:
+        lines.append(f"[predownload][paused] {pause_reason}")
+    if running:
+        lines.append("[predownload][running] 전처리/학습 중에도 남는 다운로드 슬롯에서 다음 filekey를 미리 받습니다.")
+        for index, item in enumerate(running[:4], start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "[predownload][slot] "
+                f"{index}/{max_parallel or len(running)} "
+                f"datasetkey={item.get('datasetkey') or '-'} "
+                f"filekey={item.get('filekey') or '-'} "
+                f"state={item.get('state') or '-'} "
+                f"started_at={item.get('started_at') or '-'}"
+            )
+            log_tail = get_log_tail(item.get("log_path"))
+            if log_tail:
+                lines.append(f"----- predownload log: filekey={item.get('filekey') or '-'} -----")
+                lines.append(log_tail)
+    else:
+        lines.append("[predownload][idle] 현재 병렬 다운로드 작업은 없습니다.")
+
+    for item in completed[-3:]:
+        if isinstance(item, dict):
+            lines.append(
+                "[predownload][completed] "
+                f"filekey={item.get('filekey') or '-'} exit_code={item.get('exit_code', '-')} "
+                f"finished_at={item.get('finished_at') or '-'}"
+            )
+    for item in failed[:3]:
+        if isinstance(item, dict):
+            lines.append(
+                "[predownload][failed] "
+                f"filekey={item.get('filekey') or '-'} exit_code={item.get('exit_code', '-')} "
+                f"finished_at={item.get('finished_at') or '-'}"
+            )
+
+    return {
+        "running_count": len(running),
+        "completed_count": len(completed),
+        "failed_count": len(failed),
+        "max_parallel": max_parallel,
+        "pause_reason": pause_reason,
+        "tail": "\n".join(lines),
+    }
 
 
 def build_manifest_summary_group(paths: dict, manifest_specs: tuple[tuple[str, str], ...]) -> dict[str, dict]:
@@ -1598,6 +953,30 @@ def restore_completed_jobs_from_logs(job_logs_dir: Path, runtime_config_dir: Pat
     return restored_jobs
 
 
+def merge_completed_jobs(existing_jobs: list[dict], restored_jobs: list[dict], *, limit: int = 30) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for source in (restored_jobs, existing_jobs):
+        for job in source:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("job_id") or "").strip()
+            if not job_id:
+                job_id = "|".join(
+                    str(job.get(key) or "").strip()
+                    for key in ("datasetkey", "filekey", "stage", "started_at", "log_path")
+                )
+            current = merged.get(job_id)
+            if not isinstance(current, dict):
+                merged[job_id] = dict(job)
+                continue
+            enriched = dict(current)
+            for key, value in job.items():
+                if enriched.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+                    enriched[key] = value
+            merged[job_id] = enriched
+    return sort_jobs_by_recency(list(merged.values()))[:limit]
+
+
 def create_app(config_path: Path) -> FastAPI:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path.parent)
@@ -1609,6 +988,7 @@ def create_app(config_path: Path) -> FastAPI:
     runtime_config_dir = paths["workspace_dir"] / "runtime_configs"
     runtime_config_dir.mkdir(parents=True, exist_ok=True)
     launcher_history_path = paths["workspace_dir"] / "launcher_history.json"
+    notification_settings_path = paths["workspace_dir"] / "dashboard_notifications.json"
 
     app = FastAPI(title="detectWarning Training Dashboard")
     app.add_middleware(
@@ -1634,12 +1014,268 @@ def create_app(config_path: Path) -> FastAPI:
         "auto_extract_enabled": False,
         "auto_enqueue_datasetkey": None,
         "auto_enqueue_api_key": "",
+        "auto_rgb_model": "i3d_r50",
+        "predownload_enabled": True,
+        "predownload_max_parallel": 2,
+        "predownload_min_free_gb": 100,
+        "predownload_pause_reason": "",
+        "predownload_processes": {},
+        "predownload_completed": [],
+        "predownload_failed": [],
+        "performance_plan": {},
         "last_state": "idle",
         "last_exit_code": None,
         "last_message": "아직 실행 기록이 없습니다.",
         "log_path": None,
         "pages_sync_warning": None,
+        "filekey_pipeline_status": {},
+        "notification_settings": normalize_notification_settings(
+            read_json(notification_settings_path)
+            or (config.get("dashboard", {}).get("notifications") if isinstance(config.get("dashboard"), dict) else {})
+            or {}
+        ),
     }
+
+    def save_notification_settings(settings: dict) -> dict:
+        normalized = normalize_notification_settings(settings)
+        launcher_state["notification_settings"] = normalized
+        notification_settings_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(notification_settings_path, normalized)
+        return normalized
+
+    def dispatch_dashboard_notification(event: str, *, title: str, message: str, priority: str = "default") -> None:
+        settings = normalize_notification_settings(launcher_state.get("notification_settings"))
+        if not settings.get("enabled") or event not in set(settings.get("notify_on") or []):
+            return
+        if settings.get("provider") != "ntfy":
+            settings["last_error"] = f"지원하지 않는 알림 provider입니다: {settings.get('provider')}"
+            save_notification_settings(settings)
+            return
+
+        def worker() -> None:
+            try:
+                send_ntfy_notification(settings, title=title, message=message, priority=priority)
+                settings["last_sent_at"] = current_timestamp()
+                settings["last_error"] = ""
+            except Exception as exc:
+                settings["last_error"] = str(exc)
+            try:
+                save_notification_settings(settings)
+            except Exception as exc:
+                print(f"[notify] settings save failed: {exc}", flush=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    FILEKEY_PIPELINE_STEP_ORDER = (
+        "pose_extract",
+        "guideline_clips",
+        "rgb_i3d_features",
+        "cleanup_raw_after_job",
+    )
+    FILEKEY_PIPELINE_STEP_LABELS = {
+        "pose_extract": "pose 추출",
+        "guideline_clips": "guideline_clips",
+        "rgb_i3d_features": "RGB/I3D feature",
+        "cleanup_raw_after_job": "cleanup_raw_after_job",
+    }
+    FILEKEY_PIPELINE_SUCCESS_STATES = {"completed", "completed_warning", "data_ready"}
+
+    def filekey_pipeline_step_id(job: dict | None) -> str:
+        if not isinstance(job, dict):
+            return ""
+        job_kind = infer_dashboard_job_kind(job)
+        stage = str(job.get("stage") or "").strip().lower()
+        notification_step = str(job.get("notification_step") or "").strip().lower()
+        filekey = str(job.get("filekey") or "").strip().lower()
+        if job_kind == "aihub" and stage == "extract":
+            return "pose_extract"
+        if job_kind == "guideline" or notification_step == "guideline_clips" or filekey == "guideline_clips":
+            return "guideline_clips"
+        if job_kind == "rgb" or notification_step == "rgb_i3d_features" or filekey == "rgb_i3d_features":
+            return "rgb_i3d_features"
+        if job_kind == "cleanup" or notification_step in {"cleanup_raw_after_features", "cleanup_raw_after_job"}:
+            return "cleanup_raw_after_job"
+        return ""
+
+    def filekey_pipeline_identity(job: dict | None) -> tuple[str, str, str]:
+        if not isinstance(job, dict):
+            return "", "", ""
+        step_id = filekey_pipeline_step_id(job)
+        if not step_id:
+            return "", "", ""
+        filekey = str(job.get("source_filekey") or "").strip()
+        if not filekey and infer_dashboard_job_kind(job) == "aihub":
+            filekey = str(job.get("filekey") or "").strip()
+        datasetkey = str(job.get("source_datasetkey") or job.get("datasetkey") or "").strip()
+        if not filekey:
+            return "", "", ""
+        return f"{datasetkey}:{filekey}", datasetkey, filekey
+
+    def filekey_pipeline_record_for_job(job: dict, *, reset_on_start: bool = False) -> dict | None:
+        identity, datasetkey, filekey = filekey_pipeline_identity(job)
+        if not identity:
+            return None
+        records = launcher_state.setdefault("filekey_pipeline_status", {})
+        if not isinstance(records, dict):
+            launcher_state["filekey_pipeline_status"] = {}
+            records = launcher_state["filekey_pipeline_status"]
+        if reset_on_start or identity not in records:
+            records[identity] = {
+                "datasetkey": datasetkey,
+                "filekey": filekey,
+                "steps": {},
+                "errors": [],
+                "started_at": current_timestamp(),
+                "final_sent": False,
+            }
+        return records.get(identity) if isinstance(records.get(identity), dict) else None
+
+    def mark_filekey_pipeline_started(job: dict) -> None:
+        step_id = filekey_pipeline_step_id(job)
+        if not step_id:
+            return
+        identity, _, _ = filekey_pipeline_identity(job)
+        if not identity:
+            return
+        records = launcher_state.get("filekey_pipeline_status", {})
+        existing = records.get(identity) if isinstance(records, dict) else None
+        reset_on_start = step_id == "pose_extract" or not isinstance(existing, dict) or bool(existing.get("final_sent"))
+        record = filekey_pipeline_record_for_job(job, reset_on_start=reset_on_start)
+        if not isinstance(record, dict):
+            return
+        steps = record.setdefault("steps", {})
+        if isinstance(steps, dict):
+            steps[step_id] = {
+                "state": "running",
+                "job_id": job.get("job_id"),
+                "started_at": job.get("started_at") or current_timestamp(),
+            }
+
+    def dispatch_filekey_step_started_notification(job: dict, message: str) -> None:
+        step_id = filekey_pipeline_step_id(job)
+        if not step_id:
+            return
+        mark_filekey_pipeline_started(job)
+        _, datasetkey, filekey = filekey_pipeline_identity(job)
+        if not filekey:
+            return
+        step_label = FILEKEY_PIPELINE_STEP_LABELS.get(step_id, step_id)
+        title = f"Started: {step_label}"
+        body = (
+            f"filekey: {filekey}\n"
+            f"task: {step_label}\n"
+            f"status: started\n"
+            f"datasetkey: {datasetkey or '-'}\n"
+            f"{message}"
+        )
+        dispatch_dashboard_notification("started", title=title, message=body, priority="default")
+
+    def record_filekey_pipeline_finished(job: dict, state: str, message: str) -> tuple[bool, str, str, str]:
+        step_id = filekey_pipeline_step_id(job)
+        if not step_id:
+            return False, "", "", ""
+        record = filekey_pipeline_record_for_job(job)
+        if not isinstance(record, dict):
+            return False, "", "", ""
+        steps = record.setdefault("steps", {})
+        if isinstance(steps, dict):
+            steps[step_id] = {
+                "state": state,
+                "job_id": job.get("job_id"),
+                "finished_at": job.get("finished_at") or current_timestamp(),
+                "message": message,
+            }
+        filekey = str(record.get("filekey") or "-")
+        datasetkey = str(record.get("datasetkey") or "-")
+        if state not in FILEKEY_PIPELINE_SUCCESS_STATES:
+            errors = record.setdefault("errors", [])
+            if isinstance(errors, list):
+                error_text = f"{FILEKEY_PIPELINE_STEP_LABELS.get(step_id, step_id)}: {message}"
+                if error_text not in errors:
+                    errors.append(error_text)
+            if bool(record.get("final_sent")):
+                return True, "", "", ""
+            record["final_sent"] = True
+            error_items = record.get("errors") if isinstance(record.get("errors"), list) else []
+            title = f"Filekey error: {filekey}"
+            body = (
+                f"filekey: {filekey}\n"
+                "status: error\n"
+                f"datasetkey: {datasetkey}\n"
+                "파일키 전체 작업이 오류로 중단되었습니다.\n"
+                + "\n".join(f"- {item}" for item in error_items[:6])
+            )
+            return True, "error", title, body
+        if step_id != "cleanup_raw_after_job" or bool(record.get("final_sent")):
+            return True, "", "", ""
+        record["final_sent"] = True
+        errors = record.get("errors") if isinstance(record.get("errors"), list) else []
+        if errors:
+            title = f"Filekey error: {filekey}"
+            body = (
+                f"filekey: {filekey}\n"
+                f"status: error\n"
+                f"datasetkey: {datasetkey}\n"
+                "파일키 전체 작업이 끝났지만 중간 오류가 있었습니다.\n"
+                + "\n".join(f"- {item}" for item in errors[:6])
+            )
+            return True, "error", title, body
+        completed_steps = []
+        record_steps = record.get("steps") if isinstance(record.get("steps"), dict) else {}
+        for step in FILEKEY_PIPELINE_STEP_ORDER:
+            if step in record_steps:
+                completed_steps.append(FILEKEY_PIPELINE_STEP_LABELS.get(step, step))
+        title = f"Filekey done: {filekey}"
+        body = (
+            f"filekey: {filekey}\n"
+            f"status: completed\n"
+            f"datasetkey: {datasetkey}\n"
+            "파일키 전체 작업이 정상 완료되었습니다.\n"
+            f"completed_steps: {', '.join(completed_steps) if completed_steps else '-'}"
+        )
+        return True, "completed", title, body
+
+    def performance_plan_payload() -> dict:
+        plan = launcher_state.get("performance_plan")
+        return dict(plan) if isinstance(plan, dict) else {}
+
+    def performance_plan_is_active() -> bool:
+        return bool(performance_plan_payload().get("enabled"))
+
+    def performance_plan_deadline_reached() -> bool:
+        return plan_deadline_reached(performance_plan_payload())
+
+    def enqueue_performance_plan_training_locked(reason: str) -> dict:
+        plan = performance_plan_payload()
+        if not plan.get("enabled"):
+            return {"ok": False, "message": "성능 플랜이 켜져 있지 않습니다.", "job": None}
+        if plan.get("final_training_queued"):
+            return {"ok": True, "message": "최종 auto-tune 학습이 이미 큐에 있습니다.", "job": None}
+        has_guideline_features = paths["guideline_prepared_train"].exists() and paths["guideline_prepared_val"].exists()
+        if not has_guideline_features:
+            launcher_state["auto_extract_enabled"] = False
+            plan["enabled"] = False
+            plan["finished_at"] = current_timestamp()
+            plan["status"] = "stopped_no_features"
+            launcher_state["performance_plan"] = plan
+            message = "성능 플랜을 끝냈지만 guideline feature가 없어 최종 학습을 시작하지 못했습니다."
+            launcher_state["last_message"] = message
+            return {"ok": False, "message": message, "job": None}
+        job = build_auto_tune_dashboard_job(plan, reason=reason)
+        pending_jobs = launcher_state.setdefault("queued_jobs", [])
+        if isinstance(pending_jobs, list):
+            pending_jobs.append(job)
+        launcher_state["auto_extract_enabled"] = False
+        launcher_state["auto_enqueue_enabled"] = False
+        plan["enabled"] = False
+        plan["final_training_queued"] = True
+        plan["final_training_reason"] = reason
+        plan["finished_extract_at"] = current_timestamp()
+        plan["status"] = "final_training_queued"
+        launcher_state["performance_plan"] = plan
+        launcher_state["last_state"] = "queued"
+        launcher_state["last_message"] = f"성능 플랜 추출을 마치고 최종 auto-tune/ensemble 학습을 큐에 추가했습니다. reason={reason}"
+        return {"ok": True, "message": launcher_state["last_message"], "job": job}
 
     def apply_restored_launcher_summary(completed_jobs_override: list[dict] | None = None) -> None:
         if isinstance(launcher_state.get("process"), subprocess.Popen):
@@ -1662,9 +1298,13 @@ def create_app(config_path: Path) -> FastAPI:
             launcher_state["last_exit_code"] = summary.get("last_exit_code")
 
     def remember_pages_sync_warning(action: str, exc: Exception) -> None:
-        message = f"[pages-sync] {action} failed: {exc}"
+        detail = str(exc)
+        hint = ""
+        if isinstance(exc, PermissionError) or "Permission denied" in detail or "액세스가 거부" in detail:
+            hint = " detectWarning-pages 폴더 권한 또는 동기화 중인 프로세스를 확인해 주세요."
+        message = f"[pages-sync] {action} failed: {detail}{(' | ' + hint) if hint else ''}"
         print(message, file=sys.stderr)
-        launcher_state["pages_sync_warning"] = str(exc)
+        launcher_state["pages_sync_warning"] = message
 
     def safe_sync_pages_report(action: str = "report") -> None:
         try:
@@ -1692,7 +1332,8 @@ def create_app(config_path: Path) -> FastAPI:
                 history_payload = json.load(handle)
             completed_jobs = history_payload.get("completed_jobs", [])
             if isinstance(completed_jobs, list):
-                normalized_completed_jobs = sort_jobs_by_recency(completed_jobs)
+                restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
+                normalized_completed_jobs = merge_completed_jobs(completed_jobs, restored_jobs)
                 launcher_state["completed_jobs"] = normalized_completed_jobs
                 if normalized_completed_jobs != completed_jobs:
                     persist_launcher_history(launcher_history_path, launcher_state)
@@ -1710,14 +1351,14 @@ def create_app(config_path: Path) -> FastAPI:
     def reload_completed_jobs_from_history() -> list[dict]:
         history_payload = read_json(launcher_history_path) or {}
         completed_jobs = history_payload.get("completed_jobs", [])
+        restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
         if isinstance(completed_jobs, list) and completed_jobs:
-            normalized_completed_jobs = sort_jobs_by_recency(completed_jobs)
+            normalized_completed_jobs = merge_completed_jobs(completed_jobs, restored_jobs)
             launcher_state["completed_jobs"] = normalized_completed_jobs
             if normalized_completed_jobs != completed_jobs:
                 persist_launcher_history(launcher_history_path, launcher_state)
             apply_restored_launcher_summary(launcher_state["completed_jobs"])
             return launcher_state["completed_jobs"]
-        restored_jobs = restore_completed_jobs_from_logs(job_logs_dir, runtime_config_dir)
         if restored_jobs:
             launcher_state["completed_jobs"] = sort_jobs_by_recency(restored_jobs)
             persist_launcher_history(launcher_history_path, launcher_state)
@@ -1755,30 +1396,65 @@ def create_app(config_path: Path) -> FastAPI:
                 f"다른 작업공간 {alternative_text} 에 기존 학습 기록이 남아 있을 가능성이 큽니다."
             )
 
+    def terminate_process_tree(process: subprocess.Popen) -> None:
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
     def hard_reset_workspace() -> None:
-        for key in (
-            "raw_dir",
-            "import_dir",
-            "extracted_dir",
-            "manifests_dir",
-            "prepared_dir",
-            "artifacts_dir",
-        ):
+        predownload_processes = launcher_state.get("predownload_processes", {})
+        if isinstance(predownload_processes, dict):
+            for item in list(predownload_processes.values()):
+                process = item.get("process") if isinstance(item, dict) else None
+                if isinstance(process, subprocess.Popen) and process.poll() is None:
+                    terminate_process_tree(process)
+            predownload_processes.clear()
+        reset_dirs = []
+        for key in ("raw_dir", "import_dir", "predownload_dir", "extracted_dir", "manifests_dir", "prepared_dir", "artifacts_dir"):
             target = paths.get(key)
-            if isinstance(target, Path) and target.exists():
-                shutil.rmtree(target)
+            if isinstance(target, Path):
+                reset_dirs.append(target)
+        workspace_dir = paths.get("workspace_dir")
+        if isinstance(workspace_dir, Path):
+            reset_dirs.extend(
+                [
+                    workspace_dir / "prepared_pose_guideline",
+                    workspace_dir / "rgb_clip_features",
+                    workspace_dir / "job_logs",
+                    workspace_dir / "runtime_configs",
+                ]
+            )
+        reset_dirs.extend([job_logs_dir, runtime_config_dir])
 
-        for target in (job_logs_dir, runtime_config_dir):
+        seen_reset_dirs: set[Path] = set()
+        for target in reset_dirs:
+            resolved = target.resolve()
+            if resolved in seen_reset_dirs:
+                continue
+            seen_reset_dirs.add(resolved)
             if target.exists():
-                shutil.rmtree(target)
+                remove_transient_path_with_retries(target, recreate_dir=False, retries=12, delay_seconds=1.0)
 
-        if launcher_history_path.exists():
-            launcher_history_path.unlink()
+        for target in (
+            launcher_history_path,
+            paths.get("pipeline_status"),
+            paths.get("training_progress"),
+        ):
+            if isinstance(target, Path) and target.exists():
+                remove_transient_path_with_retries(target, retries=12, delay_seconds=1.0)
 
         for key in (
             "workspace_dir",
             "raw_dir",
             "import_dir",
+            "predownload_dir",
             "extracted_dir",
             "manifests_dir",
             "prepared_dir",
@@ -1802,6 +1478,11 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["auto_extract_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = None
         launcher_state["auto_enqueue_api_key"] = ""
+        launcher_state["auto_rgb_model"] = "i3d_r50"
+        launcher_state["predownload_processes"] = {}
+        launcher_state["predownload_completed"] = []
+        launcher_state["predownload_failed"] = []
+        launcher_state["filekey_pipeline_status"] = {}
         launcher_state["last_state"] = "idle"
         launcher_state["last_exit_code"] = None
         launcher_state["last_message"] = "학습 워크스페이스를 초기화했습니다. 처음부터 다시 시작할 수 있습니다."
@@ -1859,8 +1540,107 @@ def create_app(config_path: Path) -> FastAPI:
                 pass
         return process.returncode
 
+    def build_job_startup_message(job: dict) -> str:
+        label = str(job.get("display_name") or job.get("filekey") or "job").strip()
+        if str(job.get("job_kind") or "aihub").strip().lower() == "aihub":
+            return (
+                f"[launcher] datasetkey {job.get('datasetkey', '-')}"
+                f" | filekey {job['filekey']} 작업을 시작합니다."
+            )
+        return f"[launcher] {label} 작업을 시작합니다."
+
+    def build_job_command(
+        job: dict,
+        *,
+        runtime_config_path: Path,
+        pipeline_script: Path,
+        project_root: Path,
+    ) -> list[str]:
+        job_kind = str(job.get("job_kind") or "aihub").strip().lower()
+        if job_kind == "guideline":
+            return [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(project_root / "app" / "guideline_pose_dataset.py"),
+                "--config",
+                str(runtime_config_path),
+                "--source",
+                str(job.get("source") or "cumulative"),
+            ]
+        if job_kind == "rgb":
+            command = [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(project_root / "app" / "extract_rgb_video_features.py"),
+                "--config",
+                str(runtime_config_path),
+                "--model",
+                str(job.get("rgb_model") or "i3d_r50"),
+                "--device",
+                str(job.get("device") or "cuda"),
+            ]
+            if payload_bool(job.get("reuse_existing_only", False)):
+                command.append("--reuse-existing-only")
+            return command
+        if job_kind == "cleanup":
+            return [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(project_root / "app" / "cleanup_transient_data.py"),
+                "--config",
+                str(runtime_config_path),
+            ]
+        if job_kind == "auto_tune":
+            command = [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(project_root / "app" / "auto_tune_action_training.py"),
+                "--config",
+                str(runtime_config_path),
+                "--trials",
+                str(max(int(job.get("trials") or 1), 1)),
+                "--target-metric",
+                str(job.get("target_metric") or "accuracy"),
+            ]
+            if not payload_bool(job.get("update_config", True)):
+                command.append("--no-update-config")
+            return command
+        return [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(pipeline_script),
+            "--config",
+            str(runtime_config_path),
+            "--stage",
+            str(job.get("stage") or "all"),
+        ]
+
+    def classify_dashboard_job_exit(current_job: dict | None, exit_code: int) -> tuple[str, str]:
+        if isinstance(current_job, dict) and str(current_job.get("job_kind") or "aihub").strip().lower() != "aihub":
+            if exit_code == 0:
+                return "completed", str(current_job.get("success_message") or "대시보드 작업이 완료되었습니다.")
+            return "error", f"{current_job.get('display_name') or current_job.get('filekey')} 작업이 종료 코드 {exit_code}로 중단되었습니다."
+        return classify_job_exit(paths, current_job, exit_code)
+
     def start_pipeline_for_job(job: dict) -> None:
-        reset_training_workspace(paths)
+        job_kind = str(job.get("job_kind") or "aihub").strip().lower()
+        metric_payloads_for_normal_ratio = [
+            read_json(paths["artifacts_dir"] / "metrics.json"),
+            read_json(paths["training_progress"]),
+        ]
+        if job_kind == "aihub":
+            reset_training_workspace(paths)
+            if payload_bool(job.get("reextract_filekey_only", False)):
+                reset_filekey_training_outputs(
+                    paths,
+                    datasetkey=str(job.get("datasetkey") or ""),
+                    filekey=str(job.get("filekey") or ""),
+                )
         runtime_config_dir.mkdir(parents=True, exist_ok=True)
         job_logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1868,13 +1648,59 @@ def create_app(config_path: Path) -> FastAPI:
         runtime_config["dataset_source"] = "aihub_shell"
         runtime_paths = runtime_config.setdefault("paths", {})
         runtime_paths["workspace_dir"] = str(paths["workspace_dir"])
+        if job_kind in {"guideline", "aihub"}:
+            normal_ratio_adjustment = apply_auto_normal_ratio_to_config(
+                runtime_config,
+                metric_payloads=metric_payloads_for_normal_ratio,
+                labels=get_target_labels(runtime_config),
+            )
+            if normal_ratio_adjustment.get("enabled") and normal_ratio_adjustment.get("source") == "metrics":
+                launcher_state["last_normal_ratio_adjustment"] = normal_ratio_adjustment
+            cached_adjustment = (
+                job.get("normal_ratio_adjustment")
+                if isinstance(job.get("normal_ratio_adjustment"), dict)
+                else launcher_state.get("last_normal_ratio_adjustment")
+            )
+            if (
+                normal_ratio_adjustment.get("reason") in {"no_metrics", "missing_confusion_matrix"}
+                and isinstance(cached_adjustment, dict)
+                and cached_adjustment.get("enabled")
+                and cached_adjustment.get("target_ratio") is not None
+            ):
+                runtime_guideline = runtime_config.setdefault("guideline_sampling", {})
+                runtime_guideline["target_normal_clip_ratio"] = cached_adjustment["target_ratio"]
+                normal_ratio_adjustment = {
+                    **cached_adjustment,
+                    "source": "cached_metrics",
+                    "applied": True,
+                }
+                runtime_guideline["_auto_normal_ratio_adjustment"] = normal_ratio_adjustment
+            if normal_ratio_adjustment.get("enabled"):
+                job["normal_ratio_adjustment"] = normal_ratio_adjustment
         runtime_shell = runtime_config.setdefault("aihub_shell", {})
-        if job.get("datasetkey") not in (None, ""):
-            runtime_shell["datasetkey"] = job["datasetkey"]
-        runtime_shell["filekey"] = job["filekey"]
-        if job.get("api_key"):
-            runtime_shell["api_key"] = str(job["api_key"])
-            runtime_shell["api_key_env"] = ""
+        if job_kind == "aihub":
+            if job.get("datasetkey") not in (None, ""):
+                runtime_shell["datasetkey"] = job["datasetkey"]
+            runtime_shell["filekey"] = job["filekey"]
+            if job.get("api_key"):
+                runtime_shell["api_key"] = str(job["api_key"])
+                runtime_shell["api_key_env"] = ""
+        if job_kind == "auto_tune":
+            runtime_auto_tune = runtime_config.setdefault("auto_tune", {})
+            runtime_auto_tune["max_trials"] = max(int(job.get("trials") or runtime_auto_tune.get("max_trials") or 1), 1)
+            runtime_auto_tune["target_metric"] = str(job.get("target_metric") or runtime_auto_tune.get("target_metric") or "accuracy")
+            runtime_auto_tune["ensemble_enabled"] = True
+            runtime_auto_tune["hybrid_enabled"] = True
+            runtime_auto_tune["promote_best"] = True
+            runtime_auto_tune["promote_ensemble"] = True
+            runtime_auto_tune["promote_hybrid"] = True
+
+        training_label_filter = apply_training_label_filter_to_runtime_config(runtime_config, job)
+        manifest_training_optimization = apply_manifest_aware_training_overrides(runtime_config, paths, job)
+        if manifest_training_optimization:
+            job["manifest_training_optimization"] = manifest_training_optimization
+        if training_label_filter:
+            job["training_label_filter"] = training_label_filter
 
         runtime_config_path = runtime_config_dir / f"{job['job_id']}.json"
         write_json_atomic(runtime_config_path, runtime_config)
@@ -1884,32 +1710,47 @@ def create_app(config_path: Path) -> FastAPI:
             f"[launcher] datasetkey {job.get('datasetkey', '-')}"
             f" | filekey {job['filekey']} 작업을 시작합니다."
         )
+        startup_message = build_job_startup_message(job)
         write_dashboard_status(
             paths,
-            stage="queued",
+            stage=str(job.get("stage") or "queued"),
             state="running",
             message=startup_message.replace("[launcher] ", ""),
             current_filekey=job["filekey"],
             current_datasetkey=job.get("datasetkey"),
+            job_kind=job_kind,
+        )
+        command = build_job_command(
+            job,
+            runtime_config_path=runtime_config_path,
+            pipeline_script=pipeline_script,
+            project_root=project_root,
         )
         with log_path.open("w", encoding="utf-8") as log_handle:
             log_handle.write(f"{startup_message}\n")
             log_handle.write(f"[launcher] runtime config: {runtime_config_path}\n")
+            if manifest_training_optimization:
+                log_handle.write(
+                    "[launcher] manifest training optimization: "
+                    f"pose_ready={manifest_training_optimization.get('pose_ready_ratio')} "
+                    f"rgb_ready={manifest_training_optimization.get('rgb_ready_ratio')} "
+                    f"class_weight_multipliers={manifest_training_optimization.get('class_weight_multipliers')} "
+                    f"target_metric={manifest_training_optimization.get('auto_tune_target_metric')}\n"
+                )
+            if training_label_filter:
+                log_handle.write(
+                    "[launcher] training label filter: "
+                    f"excluded={training_label_filter.get('excluded_labels')} "
+                    f"labels={training_label_filter.get('labels_after')}\n"
+                )
+            log_handle.write(f"[launcher] command: {' '.join(str(part) for part in command)}\n")
             log_handle.flush()
             child_env = os.environ.copy()
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
+            child_env["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-X",
-                    "utf8",
-                    str(pipeline_script),
-                    "--config",
-                    str(runtime_config_path),
-                    "--stage",
-                    str(job.get("stage") or "all"),
-                ],
+                command,
                 cwd=str(project_root),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
@@ -1934,9 +1775,44 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["last_message"] = (
             f"datasetkey {job.get('datasetkey', '-')} | filekey {job['filekey']} 학습을 진행 중입니다."
         )
+        launcher_state["last_message"] = job.get("running_message") or startup_message.replace("[launcher] ", "")
         safe_sync_pages_live("online", action="job start live status")
+        if filekey_pipeline_step_id(job):
+            dispatch_filekey_step_started_notification(job, launcher_state["last_message"])
+
+    def remove_dependent_followups_locked(failed_job: dict) -> int:
+        source_filekey = str(failed_job.get("source_filekey") or failed_job.get("filekey") or "").strip()
+        if not source_filekey:
+            return 0
+        source_datasetkey = str(failed_job.get("source_datasetkey") or failed_job.get("datasetkey") or "").strip()
+        pending_jobs = launcher_state.get("queued_jobs", [])
+        if not isinstance(pending_jobs, list) or not pending_jobs:
+            return 0
+        dependent_kinds = {"guideline", "rgb", "cleanup", "train_guideline"}
+        retained: list[dict] = []
+        removed_count = 0
+        for pending_job in pending_jobs:
+            if not isinstance(pending_job, dict):
+                retained.append(pending_job)
+                continue
+            pending_kind = infer_dashboard_job_kind(pending_job)
+            pending_filekey = str(pending_job.get("source_filekey") or pending_job.get("filekey") or "").strip()
+            pending_datasetkey = str(pending_job.get("source_datasetkey") or pending_job.get("datasetkey") or "").strip()
+            same_source = pending_filekey == source_filekey and (
+                not source_datasetkey
+                or not pending_datasetkey
+                or pending_datasetkey in {source_datasetkey, "prepared"}
+            )
+            if pending_kind in dependent_kinds and same_source:
+                removed_count += 1
+                continue
+            retained.append(pending_job)
+        if removed_count:
+            launcher_state["queued_jobs"] = retained
+        return removed_count
 
     def update_process_state() -> None:
+        update_predownload_processes_locked()
         process = launcher_state.get("process")
         if process is not None and isinstance(process, subprocess.Popen):
             exit_code = process.poll()
@@ -1945,6 +1821,16 @@ def create_app(config_path: Path) -> FastAPI:
                 current_job = launcher_state.get("current_job") or {}
                 filekey = current_job.get("filekey", "-") if isinstance(current_job, dict) else "-"
                 datasetkey = current_job.get("datasetkey", "-") if isinstance(current_job, dict) else "-"
+                if (
+                    isinstance(current_job, dict)
+                    and str(current_job.get("job_kind") or "aihub").strip().lower() != "aihub"
+                ):
+                    launcher_state["last_message"] = str(
+                        current_job.get("running_message")
+                        or current_job.get("message")
+                        or f"{current_job.get('display_name') or filekey} 작업을 실행 중입니다."
+                    )
+                    return
                 pending_jobs = launcher_state.get("queued_jobs", [])
                 auto_start_enabled = bool(launcher_state.get("auto_start_enabled", True))
                 if not auto_start_enabled and isinstance(pending_jobs, list) and pending_jobs:
@@ -1962,7 +1848,7 @@ def create_app(config_path: Path) -> FastAPI:
                 if isinstance(current_job, dict):
                     current_job["finished_at"] = current_timestamp()
                     current_job["exit_code"] = exit_code
-                    final_state, final_message = classify_job_exit(paths, current_job, exit_code)
+                    final_state, final_message = classify_dashboard_job_exit(current_job, exit_code)
                     current_job["state"] = final_state
                     current_job["message"] = final_message
                     current_job["result_summary"] = collect_result_summary(paths)
@@ -1986,9 +1872,47 @@ def create_app(config_path: Path) -> FastAPI:
                 else:
                     launcher_state["last_state"] = "error"
                     launcher_state["last_message"] = final_message
+                    if isinstance(current_job, dict) and infer_dashboard_job_kind(current_job) == "aihub":
+                        removed_followups = remove_dependent_followups_locked(current_job)
+                        if removed_followups:
+                            launcher_state["last_message"] = (
+                                f"{final_message} Dependent guideline/RGB/cleanup jobs for filekey "
+                                f"{current_job.get('filekey') or '-'} were removed: {removed_followups}."
+                            )
+                if isinstance(current_job, dict):
+                    job_state = str(current_job.get("state") or launcher_state.get("last_state") or "unknown")
+                    if filekey_pipeline_step_id(current_job):
+                        _, final_event, final_title, final_body = record_filekey_pipeline_finished(
+                            current_job,
+                            job_state,
+                            final_message,
+                        )
+                        if final_event:
+                            dispatch_dashboard_notification(
+                                final_event,
+                                title=final_title,
+                                message=final_body,
+                                priority="high" if final_event == "error" else "default",
+                            )
+                    else:
+                        notify_title, notify_body, notify_priority = build_job_notification_payload(
+                            current_job,
+                            job_state,
+                            final_message,
+                        )
+                        notification_event = str(current_job.get("state") or "error")
+                        if notification_event == "data_ready":
+                            notification_event = "completed"
+                        dispatch_dashboard_notification(
+                            notification_event,
+                            title=notify_title,
+                            message=notify_body,
+                            priority=notify_priority,
+                        )
 
         active_process = launcher_state.get("process")
         queued_jobs = launcher_state.get("queued_jobs", [])
+        maybe_start_predownloads_locked()
         if (
             active_process is None
             and bool(launcher_state.get("auto_start_enabled", True))
@@ -1996,7 +1920,16 @@ def create_app(config_path: Path) -> FastAPI:
             and isinstance(queued_jobs, list)
             and not queued_jobs
         ):
-            enqueue_next_extract_recommended_job_locked()
+            if performance_plan_is_active() and performance_plan_deadline_reached():
+                enqueue_performance_plan_training_locked("deadline_reached")
+            else:
+                resumed = enqueue_interrupted_auto_extract_job_locked(
+                    str(launcher_state.get("auto_enqueue_datasetkey") or ""),
+                    str(launcher_state.get("auto_enqueue_api_key") or ""),
+                    rgb_model=str(launcher_state.get("auto_rgb_model") or "i3d_r50"),
+                )
+                if resumed is None:
+                    enqueue_next_extract_recommended_job_locked()
             queued_jobs = launcher_state.get("queued_jobs", [])
         if (
             active_process is None
@@ -2029,6 +1962,32 @@ def create_app(config_path: Path) -> FastAPI:
             current_job = snapshot_job(launcher_state.get("current_job"))
             queued_jobs = launcher_state.get("queued_jobs", [])
             completed_jobs = launcher_state.get("completed_jobs", [])
+            predownload_processes = launcher_state.get("predownload_processes", {})
+            predownload_running = []
+            if isinstance(predownload_processes, dict):
+                for item in predownload_processes.values():
+                    if isinstance(item, dict):
+                        predownload_running.append({key: value for key, value in item.items() if key != "process"})
+            predownload_completed = (
+                list(launcher_state.get("predownload_completed", []))
+                if isinstance(launcher_state.get("predownload_completed"), list)
+                else []
+            )
+            predownload_completed_filekeys = {
+                str(item.get("filekey") or "").strip()
+                for item in predownload_completed
+                if isinstance(item, dict)
+            }
+            datasetkey_for_cache = str(
+                launcher_state.get("auto_enqueue_datasetkey")
+                or config.get("aihub_shell", {}).get("datasetkey")
+                or ""
+            ).strip()
+            for item in collect_completed_predownload_cache_items_locked(datasetkey_for_cache):
+                filekey = str(item.get("filekey") or "").strip()
+                if filekey and filekey not in predownload_completed_filekeys:
+                    predownload_completed.append(item)
+                    predownload_completed_filekeys.add(filekey)
             if (not isinstance(completed_jobs, list) or not completed_jobs) and current_job is None:
                 completed_jobs = reload_completed_jobs_from_history()
             elif current_job is None:
@@ -2042,14 +2001,29 @@ def create_app(config_path: Path) -> FastAPI:
             "auto_start_enabled": bool(launcher_state.get("auto_start_enabled", True)),
             "auto_enqueue_enabled": bool(launcher_state.get("auto_enqueue_enabled", False)),
             "auto_enqueue_datasetkey": launcher_state.get("auto_enqueue_datasetkey"),
+            "auto_extract_enabled": bool(launcher_state.get("auto_extract_enabled", False)),
+            "performance_plan": performance_plan_payload(),
             "runtime_config_path": str(launcher_state["runtime_config_path"])
             if launcher_state.get("runtime_config_path")
             else None,
             "current_job": current_job,
             "pending_jobs": [snapshot_job(job) for job in queued_jobs] if isinstance(queued_jobs, list) else [],
             "completed_jobs": [snapshot_job(job) for job in completed_jobs] if isinstance(completed_jobs, list) else [],
+            "predownload": {
+                "enabled": bool(launcher_state.get("predownload_enabled", True)),
+                "max_parallel": int(launcher_state.get("predownload_max_parallel") or 2),
+                "min_free_gb": float(launcher_state.get("predownload_min_free_gb") or 100),
+                "free_gb": round(predownload_free_disk_gb(), 2),
+                "pause_reason": str(launcher_state.get("predownload_pause_reason") or ""),
+                "running": predownload_running,
+                "completed": predownload_completed,
+                "failed": launcher_state.get("predownload_failed", [])
+                if isinstance(launcher_state.get("predownload_failed"), list)
+                else [],
+            },
             "last_exit_code": launcher_state.get("last_exit_code"),
             "log_path": str(launcher_state["log_path"]) if launcher_state.get("log_path") else None,
+            "notification_settings": notification_settings_public(launcher_state.get("notification_settings")),
         }
 
     safe_sync_pages_report("startup report")
@@ -2071,9 +2045,6 @@ def create_app(config_path: Path) -> FastAPI:
 
     atexit.register(sync_pages_shutdown)
 
-    worker = threading.Thread(target=queue_worker, daemon=True)
-    worker.start()
-
     def server_tone_class(state: str) -> str:
         normalized = str(state or "").strip().lower()
         if normalized in {"completed", "completed_warning", "online"}:
@@ -2091,8 +2062,11 @@ def create_app(config_path: Path) -> FastAPI:
         launcher = overview.get("launcher") or {}
         pipeline = overview.get("pipeline_status") or {}
         progress = overview.get("training_progress") or {}
+        metrics = overview.get("metrics") or {}
         dataset = overview.get("dataset") or {}
         latest = progress.get("latest") or {}
+        final_validation = metrics.get("final_validation") or progress.get("final_validation") or {}
+        model_type = metrics.get("model_type") or "single"
         current_state = launcher.get("state") or pipeline.get("state") or "idle"
         prepared_total = sum(
             int((dataset.get(key) or {}).get("total", 0) or 0)
@@ -2129,7 +2103,10 @@ def create_app(config_path: Path) -> FastAPI:
         best_epoch = progress.get("best_epoch", "-")
         latest_acc_text = f"{float(latest_acc):.3f}" if latest_acc is not None else "-"
         latest_f1_text = f"{float(latest_f1):.3f}" if latest_f1 is not None else "-"
-        best_f1_text = f"{float(best_f1):.3f}" if best_f1 is not None else "-"
+        final_acc = final_validation.get("accuracy")
+        final_f1 = final_validation.get("macro_f1")
+        final_acc_text = f"{float(final_acc):.3f}" if final_acc is not None else "-"
+        final_f1_text = f"{float(final_f1):.3f}" if final_f1 is not None else "-"
         message = launcher.get("message") or pipeline.get("message") or "상세 메시지가 없습니다."
         return (
             "<section class=\"card\" style=\"margin-bottom:20px;padding:24px 24px 18px;\">"
@@ -2145,7 +2122,7 @@ def create_app(config_path: Path) -> FastAPI:
             f"<div class=\"status-pill {server_tone_class(current_state)}\">{escape(str(current_state))}</div>"
             "</div>"
             "<div class=\"hero-meta\" style=\"margin-top:16px;\">"
-            f"<div class=\"hero-chip\"><strong>Best F1</strong> {best_f1_text} @ epoch {escape(str(best_epoch))}</div>"
+            f"<div class=\"hero-chip\"><strong>Final</strong> acc {final_acc_text} / f1 {final_f1_text} / {escape(str(model_type))}</div>"
             f"<div class=\"hero-chip\"><strong>Latest</strong> epoch {escape(str(latest_epoch))} / acc {latest_acc_text} / f1 {latest_f1_text}</div>"
             f"<div class=\"hero-chip\"><strong>Dataset</strong> raw {raw_total} / prepared {prepared_total}</div>"
             f"<div class=\"hero-chip\"><strong>Completed Jobs</strong> {len(completed_jobs)}</div>"
@@ -2175,8 +2152,8 @@ def create_app(config_path: Path) -> FastAPI:
         dataset = overview.get("dataset") or {}
         launcher = overview.get("launcher") or {}
         diagnostics = overview.get("diagnostics") or {}
-        final_validation = progress.get("final_validation") or metrics.get("final_validation") or {}
-        labels = progress.get("labels") or metrics.get("labels") or []
+        final_validation = metrics.get("final_validation") or progress.get("final_validation") or {}
+        labels = metrics.get("labels") or progress.get("labels") or []
         history = list(progress.get("history") or metrics.get("history") or [])
         completed_jobs = launcher.get("completed_jobs") or []
         per_class_rows = final_validation.get("per_class") or []
@@ -2859,6 +2836,11 @@ def create_app(config_path: Path) -> FastAPI:
       line-height: 1.6;
       word-break: break-word;
     }
+    .launch-value-compact {
+      font-size: 13px;
+      font-weight: 650;
+      color: var(--text);
+    }
     .launch-message {
       min-height: 52px;
       padding: 14px 16px;
@@ -3025,6 +3007,14 @@ def create_app(config_path: Path) -> FastAPI:
       font-weight: 700;
       letter-spacing: 0.05em;
       text-transform: uppercase;
+    }
+    .table-source {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 3px;
+      text-transform: none;
     }
     .empty {
       padding: 20px;
@@ -3716,6 +3706,33 @@ def create_app(config_path: Path) -> FastAPI:
       position: relative;
       z-index: 1;
     }
+    .chart-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+    }
+    .chart-row .chart-wrap {
+      margin-top: 0;
+    }
+    .chart-caption {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      color: #5b6d82;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .chart-caption strong {
+      color: var(--ink);
+      font-size: 12.5px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
     .chart-tooltip {
       position: absolute;
       z-index: 3;
@@ -3893,6 +3910,51 @@ def create_app(config_path: Path) -> FastAPI:
       color: #0f172a;
       font-weight: 700;
     }
+    .class-bars {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .class-bar-row {
+      display: grid;
+      grid-template-columns: minmax(92px, 0.22fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+    .class-bar-label {
+      color: var(--ink);
+      font-size: 12.5px;
+      font-weight: 800;
+      word-break: break-word;
+    }
+    .class-bar-stack {
+      display: grid;
+      gap: 5px;
+    }
+    .class-bar-track {
+      position: relative;
+      height: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(226, 232, 240, 0.92);
+    }
+    .class-bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      transition: width 0.18s ease;
+    }
+    .class-bar-values {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      color: #64748b;
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .class-bar-values strong {
+      color: var(--ink);
+      font-weight: 800;
+    }
     @media (max-width: 1480px) {
       .grid {
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3941,6 +4003,9 @@ def create_app(config_path: Path) -> FastAPI:
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .diagnostic-grid {
+        grid-template-columns: 1fr;
+      }
+      .chart-row {
         grid-template-columns: 1fr;
       }
       .value {
@@ -3999,6 +4064,7 @@ def create_app(config_path: Path) -> FastAPI:
         </div>
         <div class="control-actions">
           <button id="startButton" class="primary-button" type="button">시작 / 추가</button>
+          <button id="reextractButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #0f766e 0%, #0d9488 100%); box-shadow: 0 14px 28px rgba(13, 148, 136, 0.20);">선택 filekey 재추출</button>
           <button id="stopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #d97706 0%, #b45309 100%); box-shadow: 0 14px 28px rgba(217, 119, 6, 0.20);">현재 작업 후 중지</button>
           <button id="forceStopButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 14px 28px rgba(239, 68, 68, 0.22);">지금 중단</button>
           <button id="resetButton" class="primary-button" type="button" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); box-shadow: 0 14px 28px rgba(220, 38, 38, 0.22);">처음부터 다시 시작</button>
@@ -4013,6 +4079,10 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="launch-item">
           <div class="launch-label">현재 실행 filekey</div>
           <div class="launch-value" id="currentFilekey">-</div>
+        </div>
+        <div class="launch-item">
+          <div class="launch-label">Target filekeys</div>
+          <div class="launch-value launch-value-compact" id="currentFilekeyDetails">-</div>
         </div>
         <div class="launch-item">
           <div class="launch-label">현재 실행 datasetkey</div>
@@ -4191,6 +4261,22 @@ def create_app(config_path: Path) -> FastAPI:
               <span class="green">Validation Loss</span>
             </div>
           </div>
+          <div class="chart-row">
+            <div class="chart-wrap">
+              <div class="chart-caption"><span>Learning Rate</span><strong id="learningRateChartValue">-</strong></div>
+              <div class="chart-shell">
+                <svg id="learningRateChart" class="chart" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+                <div id="learningRateChartTooltip" class="chart-tooltip"></div>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <div class="chart-caption"><span>Loss Gap</span><strong id="lossGapChartValue">-</strong></div>
+              <div class="chart-shell">
+                <svg id="lossGapChart" class="chart" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+                <div id="lossGapChartTooltip" class="chart-tooltip"></div>
+              </div>
+            </div>
+          </div>
           <div class="two-col">
             <div class="mini-card">
               <div class="mini-title">최근 Epoch</div>
@@ -4220,13 +4306,15 @@ def create_app(config_path: Path) -> FastAPI:
         <div class="panel-head">
           <div>
             <h2 class="panel-title">데이터셋 요약</h2>
-            <div class="panel-copy">split과 클래스 분포</div>
+            <div class="panel-copy">pose, guideline/RGB, active 기준을 분리한 split과 클래스 분포</div>
           </div>
         </div>
         <div class="panel-body">
+          <div id="perClassMetricChart" class="class-bars"></div>
           <table class="table">
             <thead>
               <tr>
+                <th>기준</th>
                 <th>구간</th>
                 <th>총 샘플</th>
                 <th>클래스 분포</th>
@@ -4444,7 +4532,30 @@ def create_app(config_path: Path) -> FastAPI:
       if (!job || !job.filekey) {
         return '-';
       }
-      return `${job.filekey} (${job.state || 'unknown'})`;
+      const sourceFilekey = job.source_filekey && job.source_filekey !== job.filekey
+        ? ` | source ${job.source_filekey}`
+        : '';
+      return `${job.filekey} (${job.state || 'unknown'})${sourceFilekey}`;
+    }
+
+    function formatCurrentJobFilekeys(summary) {
+      const items = Array.isArray(summary?.filekeys) ? summary.filekeys : [];
+      if (!items.length) {
+        return '-';
+      }
+      const head = items.slice(0, 8).map((item) => {
+        const splits = item?.splits || {};
+        const splitText = ['train', 'val', 'test']
+          .map((split) => splits[split] ? `${split[0]}${splits[split]}` : null)
+          .filter(Boolean)
+          .join('/');
+        const rgbMissing = Number(item?.rgb_missing || 0);
+        const rgbText = rgbMissing > 0 ? `, rgb pending ${rgbMissing}` : '';
+        return `${item.filekey}: ${item.total}${splitText ? ` (${splitText}${rgbText})` : rgbText}`;
+      });
+      const extra = items.length > head.length ? ` +${items.length - head.length} more` : '';
+      const source = summary?.source ? `${summary.source}: ` : '';
+      return `${source}${head.join(' / ')}${extra}`;
     }
 
     function formatCompletedJobs(jobs) {
@@ -4611,6 +4722,7 @@ def create_app(config_path: Path) -> FastAPI:
         'apiKeyInput',
         'filekeysInput',
         'startButton',
+        'reextractButton',
         'stopButton',
         'forceStopButton',
         'resetButton',
@@ -4715,12 +4827,14 @@ def create_app(config_path: Path) -> FastAPI:
       const startButton = document.getElementById('startButton');
       const stopButton = document.getElementById('stopButton');
       const forceStopButton = document.getElementById('forceStopButton');
+      const reextractButton = document.getElementById('reextractButton');
       const resetButton = document.getElementById('resetButton');
-      if (!startButton || !stopButton || !forceStopButton || !resetButton) {
+      if (!startButton || !stopButton || !forceStopButton || !resetButton || !reextractButton) {
         return;
       }
       if (viewerMode) {
         startButton.disabled = true;
+        reextractButton.disabled = true;
         stopButton.disabled = true;
         forceStopButton.disabled = true;
         resetButton.disabled = true;
@@ -4735,6 +4849,7 @@ def create_app(config_path: Path) -> FastAPI:
       } else {
         startButton.textContent = '시작 / 추가';
       }
+      reextractButton.disabled = false;
 
       if (hasCurrentJob || pendingCount > 0) {
         stopButton.disabled = !autoStartEnabled;
@@ -5163,14 +5278,177 @@ def create_app(config_path: Path) -> FastAPI:
       });
     }
 
-    function renderDatasetTable(dataset) {
+    function renderSingleMetricChart({
+      svgId,
+      tooltipId,
+      lineId,
+      valueId,
+      history,
+      label,
+      color,
+      valueGetter,
+      valueFormatter,
+      emptyText,
+      includeZeroLine = false,
+    }) {
+      const svg = document.getElementById(svgId);
+      if (!svg) {
+        return;
+      }
+      const rows = Array.isArray(history) ? history : [];
+      const values = rows.map((row) => {
+        const value = Number(valueGetter(row));
+        return Number.isFinite(value) ? value : null;
+      });
+      const validValues = values.filter((value) => value !== null);
+      const latestValue = validValues.length ? validValues[validValues.length - 1] : null;
+      setText(valueId, latestValue === null ? '-' : valueFormatter(latestValue));
+      if (!rows.length || !validValues.length) {
+        svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#94a3b8" font-size="15">${escapeHtml(emptyText)}</text>`;
+        const tooltip = document.getElementById(tooltipId);
+        if (tooltip) {
+          tooltip.classList.remove('visible');
+        }
+        return;
+      }
+
+      const width = 800;
+      const height = 220;
+      const padLeft = 58;
+      const padRight = 20;
+      const padTop = 16;
+      const padBottom = 30;
+      const innerW = width - padLeft - padRight;
+      const innerH = height - padTop - padBottom;
+      let minY = Math.min(...validValues);
+      let maxY = Math.max(...validValues);
+      if (includeZeroLine) {
+        minY = Math.min(minY, 0);
+        maxY = Math.max(maxY, 0);
+      }
+      if (maxY <= minY) {
+        maxY = minY + 1;
+      }
+      const padding = (maxY - minY) * 0.12 || 0.001;
+      minY -= padding;
+      maxY += padding;
+      const maxX = Math.max(rows.length - 1, 1);
+      const xFor = (index) => padLeft + (index / maxX) * innerW;
+      const yFor = (value) => padTop + (1 - ((value - minY) / (maxY - minY))) * innerH;
+
+      const points = [];
+      const circles = [];
+      rows.forEach((row, index) => {
+        const value = values[index];
+        if (value === null) {
+          return;
+        }
+        const x = xFor(index);
+        const y = yFor(value);
+        points.push(`${x},${y}`);
+        circles.push(`
+          <g class="chart-point" transform="translate(${x}, ${y})">
+            <circle class="chart-point-core" r="4.4" fill="#ffffff"></circle>
+            <circle class="chart-point-core" r="3" fill="${color}"></circle>
+            <circle
+              class="chart-point-hit"
+              r="12"
+              data-cx="${x}"
+              data-title="Epoch ${escapeHtml(row.epoch ?? index + 1)}"
+              data-lines="${escapeHtml(label)}:${escapeHtml(valueFormatter(value))}|Train Loss:${Number(row.train_loss ?? 0).toFixed(4)}|Val Loss:${Number(row.val_loss ?? 0).toFixed(4)}|Val Macro F1:${Number(row.val_macro_f1 ?? 0).toFixed(4)}"
+            ></circle>
+          </g>
+        `);
+      });
+
+      const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const y = padTop + (1 - ratio) * innerH;
+        const value = minY + ((maxY - minY) * ratio);
+        return `
+          <line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(148,163,184,0.18)" />
+          <text x="8" y="${y + 4}" fill="#94a3b8" font-size="11">${escapeHtml(valueFormatter(value))}</text>
+        `;
+      }).join('');
+      const zeroLine = includeZeroLine && minY < 0 && maxY > 0
+        ? `<line x1="${padLeft}" y1="${yFor(0)}" x2="${width - padRight}" y2="${yFor(0)}" stroke="rgba(15,23,42,0.22)" stroke-dasharray="5 5" />`
+        : '';
+      const xLabels = rows.map((row, index) => {
+        if (rows.length > 10 && index % Math.ceil(rows.length / 6) !== 0 && index !== rows.length - 1) {
+          return '';
+        }
+        return `<text x="${xFor(index)}" y="${height - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">${escapeHtml(row.epoch ?? index + 1)}</text>`;
+      }).join('');
+
+      svg.innerHTML = `
+        ${grid}
+        ${zeroLine}
+        <line id="${lineId}" class="chart-hover-line" x1="0" y1="0" x2="0" y2="0"></line>
+        <polyline fill="none" stroke="${color}" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" points="${points.join(' ')}"></polyline>
+        ${circles.join('')}
+        ${xLabels}
+      `;
+      attachChartTooltip({
+        svgId,
+        tooltipId,
+        lineId,
+        bottomY: height - padBottom,
+      });
+    }
+
+    function renderLearningRateChart(history) {
+      renderSingleMetricChart({
+        svgId: 'learningRateChart',
+        tooltipId: 'learningRateChartTooltip',
+        lineId: 'learningRateChartHoverLine',
+        valueId: 'learningRateChartValue',
+        history,
+        label: 'Learning Rate',
+        color: '#7c3aed',
+        valueGetter: (row) => row.learning_rate,
+        valueFormatter: (value) => Number(value).toExponential(2),
+        emptyText: 'learning rate 기록이 없습니다',
+      });
+    }
+
+    function renderLossGapChart(history) {
+      renderSingleMetricChart({
+        svgId: 'lossGapChart',
+        tooltipId: 'lossGapChartTooltip',
+        lineId: 'lossGapChartHoverLine',
+        valueId: 'lossGapChartValue',
+        history,
+        label: 'Val - Train',
+        color: '#f97316',
+        valueGetter: (row) => Number(row.val_loss) - Number(row.train_loss),
+        valueFormatter: (value) => `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(4)}`,
+        emptyText: 'loss gap 기록이 없습니다',
+        includeZeroLine: true,
+      });
+    }
+
+    function renderDatasetTable(dataset, distributionSources) {
       const tbody = document.getElementById('datasetTable');
       const empty = document.getElementById('datasetEmpty');
       const rows = [];
-      const sections = ['raw', 'train', 'val', 'test', 'prepared_train', 'prepared_val', 'prepared_test'];
+      const splitSections = ['raw', 'train', 'val', 'test'];
+      const preparedSections = ['prepared_train', 'prepared_val', 'prepared_test'];
+      const sectionLabels = {
+        raw: '누적 원본',
+        train: '누적 train split',
+        val: '누적 val split',
+        test: '누적 test split',
+        prepared_train: 'train',
+        prepared_val: 'val',
+        prepared_test: 'test',
+      };
+      const sourceLabels = {
+        cumulative: '누적 원본/Pose',
+        guideline: 'Guideline/RGB clip',
+        active: '학습 active',
+        current: '현재 작업',
+      };
 
-      sections.forEach((key) => {
-        const info = dataset[key];
+      const appendRow = (sourceLabel, key, info) => {
         if (!info || !info.total) {
           return;
         }
@@ -5179,12 +5457,24 @@ def create_app(config_path: Path) -> FastAPI:
           .join(' / ');
         rows.push(`
           <tr>
-            <td>${escapeHtml(key)}</td>
+            <td>${escapeHtml(sourceLabel)}</td>
+            <td>${escapeHtml(sectionLabels[key] || key)}</td>
             <td>${info.total}</td>
             <td>${labels || '-'}</td>
           </tr>
         `);
-      });
+      };
+
+      if (distributionSources && Object.keys(distributionSources).length) {
+        const cumulative = distributionSources.cumulative || {};
+        splitSections.forEach((key) => appendRow(sourceLabels.cumulative, key, cumulative[key]));
+        preparedSections.forEach((key) => appendRow(sourceLabels.cumulative, key, cumulative[key]));
+        preparedSections.forEach((key) => appendRow(sourceLabels.guideline, key, distributionSources.guideline?.[key]));
+        preparedSections.forEach((key) => appendRow(sourceLabels.active, key, distributionSources.active?.[key]));
+        splitSections.concat(preparedSections).forEach((key) => appendRow(sourceLabels.current, key, distributionSources.current?.[key]));
+      } else {
+        splitSections.concat(preparedSections).forEach((key) => appendRow('데이터셋', key, dataset[key]));
+      }
 
       if (!rows.length) {
         tbody.innerHTML = '';
@@ -5306,10 +5596,10 @@ def create_app(config_path: Path) -> FastAPI:
     }
 
     function renderMetricInsights(progress, metrics) {
-      const finalValidation = progress?.final_validation || metrics?.final_validation || {};
+      const finalValidation = metrics?.final_validation || progress?.final_validation || {};
       const history = progress?.history || [];
       const latest = progress?.latest || history[history.length - 1] || null;
-      const labels = progress?.labels || metrics?.labels || [];
+      const labels = metrics?.labels || progress?.labels || [];
       const earlyStopping = progress?.early_stopping || metrics?.early_stopping || {};
       const stoppedEarly = Boolean(progress?.stopped_early ?? metrics?.stopped_early);
       const trainImbalance = formatImbalanceSummary(progress?.train_distribution || metrics?.train_distribution || null);
@@ -5374,15 +5664,58 @@ def create_app(config_path: Path) -> FastAPI:
       document.getElementById('trainImbalanceCopy').textContent = trainImbalance.copy;
     }
 
+    function renderPerClassMetricChart(labels, perClass, confusion) {
+      const wrap = document.getElementById('perClassMetricChart');
+      if (!wrap) {
+        return;
+      }
+      if (!Array.isArray(perClass) || !perClass.length) {
+        wrap.innerHTML = '<div class="empty">클래스별 그래프가 아직 없습니다.</div>';
+        return;
+      }
+      const supportRows = buildPerClassSupport(labels, confusion);
+      const supportByClass = new Map(supportRows.map((row) => [Number(row.class_index), Number(row.support || 0)]));
+      const sortedRows = perClass
+        .filter((row) => row && row.class_index !== undefined)
+        .slice()
+        .sort((a, b) => Number(a.class_index) - Number(b.class_index));
+      wrap.innerHTML = sortedRows.map((row) => {
+        const classIndex = Number(row.class_index);
+        const label = labels?.[classIndex] || row.label || `class_${classIndex}`;
+        const precision = Math.max(0, Math.min(1, Number(row.precision || 0)));
+        const recall = Math.max(0, Math.min(1, Number(row.recall || 0)));
+        const f1 = Math.max(0, Math.min(1, Number(row.f1 || 0)));
+        const support = supportByClass.get(classIndex) ?? Number(row.support || 0);
+        return `
+          <div class="class-bar-row">
+            <div class="class-bar-label">${escapeHtml(label)}</div>
+            <div class="class-bar-stack">
+              <div class="class-bar-track" title="F1 ${f1.toFixed(4)}">
+                <div class="class-bar-fill" style="width:${(f1 * 100).toFixed(2)}%;background:linear-gradient(90deg,#22c55e,#2563eb);"></div>
+              </div>
+              <div class="class-bar-values">
+                <span><strong>F1</strong> ${f1.toFixed(3)}</span>
+                <span><strong>Recall</strong> ${recall.toFixed(3)}</span>
+                <span><strong>Precision</strong> ${precision.toFixed(3)}</span>
+                <span><strong>Support</strong> ${support}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
     function renderPerClassMetrics(labels, perClass, confusion) {
       const tbody = document.getElementById('perClassMetricsTable');
       const empty = document.getElementById('perClassMetricsEmpty');
       if (!perClass || !perClass.length) {
         tbody.innerHTML = '';
         empty.style.display = 'block';
+        renderPerClassMetricChart(labels, [], confusion);
         return;
       }
       empty.style.display = 'none';
+      renderPerClassMetricChart(labels, perClass, confusion);
       const supportRows = buildPerClassSupport(labels, confusion);
       tbody.innerHTML = perClass.map((row) => {
         const label = labels?.[row.class_index] || `class_${row.class_index}`;
@@ -5618,11 +5951,58 @@ def create_app(config_path: Path) -> FastAPI:
         if (!resumeOnly) {
           document.getElementById('filekeysInput').value = '';
         }
-        await refresh();
+        await refresh({ forceFull: true });
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
         button.disabled = false;
+        updateControlButtons(latestOverview?.launcher || {});
+      }
+    }
+
+    async function reextractSelectedFilekeys() {
+      if (viewerMode) {
+        setLaunchMessage('읽기 전용 공유 화면에서는 재추출을 시작할 수 없습니다.', true);
+        return;
+      }
+      const input = document.getElementById('filekeysInput').value.trim();
+      const datasetKey = saveDatasetKey();
+      const apiKey = saveApiKey();
+      if (!input) {
+        setLaunchMessage('재추출할 filekey를 입력해 주세요. 예: 49665', true);
+        return;
+      }
+      if (!datasetKey) {
+        setLaunchMessage('datasetkey를 입력해 주세요.', true);
+        return;
+      }
+      const button = document.getElementById('reextractButton');
+      button.disabled = true;
+      button.textContent = '재추출 큐 추가 중...';
+      try {
+        const response = await fetch('/api/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            datasetkey: datasetKey,
+            filekeys: input,
+            api_key: apiKey,
+            stage: 'extract',
+            feature_extract: true,
+            reextract_filekey_only: true,
+          }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || data.message || 'filekey 재추출 큐 추가에 실패했습니다.');
+        }
+        setLaunchMessage(data.message || '선택 filekey 재추출을 큐에 추가했습니다.', false);
+        document.getElementById('filekeysInput').value = '';
+        await refresh({ forceFull: true });
+      } catch (error) {
+        setLaunchMessage(error.message || String(error), true);
+      } finally {
+        button.textContent = '선택 filekey 재추출';
         updateControlButtons(latestOverview?.launcher || {});
       }
     }
@@ -5646,7 +6026,7 @@ def create_app(config_path: Path) -> FastAPI:
           throw new Error(data.detail || data.message || '중지 요청에 실패했습니다.');
         }
         setLaunchMessage(data.message || '현재 작업까지만 진행하고 다음 큐 자동 시작을 멈춥니다.', false);
-        await refresh();
+        await refresh({ forceFull: true });
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
@@ -5678,7 +6058,7 @@ def create_app(config_path: Path) -> FastAPI:
           throw new Error(data.detail || data.message || '강제 중단에 실패했습니다.');
         }
         setLaunchMessage(data.message || '현재 작업을 강제 중단했습니다.', false);
-        await refresh();
+        await refresh({ forceFull: true });
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
@@ -5710,7 +6090,7 @@ def create_app(config_path: Path) -> FastAPI:
           throw new Error(data.detail || data.message || '초기화에 실패했습니다.');
         }
         setLaunchMessage(data.message || '학습 워크스페이스를 초기화했습니다.', false);
-        await refresh();
+        await refresh({ forceFull: true });
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       } finally {
@@ -5740,7 +6120,7 @@ def create_app(config_path: Path) -> FastAPI:
           throw new Error(data.detail || data.message || '대기열 삭제에 실패했습니다.');
         }
         setLaunchMessage(data.message || '선택한 대기열 작업을 삭제했습니다.', false);
-        await refresh();
+        await refresh({ forceFull: true });
       } catch (error) {
         setLaunchMessage(error.message || String(error), true);
       }
@@ -5755,14 +6135,69 @@ def create_app(config_path: Path) -> FastAPI:
       }
     }
 
-    async function refresh() {
+    const OVERVIEW_FULL_REFRESH_INTERVAL_MS = 5000;
+    let lastFullOverviewAt = 0;
+
+    function isEmptyPayload(value) {
+      if (value === null || value === undefined) {
+        return true;
+      }
+      if (Array.isArray(value)) {
+        return value.length === 0;
+      }
+      if (typeof value === 'object') {
+        return Object.keys(value).length === 0;
+      }
+      return false;
+    }
+
+    function mergeLiteOverview(previous, incoming, isLite) {
+      if (!isLite || !previous) {
+        return incoming;
+      }
+      const merged = { ...previous, ...incoming };
+      [
+        'dataset',
+        'guideline_quality',
+        'prepared_pose_items',
+        'logs',
+        'metrics',
+        'skip_report',
+        'cumulative_skip_report',
+        'diagnostics',
+        'insights',
+      ].forEach((key) => {
+        if (isEmptyPayload(incoming?.[key]) && previous?.[key] !== undefined) {
+          merged[key] = previous[key];
+        }
+      });
+      merged.training_progress = {
+        ...(previous.training_progress || {}),
+        ...(incoming.training_progress || {}),
+      };
+      merged.launcher = {
+        ...(previous.launcher || {}),
+        ...(incoming.launcher || {}),
+      };
+      return merged;
+    }
+
+    async function refresh(options = {}) {
       let data;
       if (pendingInitialOverview) {
         data = pendingInitialOverview;
         pendingInitialOverview = null;
+        lastFullOverviewAt = Date.now();
       } else {
         try {
-          const response = await fetch('/api/overview', { cache: 'no-store' });
+          const now = Date.now();
+          const forceFull = Boolean(options?.forceFull);
+          const shouldFetchFull =
+            forceFull ||
+            !latestOverview ||
+            !lastRenderSucceeded ||
+            (now - lastFullOverviewAt) >= OVERVIEW_FULL_REFRESH_INTERVAL_MS;
+          const response = await fetch(shouldFetchFull ? '/api/overview' : '/api/overview?lite=1', { cache: 'no-store' });
           if (!response.ok) {
             let detail = `대시보드 상태를 불러오지 못했습니다. (${response.status})`;
             try {
@@ -5774,7 +6209,11 @@ def create_app(config_path: Path) -> FastAPI:
             setLaunchMessage(detail, true);
             return;
           }
-          data = await response.json();
+          const incoming = await response.json();
+          if (shouldFetchFull) {
+            lastFullOverviewAt = Date.now();
+          }
+          data = mergeLiteOverview(latestOverview, incoming, !shouldFetchFull);
         } catch (error) {
           setLaunchMessage(error?.message || '대시보드 상태 요청에 실패했습니다.', true);
           return;
@@ -5824,6 +6263,7 @@ def create_app(config_path: Path) -> FastAPI:
         setText('workspaceChip', data.workspace_name || '-');
         setText('launcherState', formatLauncherState(launcher.state || 'idle'));
         setText('currentFilekey', formatJob(launcher.current_job));
+        setText('currentFilekeyDetails', formatCurrentJobFilekeys(data.current_job_filekeys || {}));
         setText(
           'currentDatasetkey',
           launcher.current_job?.datasetkey || formatDatasetkeys(launcher.pending_jobs || [])
@@ -5914,14 +6354,16 @@ def create_app(config_path: Path) -> FastAPI:
       runRenderStep('charts and dataset tables', renderErrors, () => {
         renderChart(progress.history || []);
         renderLossChart(progress.history || []);
+        renderLearningRateChart(progress.history || []);
+        renderLossGapChart(progress.history || []);
         renderMetricInsights(progress, metrics);
-        renderDatasetTable(data.dataset || {});
+        renderDatasetTable(data.dataset || {}, data.distribution_sources || {});
         renderCurrentJobProgress(currentJobProgress, data.current_dataset || {}, continualState, progress);
       });
 
       runRenderStep('validation metrics', renderErrors, () => {
-        const metricLabels = progress.labels || metrics.labels || [];
-        const finalValidation = progress.final_validation || metrics.final_validation || {};
+        const metricLabels = metrics.labels || progress.labels || [];
+        const finalValidation = metrics.final_validation || progress.final_validation || {};
         renderPerClassMetrics(
           metricLabels,
           finalValidation.per_class || [],
@@ -5974,6 +6416,7 @@ def create_app(config_path: Path) -> FastAPI:
     document.getElementById('datasetKeyInput').addEventListener('change', saveDatasetKey);
     document.getElementById('apiKeyInput').addEventListener('change', saveApiKey);
     document.getElementById('startButton').addEventListener('click', startTraining);
+    document.getElementById('reextractButton').addEventListener('click', reextractSelectedFilekeys);
     document.getElementById('stopButton').addEventListener('click', pauseQueue);
     document.getElementById('forceStopButton').addEventListener('click', forceStopCurrentJob);
     document.getElementById('resetButton').addEventListener('click', resetWorkspace);
@@ -5985,8 +6428,8 @@ def create_app(config_path: Path) -> FastAPI:
       removeQueuedJob(button.dataset.jobId || '', button.dataset.filekey || '');
     });
     applyViewerMode();
-    refresh();
-    setInterval(refresh, 1000);
+    refresh({ forceFull: true });
+    setInterval(() => refresh(), 1000);
   </script>
   <script>
     (function () {
@@ -6118,6 +6561,70 @@ def create_app(config_path: Path) -> FastAPI:
             else:
                 payload[key] = values
         return payload
+
+    @app.post("/actions/notifications")
+    async def update_notifications(request: Request):
+        payload = await read_form_payload(request)
+        enabled_value = payload.get("enabled")
+        if isinstance(enabled_value, list):
+            enabled_value = enabled_value[0] if enabled_value else ""
+        notify_on = payload.get("notify_on")
+        settings = normalize_notification_settings(
+            {
+                "enabled": enabled_value in {"1", "true", "on", "yes", True},
+                "provider": payload.get("provider") or "ntfy",
+                "ntfy_server": payload.get("ntfy_server") or NOTIFICATION_DEFAULT_NTFY_SERVER,
+                "ntfy_topic": payload.get("ntfy_topic") or "",
+                "notify_on": notify_on if isinstance(notify_on, list) else [notify_on] if notify_on else [],
+            }
+        )
+        mode = str(payload.get("mode") or "save").strip().lower()
+        with state_lock:
+            save_notification_settings(settings)
+        if mode == "test":
+            if not settings.get("enabled"):
+                return build_dashboard_action_response(
+                    request,
+                    message="푸시 알림이 꺼져 있습니다. 켠 다음 테스트해 주세요.",
+                    level="warn",
+                    ok=False,
+                    status_code=400,
+                )
+            try:
+                send_ntfy_notification(
+                    settings,
+                    title="detectWarning 테스트 알림",
+                    message="대시보드 푸시 알림 연결이 정상입니다.",
+                    priority="default",
+                )
+                settings["last_sent_at"] = current_timestamp()
+                settings["last_error"] = ""
+                with state_lock:
+                    save_notification_settings(settings)
+                return build_dashboard_action_response(
+                    request,
+                    message="아이폰으로 테스트 푸시를 보냈습니다.",
+                    level="good",
+                    payload={"notification_settings": notification_settings_public(settings)},
+                )
+            except Exception as exc:
+                settings["last_error"] = str(exc)
+                with state_lock:
+                    save_notification_settings(settings)
+                return build_dashboard_action_response(
+                    request,
+                    message=f"테스트 푸시 전송 실패: {exc}",
+                    level="danger",
+                    ok=False,
+                    status_code=502,
+                    payload={"notification_settings": notification_settings_public(settings)},
+                )
+        return build_dashboard_action_response(
+            request,
+            message="푸시 알림 설정을 저장했습니다.",
+            level="good",
+            payload={"notification_settings": notification_settings_public(settings)},
+        )
 
     def fetch_aihub_file_tree_for_dashboard(datasetkey: str, api_key: str = "") -> tuple[dict | list, str]:
         shell_config = config.get("aihub_shell", {})
@@ -6380,7 +6887,143 @@ def create_app(config_path: Path) -> FastAPI:
                 filekey = str(job.get("filekey") or "").strip()
                 if filekey:
                     filekeys.add(filekey)
+        if include_prepared:
+            filekeys.update(collect_manifest_filekeys_locked())
         return filekeys
+
+    def collect_manifest_filekeys_locked() -> set[str]:
+        filekeys: set[str] = set()
+        for path_key in (
+            "prepared_train",
+            "prepared_val",
+            "prepared_test",
+            "guideline_prepared_train",
+            "guideline_prepared_val",
+            "guideline_prepared_test",
+        ):
+            manifest_path = paths.get(path_key)
+            if not isinstance(manifest_path, Path) or not manifest_path.exists():
+                continue
+            try:
+                with manifest_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        filekey = str(row.get("source_filekey") or row.get("filekey") or "").strip()
+                        if filekey and filekey not in {"guideline_clips", "rgb_i3d_features"}:
+                            filekeys.add(filekey)
+            except OSError:
+                continue
+        return filekeys
+
+    def collect_predownload_filekeys_locked(datasetkey: str) -> set[str]:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        filekeys: set[str] = set()
+        running = launcher_state.get("predownload_processes", {})
+        if isinstance(running, dict):
+            for item in running.values():
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("datasetkey") or "").strip() != normalized_datasetkey:
+                    continue
+                filekey = str(item.get("filekey") or "").strip()
+                if filekey:
+                    filekeys.add(filekey)
+        for key in ("predownload_completed",):
+            items = launcher_state.get(key, [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("datasetkey") or "").strip() != normalized_datasetkey:
+                    continue
+                filekey = str(item.get("filekey") or "").strip()
+                if filekey:
+                    filekeys.add(filekey)
+        predownload_dir = paths.get("predownload_dir")
+        if isinstance(predownload_dir, Path) and predownload_dir.exists():
+            try:
+                cache_dirs = [path for path in predownload_dir.iterdir() if path.is_dir()]
+            except OSError:
+                cache_dirs = []
+            for cache_dir in cache_dirs:
+                marker_path = cache_dir / ".predownload_complete.json"
+                if not marker_path.exists():
+                    continue
+                marker = read_json(marker_path) or {}
+                if isinstance(marker, dict):
+                    marker_datasetkey = str(marker.get("datasetkey") or "").strip()
+                    if marker_datasetkey and marker_datasetkey != normalized_datasetkey:
+                        continue
+                    marker_filekey = str(marker.get("filekey") or "").strip()
+                else:
+                    marker_filekey = ""
+                if not marker_filekey:
+                    marker_filekey = cache_dir.name[4:] if cache_dir.name.startswith("job_") else cache_dir.name
+                marker_filekey = marker_filekey.strip()
+                if marker_filekey:
+                    filekeys.add(marker_filekey)
+        return filekeys
+
+    def collect_completed_predownload_cache_items_locked(datasetkey: str) -> list[dict]:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        predownload_dir = paths.get("predownload_dir")
+        if not isinstance(predownload_dir, Path) or not predownload_dir.exists():
+            return []
+        try:
+            cache_dirs = [path for path in predownload_dir.iterdir() if path.is_dir()]
+        except OSError:
+            return []
+        prepared_filekeys = collect_manifest_filekeys_locked()
+        items: list[dict] = []
+        for cache_dir in cache_dirs:
+            marker_path = cache_dir / ".predownload_complete.json"
+            if not marker_path.exists():
+                continue
+            marker = read_json(marker_path) or {}
+            marker = marker if isinstance(marker, dict) else {}
+            marker_datasetkey = str(marker.get("datasetkey") or "").strip()
+            if marker_datasetkey and normalized_datasetkey and marker_datasetkey != normalized_datasetkey:
+                continue
+            marker_filekey = str(marker.get("filekey") or "").strip()
+            if not marker_filekey:
+                marker_filekey = cache_dir.name[4:] if cache_dir.name.startswith("job_") else cache_dir.name
+            marker_filekey = marker_filekey.strip()
+            if not marker_filekey:
+                continue
+            if marker_filekey in prepared_filekeys:
+                continue
+            try:
+                payload_files = [path for path in cache_dir.iterdir() if path.name != marker_path.name]
+            except OSError:
+                payload_files = []
+            if not payload_files:
+                continue
+            items.append(
+                {
+                    "job_id": f"disk_cache_{marker_filekey}",
+                    "datasetkey": marker_datasetkey or normalized_datasetkey,
+                    "filekey": marker_filekey,
+                    "recommendation": {
+                        "filekey": marker_filekey,
+                        "recommendation_reason": "predownload_disk_cache",
+                    },
+                    "state": "completed",
+                    "finished_at": marker.get("finished_at"),
+                    "started_at": marker.get("started_at"),
+                    "cache_dir": str(cache_dir),
+                    "file_count": marker.get("file_count") or len(payload_files),
+                    "total_bytes": marker.get("total_bytes"),
+                }
+            )
+        items.sort(key=lambda item: str(item.get("finished_at") or ""), reverse=False)
+        return items
 
     def collect_prepared_label_counts() -> dict[str, int]:
         counts: Counter[str] = Counter()
@@ -6422,8 +7065,8 @@ def create_app(config_path: Path) -> FastAPI:
             history[-1] if isinstance(history, list) and history else {}
         )
         final_validation = (
-            training_progress.get("final_validation")
-            or metrics.get("final_validation")
+            metrics.get("final_validation")
+            or training_progress.get("final_validation")
             or {}
         )
         insight_metrics = {
@@ -6432,9 +7075,9 @@ def create_app(config_path: Path) -> FastAPI:
             "history": history if isinstance(history, list) else [],
             "latest": latest if isinstance(latest, dict) else {},
             "final_validation": final_validation if isinstance(final_validation, dict) else {},
-            "best_epoch": training_progress.get("best_epoch") or metrics.get("best_epoch"),
-            "best_val_macro_f1": training_progress.get("best_val_macro_f1") or metrics.get("best_val_macro_f1"),
-            "best_validation": training_progress.get("best_validation") or metrics.get("best_validation") or {},
+            "best_epoch": metrics.get("best_epoch") or training_progress.get("best_epoch"),
+            "best_val_macro_f1": metrics.get("best_val_macro_f1") or training_progress.get("best_val_macro_f1"),
+            "best_validation": metrics.get("best_validation") or training_progress.get("best_validation") or {},
         }
         return interpret_training_results(
             insight_metrics,
@@ -6462,6 +7105,558 @@ def create_app(config_path: Path) -> FastAPI:
             and job.get("auto_recommended")
             and str(job.get("datasetkey") or "").strip() == normalized_datasetkey
         )
+
+    def pop_completed_predownload_locked(datasetkey: str) -> dict | None:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        active_filekeys = collect_active_queue_filekeys_locked(normalized_datasetkey, include_prepared=False)
+        completed = launcher_state.get("predownload_completed", [])
+        if not isinstance(completed, list):
+            completed = []
+        for index, item in enumerate(list(completed)):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("datasetkey") or "").strip() != normalized_datasetkey:
+                continue
+            recommendation = (
+                item.get("recommendation")
+                if isinstance(item.get("recommendation"), dict)
+                else {}
+            )
+            scope = recommendation.get("recommendation_scope") if isinstance(recommendation.get("recommendation_scope"), dict) else {}
+            zip_group = (
+                aihub_entry_zip_group(recommendation)
+                or str(scope.get("zip_group") or "").strip().lower()
+            )
+            allowed_cache_groups = set(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS) | set(AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS)
+            if zip_group and zip_group not in allowed_cache_groups:
+                completed.pop(index)
+                continue
+            if str(item.get("filekey") or "").strip() in active_filekeys:
+                continue
+            return completed.pop(index)
+        for item in collect_completed_predownload_cache_items_locked(normalized_datasetkey):
+            filekey = str(item.get("filekey") or "").strip()
+            if filekey and filekey not in active_filekeys:
+                return item
+        return None
+
+    def pop_failed_predownload_retry_locked(datasetkey: str, *, existing_filekeys: set[str]) -> dict | None:
+        normalized_datasetkey = str(datasetkey or "").strip()
+        failed = launcher_state.get("predownload_failed", [])
+        if not isinstance(failed, list):
+            return None
+        for index, item in enumerate(list(failed)):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("datasetkey") or "").strip() != normalized_datasetkey:
+                continue
+            filekey = str(item.get("filekey") or "").strip()
+            if not filekey or filekey in existing_filekeys:
+                continue
+            retry_item = failed.pop(index)
+            retry_item["retry_of"] = retry_item.get("job_id")
+            retry_item["retry_count"] = int(retry_item.get("retry_count", 0) or 0) + 1
+            return retry_item
+        return None
+
+    def find_incomplete_predownload_cache_retry_locked(datasetkey: str, *, existing_filekeys: set[str]) -> dict | None:
+        predownload_dir = paths.get("predownload_dir")
+        if not isinstance(predownload_dir, Path) or not predownload_dir.exists():
+            return None
+        candidates: list[Path] = []
+        try:
+            candidates = [path for path in predownload_dir.iterdir() if path.is_dir()]
+        except OSError:
+            return None
+        candidates.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+        for cache_dir in candidates:
+            if (cache_dir / ".predownload_complete.json").exists():
+                continue
+            filekey = cache_dir.name
+            if filekey.startswith("job_"):
+                filekey = filekey[4:]
+            filekey = filekey.strip()
+            if not filekey or filekey in existing_filekeys:
+                continue
+            try:
+                has_partial_files = any(path.name != ".predownload_complete.json" for path in cache_dir.iterdir())
+            except OSError:
+                has_partial_files = False
+            return {
+                "job_id": f"incomplete_cache_{filekey}",
+                "datasetkey": str(datasetkey or "").strip(),
+                "filekey": filekey,
+                "recommendation": {
+                    "filekey": filekey,
+                    "recommendation_reason": "incomplete_predownload_cache",
+                },
+                "retry_of": f"incomplete_cache_{filekey}",
+                "retry_count": 1,
+                "partial_cache_dir": str(cache_dir),
+                "partial_files_detected": has_partial_files,
+            }
+        return None
+
+    def dashboard_job_resume_identity(job: dict) -> str:
+        job_kind = infer_dashboard_job_kind(job)
+        stage = str(job.get("stage") or "").strip()
+        if not stage:
+            stage = "extract" if job_kind == "aihub" else "all"
+        return "|".join(
+            [
+                str(job.get("datasetkey") or "").strip(),
+                str(job.get("filekey") or "").strip(),
+                job_kind,
+                stage,
+                str(job.get("source_filekey") or "").strip(),
+            ]
+        )
+
+    def active_dashboard_job_identities_locked() -> set[str]:
+        identities: set[str] = set()
+        current_job = launcher_state.get("current_job")
+        if isinstance(current_job, dict):
+            identities.add(dashboard_job_resume_identity(current_job))
+        pending_jobs = launcher_state.get("queued_jobs", [])
+        if isinstance(pending_jobs, list):
+            for job in pending_jobs:
+                if isinstance(job, dict):
+                    identities.add(dashboard_job_resume_identity(job))
+        return identities
+
+    def enqueue_followup_jobs_for_retry_locked(retry_job: dict, *, rgb_model: str) -> None:
+        job_kind = infer_dashboard_job_kind(retry_job)
+        pending_jobs = launcher_state.setdefault("queued_jobs", [])
+        if not isinstance(pending_jobs, list):
+            launcher_state["queued_jobs"] = []
+            pending_jobs = launcher_state["queued_jobs"]
+
+        source_filekey = str(retry_job.get("source_filekey") or retry_job.get("filekey") or "").strip()
+        source_datasetkey = str(retry_job.get("source_datasetkey") or retry_job.get("datasetkey") or "").strip()
+        followup_payload = {
+            "source": "cumulative",
+            "include_rgb": True,
+            "start_train": False,
+            "cleanup_after": True,
+            "rgb_model": retry_job.get("rgb_model") or rgb_model or "i3d_r50",
+            "device": retry_job.get("device") or "cuda",
+            "source_filekey": source_filekey,
+            "source_datasetkey": source_datasetkey,
+        }
+        if job_kind == "aihub":
+            followups = build_guideline_dashboard_jobs(followup_payload)
+        elif job_kind == "guideline":
+            followups = build_guideline_dashboard_jobs({**followup_payload, "skip_guideline": True})
+        elif job_kind == "rgb":
+            followups = build_guideline_dashboard_jobs(
+                {
+                    **followup_payload,
+                    "skip_guideline": True,
+                    "include_rgb": False,
+                    "start_train": False,
+                    "cleanup_after": True,
+                }
+            )
+        else:
+            followups = []
+
+        existing = active_dashboard_job_identities_locked()
+        for followup in followups:
+            identity = dashboard_job_resume_identity(followup)
+            if identity in existing:
+                continue
+            pending_jobs.append(followup)
+            existing.add(identity)
+
+    def enqueue_missing_completed_extract_followups_locked(*, rgb_model: str) -> dict | None:
+        completed_jobs = launcher_state.get("completed_jobs", [])
+        if not isinstance(completed_jobs, list):
+            return None
+        pending_jobs = launcher_state.setdefault("queued_jobs", [])
+        if not isinstance(pending_jobs, list):
+            launcher_state["queued_jobs"] = []
+            pending_jobs = launcher_state["queued_jobs"]
+        if any(
+            isinstance(job, dict)
+            and infer_dashboard_job_kind(job) in {"guideline", "rgb", "cleanup", "train_guideline"}
+            for job in pending_jobs
+        ):
+            return None
+        current_job = launcher_state.get("current_job")
+        if isinstance(current_job, dict) and infer_dashboard_job_kind(current_job) in {
+            "guideline",
+            "rgb",
+            "cleanup",
+            "train_guideline",
+        }:
+            return None
+        if not guideline_manifests_are_stale():
+            return None
+
+        completed_followup_sources = {
+            str(job.get("source_filekey") or "").strip()
+            for job in completed_jobs
+            if isinstance(job, dict)
+            and infer_dashboard_job_kind(job) in {"cleanup", "rgb"}
+            and str(job.get("state") or "").strip().lower() in {"completed", "completed_warning"}
+        }
+        for completed_job in completed_jobs:
+            if not isinstance(completed_job, dict):
+                continue
+            if infer_dashboard_job_kind(completed_job) != "aihub":
+                continue
+            if str(completed_job.get("state") or "").strip().lower() not in {"completed", "completed_warning", "data_ready"}:
+                continue
+            source_filekey = str(completed_job.get("source_filekey") or completed_job.get("filekey") or "").strip()
+            if not source_filekey or source_filekey in completed_followup_sources:
+                continue
+            source_datasetkey = str(completed_job.get("source_datasetkey") or completed_job.get("datasetkey") or "").strip()
+            followups = build_guideline_dashboard_jobs(
+                {
+                    "source": "cumulative",
+                    "include_rgb": True,
+                    "start_train": False,
+                    "cleanup_after": True,
+                    "rgb_model": rgb_model or launcher_state.get("auto_rgb_model") or "i3d_r50",
+                    "device": "cuda",
+                    "source_filekey": source_filekey,
+                    "source_datasetkey": source_datasetkey,
+                }
+            )
+            pending_jobs.extend(followups)
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = (
+                f"filekey {source_filekey} 추출은 끝났지만 guideline/RGB 후속 산출물이 오래되어 "
+                "새 filekey보다 먼저 후속 작업을 큐에 추가했습니다."
+            )
+            persist_launcher_history(launcher_history_path, launcher_state)
+            return {"ok": True, "message": launcher_state["last_message"], "job": followups[0] if followups else None}
+        return None
+
+    def enqueue_interrupted_auto_extract_job_locked(datasetkey: str, api_key: str, *, rgb_model: str) -> dict | None:
+        followup_result = enqueue_missing_completed_extract_followups_locked(rgb_model=rgb_model)
+        if followup_result is not None:
+            return followup_result
+        completed_jobs = launcher_state.get("completed_jobs", [])
+        if not isinstance(completed_jobs, list):
+            return None
+        active_identities = active_dashboard_job_identities_locked()
+        resolved_identities: set[str] = set()
+        for completed_job in completed_jobs:
+            if not isinstance(completed_job, dict):
+                continue
+            identity = dashboard_job_resume_identity(completed_job)
+            state = str(completed_job.get("state") or "").strip().lower()
+            if state in {"completed", "completed_warning", "data_ready"}:
+                resolved_identities.add(identity)
+                continue
+            if state not in {"aborted", "error"}:
+                continue
+            if identity in resolved_identities or identity in active_identities:
+                continue
+            retry_job = build_retry_job_from(completed_job)
+            if infer_dashboard_job_kind(retry_job) == "aihub":
+                try:
+                    retry_count = int(retry_job.get("retry_count", 0) or 0)
+                except (TypeError, ValueError):
+                    retry_count = 0
+                if retry_count >= 3:
+                    resolved_identities.add(identity)
+                    launcher_state["last_message"] = (
+                        f"filekey {retry_job.get('filekey')} extraction already failed {retry_count} times; "
+                        "skipping retry and selecting the next filekey."
+                    )
+                    continue
+            if api_key and infer_dashboard_job_kind(retry_job) == "aihub":
+                retry_job["api_key"] = api_key
+            if datasetkey and not retry_job.get("datasetkey"):
+                retry_job["datasetkey"] = datasetkey
+            retry_job["auto_resume_interrupted"] = True
+            if infer_dashboard_job_kind(retry_job) == "rgb":
+                retry_job.setdefault("rgb_model", rgb_model or "i3d_r50")
+            pending_jobs = launcher_state.setdefault("queued_jobs", [])
+            if not isinstance(pending_jobs, list):
+                launcher_state["queued_jobs"] = []
+                pending_jobs = launcher_state["queued_jobs"]
+            pending_jobs.append(retry_job)
+            enqueue_followup_jobs_for_retry_locked(retry_job, rgb_model=rgb_model)
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = (
+                f"중단됐던 작업을 먼저 재개합니다: filekey {retry_job.get('filekey')} "
+                f"({infer_dashboard_job_kind(retry_job)})."
+            )
+            persist_launcher_history(launcher_history_path, launcher_state)
+            return {"ok": True, "message": launcher_state["last_message"], "job": retry_job}
+        return None
+
+    def append_predownload_log_line(item: dict, line: str) -> None:
+        log_path = item.get("log_path") if isinstance(item, dict) else None
+        if not log_path:
+            return
+        try:
+            with Path(str(log_path)).open("a", encoding="utf-8") as handle:
+                handle.write(line.rstrip() + "\n")
+        except OSError:
+            pass
+
+    def update_predownload_processes_locked() -> None:
+        running = launcher_state.get("predownload_processes", {})
+        if not isinstance(running, dict):
+            launcher_state["predownload_processes"] = {}
+            return
+        completed = launcher_state.setdefault("predownload_completed", [])
+        failed = launcher_state.setdefault("predownload_failed", [])
+        for job_id, item in list(running.items()):
+            if not isinstance(item, dict):
+                running.pop(job_id, None)
+                continue
+            process = item.get("process")
+            if not isinstance(process, subprocess.Popen):
+                running.pop(job_id, None)
+                continue
+            exit_code = process.poll()
+            if exit_code is None:
+                continue
+            item["finished_at"] = current_timestamp()
+            item["exit_code"] = exit_code
+            item.pop("process", None)
+            item["state"] = "completed" if exit_code == 0 else "error"
+            if exit_code == 0:
+                append_predownload_log_line(
+                    item,
+                    f"[predownload][completed] filekey={item.get('filekey')} exit_code=0 finished_at={item['finished_at']}",
+                )
+            else:
+                append_predownload_log_line(
+                    item,
+                    f"[predownload][error] filekey={item.get('filekey')} exit_code={exit_code} finished_at={item['finished_at']}",
+                )
+            running.pop(job_id, None)
+            if exit_code == 0 and isinstance(completed, list):
+                item_filekey = str(item.get("filekey") or "").strip()
+                if item_filekey:
+                    completed[:] = [
+                        existing
+                        for existing in completed
+                        if not (
+                            isinstance(existing, dict)
+                            and str(existing.get("datasetkey") or "").strip() == str(item.get("datasetkey") or "").strip()
+                            and str(existing.get("filekey") or "").strip() == item_filekey
+                        )
+                    ]
+                completed.append(item)
+                del completed[:-PREDOWNLOAD_COMPLETED_HISTORY_LIMIT]
+            elif isinstance(failed, list):
+                failed.insert(0, item)
+                del failed[PREDOWNLOAD_FAILED_HISTORY_LIMIT:]
+
+    def active_aihub_download_slot_locked() -> int:
+        current_job = launcher_state.get("current_job")
+        if not isinstance(current_job, dict):
+            return 0
+        if str(current_job.get("job_kind") or "aihub").strip().lower() != "aihub":
+            return 0
+        if str(current_job.get("stage") or "").strip().lower() not in {"", "all", "extract"}:
+            return 0
+        return 1
+
+    def predownload_free_disk_gb() -> float:
+        try:
+            usage = shutil.disk_usage(paths["workspace_dir"])
+        except OSError:
+            return 0.0
+        return float(usage.free) / (1024 ** 3)
+
+    def maybe_start_predownloads_locked() -> None:
+        update_predownload_processes_locked()
+        if not bool(launcher_state.get("predownload_enabled", True)):
+            return
+        if not bool(launcher_state.get("auto_extract_enabled", False)):
+            return
+        datasetkey = str(
+            launcher_state.get("auto_enqueue_datasetkey")
+            or config.get("aihub_shell", {}).get("datasetkey")
+            or ""
+        ).strip()
+        api_key = str(launcher_state.get("auto_enqueue_api_key") or "").strip()
+        if not datasetkey:
+            return
+        min_free_gb = max(float(launcher_state.get("predownload_min_free_gb") or 100), 0.0)
+        if predownload_free_disk_gb() <= min_free_gb:
+            launcher_state["predownload_pause_reason"] = (
+                f"디스크 여유 공간이 {min_free_gb:g}GB 이하라 새 predownload를 잠시 멈췄습니다."
+            )
+            return
+        launcher_state["predownload_pause_reason"] = ""
+        running = launcher_state.setdefault("predownload_processes", {})
+        if not isinstance(running, dict):
+            launcher_state["predownload_processes"] = {}
+            running = launcher_state["predownload_processes"]
+        max_parallel = max(int(launcher_state.get("predownload_max_parallel") or 2), 0)
+        ready_cache_filekeys = {
+            str(item.get("filekey") or "").strip()
+            for item in collect_completed_predownload_cache_items_locked(datasetkey)
+            if str(item.get("filekey") or "").strip()
+        }
+        ready_cache_filekeys.update(
+            str(item.get("filekey") or "").strip()
+            for item in launcher_state.get("predownload_completed", [])
+            if isinstance(item, dict) and str(item.get("datasetkey") or "").strip() == datasetkey
+        )
+        ready_cache_filekeys.discard("")
+        if len(ready_cache_filekeys) >= max_parallel:
+            launcher_state["predownload_pause_reason"] = (
+                f"준비된 predownload cache가 {len(ready_cache_filekeys)}개라 새 다운로드를 멈췄습니다. "
+                f"목표 보관 개수는 {max_parallel}개입니다."
+            )
+            return
+        desired_new_downloads = max_parallel - len(ready_cache_filekeys) - len(running)
+        # Predownload slots are independent from the active pipeline job:
+        # allow 1 processing filekey plus max_parallel background downloads.
+        concurrent_capacity = max_parallel - len(running)
+        available_slots = min(desired_new_downloads, concurrent_capacity)
+        if available_slots <= 0:
+            return
+        try:
+            lookup = build_aihub_filekey_lookup_for_dashboard(datasetkey=datasetkey, api_key=api_key, refresh_process=False)
+        except Exception:
+            return
+        lookup_entries = lookup.get("entries") or []
+        entry_by_filekey = {
+            str(entry.get("filekey") or "").strip(): entry
+            for entry in lookup_entries
+            if isinstance(entry, dict) and str(entry.get("filekey") or "").strip()
+        }
+        prepared_split_label_counts = collect_prepared_label_counts_by_split()
+        prepared_label_counts: Counter[str] = Counter()
+        for by_label in prepared_split_label_counts.values():
+            prepared_label_counts.update(normalize_label_count_map(by_label))
+        for _ in range(available_slots):
+            existing_filekeys = collect_active_queue_filekeys_locked(datasetkey, include_prepared=True)
+            existing_filekeys |= collect_predownload_filekeys_locked(datasetkey)
+            retry_predownload = pop_failed_predownload_retry_locked(datasetkey, existing_filekeys=existing_filekeys)
+            if not isinstance(retry_predownload, dict):
+                retry_predownload = find_incomplete_predownload_cache_retry_locked(
+                    datasetkey,
+                    existing_filekeys=existing_filekeys,
+                )
+            if isinstance(retry_predownload, dict):
+                recommended = (
+                    retry_predownload.get("recommendation")
+                    if isinstance(retry_predownload.get("recommendation"), dict)
+                    else {}
+                )
+                retry_filekey = str(retry_predownload.get("filekey") or "").strip()
+                recommended = {**entry_by_filekey.get(retry_filekey, {}), **recommended, "filekey": retry_filekey}
+            else:
+                recommended = find_next_trainable_aihub_entry(
+                    lookup_entries,
+                    existing_filekeys=existing_filekeys,
+                    prepared_label_counts=dict(prepared_label_counts),
+                    prepared_split_label_counts=prepared_split_label_counts,
+                    allowed_zip_groups=AIHUB_AUTO_RECOMMEND_ZIP_GROUPS,
+                    insights=build_auto_recommendation_insights(),
+                    recommendation_policy=build_auto_recommendation_policy(),
+                )
+                if not isinstance(recommended, dict) or not recommended.get("filekey"):
+                    return
+            if predownload_free_disk_gb() <= min_free_gb:
+                return
+            filekey = str(recommended["filekey"])
+            zip_group = aihub_entry_zip_group(recommended)
+            allowed_predownload_groups = set(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS) | set(AIHUB_AUTO_RECOMMEND_FALLBACK_ZIP_GROUPS)
+            if zip_group not in allowed_predownload_groups:
+                launcher_state["predownload_pause_reason"] = (
+                    f"허용되지 않은 추천 filekey {filekey}({zip_group or 'unknown'})를 차단했습니다."
+                )
+                return
+            job_id = f"predownload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{re.sub(r'[^0-9A-Za-z_-]+', '_', filekey)}"
+            runtime_config = json.loads(json.dumps(config))
+            runtime_paths = runtime_config.setdefault("paths", {})
+            runtime_paths["workspace_dir"] = str(paths["workspace_dir"])
+            runtime_config["dataset_source"] = "aihub_shell"
+            runtime_shell = runtime_config.setdefault("aihub_shell", {})
+            runtime_shell["datasetkey"] = datasetkey
+            runtime_shell["filekey"] = filekey
+            if api_key:
+                runtime_shell["api_key"] = api_key
+                runtime_shell["api_key_env"] = ""
+            runtime_config_path = runtime_config_dir / f"{job_id}.json"
+            write_json_atomic(runtime_config_path, runtime_config)
+            log_path = job_logs_dir / f"{job_id}.log"
+            command = [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(Path(__file__).resolve().with_name("predownload_aihub_filekey.py")),
+                "--config",
+                str(runtime_config_path),
+            ]
+            active_pipeline_job = launcher_state.get("current_job") if isinstance(launcher_state.get("current_job"), dict) else {}
+            active_pipeline_stage = str(active_pipeline_job.get("stage") or active_pipeline_job.get("job_kind") or "-")
+            active_pipeline_filekey = str(active_pipeline_job.get("filekey") or "-")
+            running_after_start = len(running) + 1
+            active_download_slot = active_aihub_download_slot_locked()
+            recommendation_reason = str(
+                recommended.get("recommendation_reason")
+                or recommended.get("reason")
+                or recommended.get("diagnosis_reason")
+                or "-"
+            )
+            recommendation_scope = aihub_entry_zip_group(recommended) or "-"
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                log_handle.write(f"[predownload][start] datasetkey={datasetkey} filekey={filekey}\n")
+                if isinstance(retry_predownload, dict):
+                    log_handle.write(
+                        "[predownload][resume] "
+                        f"retry_of={retry_predownload.get('retry_of') or retry_predownload.get('job_id') or '-'} "
+                        f"retry_count={retry_predownload.get('retry_count') or 1}\n"
+                    )
+                log_handle.write(
+                    "[predownload][parallel] "
+                    f"running_predownload={running_after_start}/{max_parallel} "
+                    f"active_pipeline_download_slot={active_download_slot} "
+                    "slot_policy=active_pipeline_excluded "
+                    f"free_disk_gb={predownload_free_disk_gb():.1f}\n"
+                )
+                log_handle.write(
+                    "[predownload][alongside] "
+                    f"pipeline_filekey={active_pipeline_filekey} pipeline_stage={active_pipeline_stage}\n"
+                )
+                log_handle.write(
+                    "[predownload][recommendation] "
+                    f"target_label={recommended.get('target_label') or '-'} "
+                    f"zip_group={recommendation_scope} reason={recommendation_reason}\n"
+                )
+                log_handle.write(f"[predownload][config] runtime config: {runtime_config_path}\n")
+                log_handle.flush()
+                child_env = os.environ.copy()
+                child_env["PYTHONUTF8"] = "1"
+                child_env["PYTHONIOENCODING"] = "utf-8"
+                child_env["PYTHONUNBUFFERED"] = "1"
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(project_root),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    env=child_env,
+                    start_new_session=(os.name != "nt"),
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
+                )
+            running[job_id] = {
+                "job_id": job_id,
+                "datasetkey": datasetkey,
+                "filekey": filekey,
+                "recommendation": recommended,
+                "state": "running",
+                "started_at": current_timestamp(),
+                "runtime_config_path": str(runtime_config_path),
+                "log_path": str(log_path),
+                "process": process,
+                "retry_of": retry_predownload.get("retry_of") if isinstance(retry_predownload, dict) else None,
+                "retry_count": retry_predownload.get("retry_count") if isinstance(retry_predownload, dict) else None,
+            }
 
     def optimize_auto_recommended_queue_locked(
         datasetkey: str,
@@ -6601,11 +7796,12 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["auto_enqueue_api_key"] = str(api_key or "").strip()
         launcher_state["auto_start_enabled"] = True
 
-    def enable_auto_extract_locked(datasetkey: str, api_key: str) -> None:
+    def enable_auto_extract_locked(datasetkey: str, api_key: str, rgb_model: str = "i3d_r50") -> None:
         launcher_state["auto_extract_enabled"] = True
         launcher_state["auto_enqueue_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = str(datasetkey or "").strip()
         launcher_state["auto_enqueue_api_key"] = str(api_key or "").strip()
+        launcher_state["auto_rgb_model"] = str(rgb_model or "i3d_r50").strip() or "i3d_r50"
         launcher_state["auto_start_enabled"] = True
 
     def disable_auto_enqueue_locked(message: str) -> None:
@@ -6613,6 +7809,7 @@ def create_app(config_path: Path) -> FastAPI:
         launcher_state["auto_extract_enabled"] = False
         launcher_state["auto_enqueue_datasetkey"] = None
         launcher_state["auto_enqueue_api_key"] = ""
+        launcher_state["auto_rgb_model"] = "i3d_r50"
         launcher_state["last_message"] = message
 
     def enqueue_next_extract_recommended_job_locked() -> dict:
@@ -6622,7 +7819,45 @@ def create_app(config_path: Path) -> FastAPI:
             message = "자동 추출을 위한 datasetkey가 없습니다."
             disable_auto_enqueue_locked(message)
             return {"ok": False, "message": message, "job": None}
-        lookup = build_aihub_filekey_lookup_for_dashboard(datasetkey=datasetkey, api_key=api_key, refresh_process=False)
+        completed_predownload = pop_completed_predownload_locked(datasetkey)
+        if isinstance(completed_predownload, dict):
+            filekey = str(completed_predownload.get("filekey") or "").strip()
+            recommended = completed_predownload.get("recommendation") if isinstance(completed_predownload.get("recommendation"), dict) else {}
+            job = build_job(filekey, datasetkey=datasetkey, api_key=api_key, stage="extract")
+            job["auto_recommended"] = True
+            job["target_label"] = recommended.get("target_label")
+            job["recommendation_reason"] = recommended.get("recommendation_reason") or "predownload_cache"
+            job["notification_step"] = "filekey_pose_preprocess"
+            job["source_filekey"] = filekey
+            job["source_datasetkey"] = datasetkey
+            job["predownload_cache"] = True
+            launcher_state.setdefault("queued_jobs", []).append(job)
+            launcher_state.setdefault("queued_jobs", []).extend(
+                build_guideline_dashboard_jobs(
+                    {
+                        "source": "cumulative",
+                        "include_rgb": True,
+                        "start_train": False,
+                        "cleanup_after": True,
+                        "rgb_model": launcher_state.get("auto_rgb_model") or "i3d_r50",
+                        "device": "cuda",
+                        "source_filekey": filekey,
+                        "source_datasetkey": datasetkey,
+                    }
+                )
+            )
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = (
+                f"미리 다운로드된 filekey {filekey}를 전처리 큐에 추가했습니다."
+            )
+            return {"ok": True, "message": launcher_state["last_message"], "job": job}
+        try:
+            lookup = build_aihub_filekey_lookup_for_dashboard(datasetkey=datasetkey, api_key=api_key, refresh_process=False)
+        except Exception as exc:
+            message = f"분포 맞춤 자동추출 filekey 조회에 실패했습니다: {exc}"
+            disable_auto_enqueue_locked(message)
+            launcher_state["last_state"] = "error"
+            return {"ok": False, "message": message, "job": None}
         prepared_split_label_counts = collect_prepared_label_counts_by_split()
         prepared_label_counts: Counter[str] = Counter()
         for by_label in prepared_split_label_counts.values():
@@ -6638,6 +7873,8 @@ def create_app(config_path: Path) -> FastAPI:
         )
         if not isinstance(recommended, dict) or not recommended.get("filekey"):
             message = "분포 기준에 맞는 자동 추출 추천 filekey가 없습니다."
+            if performance_plan_is_active():
+                return enqueue_performance_plan_training_locked("no_more_recommended_filekeys")
             disable_auto_enqueue_locked(message)
             return {"ok": False, "message": message, "job": None}
         filekey = str(recommended["filekey"])
@@ -6645,9 +7882,29 @@ def create_app(config_path: Path) -> FastAPI:
         job["auto_recommended"] = True
         job["target_label"] = recommended.get("target_label")
         job["recommendation_reason"] = recommended.get("recommendation_reason") or "class_balance"
+        job["notification_step"] = "filekey_pose_preprocess"
+        job["source_filekey"] = filekey
+        job["source_datasetkey"] = datasetkey
         launcher_state.setdefault("queued_jobs", []).append(job)
         launcher_state["last_state"] = "queued"
         launcher_state["last_message"] = f"분포 기준 자동 추출 filekey {filekey}를 큐에 추가했습니다."
+        launcher_state.setdefault("queued_jobs", []).extend(
+            build_guideline_dashboard_jobs(
+                {
+                    "source": "cumulative",
+                    "include_rgb": True,
+                    "start_train": False,
+                    "cleanup_after": True,
+                    "rgb_model": launcher_state.get("auto_rgb_model") or "i3d_r50",
+                    "device": "cuda",
+                    "source_filekey": filekey,
+                    "source_datasetkey": datasetkey,
+                }
+            )
+        )
+        launcher_state["last_message"] = (
+            f"분포 기준 자동 추출 filekey {filekey}를 큐에 추가했고, RGB+Pose feature 추출 후 원본 정리까지 이어서 실행합니다."
+        )
         return {"ok": True, "message": launcher_state["last_message"], "job": job}
 
     def enqueue_next_recommended_job_locked() -> dict:
@@ -6657,15 +7914,27 @@ def create_app(config_path: Path) -> FastAPI:
             or ""
         ).strip()
         api_key = str(launcher_state.get("auto_enqueue_api_key") or "").strip()
-        if not paths["prepared_train"].exists() or not paths["prepared_val"].exists():
+        has_guideline_features = paths["guideline_prepared_train"].exists() and paths["guideline_prepared_val"].exists()
+        has_prepared_pose = paths["prepared_train"].exists() and paths["prepared_val"].exists()
+        if not has_guideline_features and not has_prepared_pose:
             message = "추출된 prepared 데이터가 없어 학습을 시작할 수 없습니다."
             disable_auto_enqueue_locked(message)
             launcher_state["last_state"] = launcher_state.get("last_state") or "completed"
             return {"ok": False, "message": message, "job": None}
         pending_jobs = launcher_state.setdefault("queued_jobs", [])
-        job = build_job("prepared_pose", datasetkey=datasetkey or "prepared", api_key=api_key, stage="train")
+        job = build_job(
+            "guideline_features" if has_guideline_features else "prepared_pose",
+            datasetkey=datasetkey or "prepared",
+            api_key=api_key,
+            stage="train",
+        )
         job["auto_recommended"] = True
         job["recommendation_reason"] = "prepared_data_training"
+        if has_guideline_features:
+            job["job_kind"] = "train_guideline"
+            job["display_name"] = "추출된 RGB+Pose feature 학습"
+            job["running_message"] = "누적 guideline/RGB+Pose feature로 학습/auto-tune/ensemble을 실행 중입니다."
+            job["success_message"] = "추출된 feature 기반 학습이 완료되었습니다."
         if isinstance(pending_jobs, list):
             pending_jobs.append(job)
         launcher_state["auto_enqueue_enabled"] = False
@@ -6802,6 +8071,9 @@ def create_app(config_path: Path) -> FastAPI:
         resume_only = payload_bool(resume_only_raw)
         auto_enqueue_next = payload_bool(payload.get("auto_enqueue_next", False))
         auto_extract_next = payload_bool(payload.get("auto_extract_next", False))
+        feature_extract = payload_bool(payload.get("feature_extract", False))
+        reextract_filekey_only = payload_bool(payload.get("reextract_filekey_only", False))
+        excluded_training_labels = excluded_training_labels_from_payload(payload)
         requested_stage = str(payload.get("stage") or "all").strip().lower()
         if requested_stage not in {"all", "extract"}:
             requested_stage = "all"
@@ -6811,6 +8083,11 @@ def create_app(config_path: Path) -> FastAPI:
         if auto_extract_next:
             filekeys = []
             requested_stage = "extract"
+        if feature_extract:
+            requested_stage = "extract"
+        if reextract_filekey_only:
+            requested_stage = "extract"
+            feature_extract = True
         if not filekeys and not resume_only and not auto_enqueue_next and not auto_extract_next:
             raise HTTPException(status_code=400, detail="filekey를 하나 이상 입력해 주세요.")
 
@@ -6871,7 +8148,7 @@ def create_app(config_path: Path) -> FastAPI:
             if auto_enqueue_next:
                 enable_auto_enqueue_locked(datasetkey, api_key)
             if auto_extract_next:
-                enable_auto_extract_locked(datasetkey, api_key)
+                enable_auto_extract_locked(datasetkey, api_key, str(payload.get("rgb_model") or "i3d_r50"))
 
             if filekeys:
                 for filekey in filekeys:
@@ -6880,12 +8157,46 @@ def create_app(config_path: Path) -> FastAPI:
                         skipped.append(filekey)
                         continue
                     job = build_job(filekey, datasetkey=datasetkey, api_key=api_key, stage=requested_stage)
+                    if excluded_training_labels and requested_stage in {"all", "train"}:
+                        job["excluded_training_labels"] = excluded_training_labels
+                    if requested_stage == "extract":
+                        job["notification_step"] = "filekey_pose_preprocess"
+                        job["source_filekey"] = filekey
+                        job["source_datasetkey"] = datasetkey
+                    if reextract_filekey_only:
+                        job["reextract_filekey_only"] = True
+                        job["recommendation_reason"] = "manual_filekey_reextract"
+                        job["running_message"] = f"filekey {filekey} 기존 산출물을 정리한 뒤 단일 재추출을 실행 중입니다."
                     if isinstance(pending_jobs, list):
                         pending_jobs.append(job)
+                        if feature_extract and requested_stage == "extract":
+                            pending_jobs.extend(
+                                build_guideline_dashboard_jobs(
+                                    {
+                                        "source": "cumulative",
+                                        "include_rgb": True,
+                                        "start_train": False,
+                                        "cleanup_after": True,
+                                        "rgb_model": payload.get("rgb_model") or "i3d_r50",
+                                        "device": payload.get("device") or "cuda",
+                                        "source_filekey": filekey,
+                                        "source_datasetkey": datasetkey,
+                                        "excluded_training_labels": excluded_training_labels,
+                                    }
+                                )
+                            )
                     appended.append(filekey)
                     existing_keys.add(unique_key)
             elif auto_extract_next:
-                recommendation = enqueue_next_extract_recommended_job_locked()
+                recommendation = enqueue_interrupted_auto_extract_job_locked(
+                    datasetkey,
+                    api_key,
+                    rgb_model=str(payload.get("rgb_model") or "i3d_r50"),
+                )
+                if recommendation is None:
+                    recommendation = enqueue_next_extract_recommended_job_locked()
+                if not recommendation.get("ok"):
+                    raise HTTPException(status_code=409, detail=str(recommendation.get("message") or "자동추출 추천 filekey를 찾지 못했습니다."))
                 job = recommendation.get("job")
                 if isinstance(job, dict) and job.get("filekey"):
                     appended.append(str(job["filekey"]))
@@ -6923,6 +8234,288 @@ def create_app(config_path: Path) -> FastAPI:
             "launcher": get_launcher_status(),
         }
 
+    def build_guideline_dashboard_jobs(payload: dict) -> list[dict]:
+        include_rgb = payload_bool(payload.get("include_rgb", True))
+        start_train = payload_bool(payload.get("start_train", True))
+        cleanup_after = payload_bool(payload.get("cleanup_after", False))
+        skip_guideline = payload_bool(payload.get("skip_guideline", False))
+        excluded_training_labels = excluded_training_labels_from_payload(payload)
+        source = str(payload.get("source") or "cumulative").strip() or "cumulative"
+        rgb_model = str(payload.get("rgb_model") or "i3d_r50").strip() or "i3d_r50"
+        source_filekey = str(payload.get("source_filekey") or "").strip()
+        source_datasetkey = str(payload.get("source_datasetkey") or payload.get("datasetkey") or "prepared").strip()
+        if not source_filekey:
+            source_filekey = infer_guideline_pipeline_source_filekeys(
+                paths,
+                use_guideline=bool(skip_guideline),
+            )
+        jobs: list[dict] = []
+
+        if not skip_guideline:
+            guideline_job = build_job("guideline_clips", datasetkey="prepared", stage="guideline")
+            guideline_job.update(
+                {
+                    "job_kind": "guideline",
+                    "notification_step": "guideline_clips",
+                    "source_filekey": source_filekey,
+                    "source_datasetkey": source_datasetkey,
+                    "display_name": "가이드라인 clip/normal 생성",
+                    "source": source,
+                    "running_message": "XML/event/context 기준 clip manifest와 normal 샘플을 생성 중입니다.",
+                    "success_message": "가이드라인 clip/normal manifest 생성이 완료되었습니다.",
+                }
+            )
+            jobs.append(guideline_job)
+
+        if include_rgb:
+            rgb_job = build_job("rgb_i3d_features", datasetkey="prepared", stage="rgb")
+            rgb_job.update(
+                {
+                    "job_kind": "rgb",
+                    "notification_step": "rgb_i3d_features",
+                    "source_filekey": source_filekey,
+                    "source_datasetkey": source_datasetkey,
+                    "display_name": "RGB/I3D feature 추출",
+                    "rgb_model": rgb_model,
+                    "device": str(payload.get("device") or "cuda"),
+                    "running_message": f"{rgb_model} RGB feature를 clip별로 추출 중입니다.",
+                    "success_message": "RGB/I3D feature 추출이 완료되었습니다.",
+                }
+            )
+            jobs.append(rgb_job)
+
+        if start_train:
+            train_job = build_job("guideline_train", datasetkey="prepared", stage="train")
+            train_job.update(
+                {
+                    "job_kind": "train_guideline",
+                    "notification_step": "guideline_train",
+                    "source_filekey": source_filekey,
+                    "source_datasetkey": source_datasetkey,
+                    "display_name": "가이드라인 fusion 학습",
+                    "running_message": "가이드라인 clip manifest로 학습/auto-tune/ensemble을 실행 중입니다.",
+                    "success_message": "가이드라인 기반 학습이 완료되었습니다.",
+                }
+            )
+            if excluded_training_labels:
+                train_job["excluded_training_labels"] = excluded_training_labels
+            jobs.append(train_job)
+
+        if cleanup_after:
+            cleanup_job = build_job("cleanup_raw_after_features", datasetkey="prepared", stage="cleanup")
+            cleanup_job.update(
+                {
+                    "job_kind": "cleanup",
+                    "notification_step": "cleanup_raw_after_job",
+                    "source_filekey": source_filekey,
+                    "source_datasetkey": source_datasetkey,
+                    "display_name": "원본/임시 파일 정리",
+                    "running_message": "누적 feature/manifest는 유지하고 원본/임시 다운로드 데이터를 정리 중입니다.",
+                    "success_message": "원본/임시 다운로드 데이터 정리가 완료되었습니다.",
+                }
+            )
+            jobs.append(cleanup_job)
+
+        return jobs
+
+    def start_guideline_pipeline_request(payload: dict) -> dict:
+        jobs = build_guideline_dashboard_jobs(payload)
+        if not jobs:
+            raise HTTPException(status_code=400, detail="실행할 작업이 없습니다.")
+        with state_lock:
+            update_process_state()
+            pending_jobs = launcher_state.setdefault("queued_jobs", [])
+            if not isinstance(pending_jobs, list):
+                launcher_state["queued_jobs"] = []
+                pending_jobs = launcher_state["queued_jobs"]
+            pending_jobs.extend(jobs)
+            launcher_state["auto_start_enabled"] = True
+            launcher_state["auto_enqueue_enabled"] = False
+            launcher_state["auto_extract_enabled"] = False
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = f"가이드라인 개선 파이프라인 {len(jobs)}단계를 대기열에 추가했습니다."
+            if launcher_state.get("process") is None and pending_jobs:
+                next_job = pending_jobs.pop(0)
+                start_pipeline_for_job(next_job)
+        return {
+            "ok": True,
+            "message": f"가이드라인 개선 파이프라인 {len(jobs)}단계를 시작했습니다.",
+            "launcher": get_launcher_status(),
+        }
+
+    def start_performance_plan_request(payload: dict) -> dict:
+        plan_request = normalize_performance_plan_request(payload, config)
+        datasetkey = plan_request["datasetkey"]
+        api_key = str(payload.get("api_key") or "").strip()
+        if not datasetkey:
+            raise HTTPException(status_code=400, detail="성능 플랜을 시작하려면 datasetkey가 필요합니다.")
+
+        with state_lock:
+            update_process_state()
+            enable_auto_extract_locked(datasetkey, api_key, plan_request["rgb_model"])
+            launcher_state["performance_plan"] = {
+                "enabled": True,
+                "status": "extracting",
+                "started_at": current_timestamp(),
+                **plan_request,
+                "final_training_queued": False,
+            }
+            pending_jobs = launcher_state.setdefault("queued_jobs", [])
+            launcher_state["last_state"] = "queued"
+            launcher_state["last_message"] = (
+                f"최고 성능 자동 플랜을 시작했습니다. {plan_request['days']:g}일 동안 분포 기준 추출을 누적하고 "
+                f"마지막에 {plan_request['max_trials']} trial auto-tune/ensemble 학습을 실행합니다."
+            )
+            if launcher_state.get("process") is None and isinstance(pending_jobs, list) and not pending_jobs:
+                resumed = enqueue_interrupted_auto_extract_job_locked(
+                    datasetkey,
+                    api_key,
+                    rgb_model=plan_request["rgb_model"],
+                )
+                if resumed is None:
+                    enqueue_next_extract_recommended_job_locked()
+                pending_jobs = launcher_state.setdefault("queued_jobs", [])
+                if launcher_state.get("process") is None and isinstance(pending_jobs, list) and pending_jobs:
+                    next_job = pending_jobs.pop(0)
+                    start_pipeline_for_job(next_job)
+        return {"ok": True, "message": launcher_state["last_message"], "launcher": get_launcher_status()}
+
+    def clear_guideline_outputs() -> None:
+        workspace_dir = paths.get("workspace_dir")
+        manifest_dir = paths.get("manifests_dir")
+        targets = [
+            paths.get("guideline_prepared_train"),
+            paths.get("guideline_prepared_val"),
+            paths.get("guideline_prepared_test"),
+            manifest_dir / "guideline_prepare_summary.json" if isinstance(manifest_dir, Path) else None,
+            workspace_dir / "prepared_pose_guideline" if isinstance(workspace_dir, Path) else None,
+            workspace_dir / "rgb_clip_features" if isinstance(workspace_dir, Path) else None,
+        ]
+        for target in targets:
+            if isinstance(target, Path) and target.exists():
+                remove_transient_path_with_retries(target, recreate_dir=False, retries=12, delay_seconds=1.0)
+
+    def restart_guideline_pipeline_request(payload: dict) -> dict:
+        with state_lock:
+            update_process_state()
+            current_job = launcher_state.get("current_job")
+            if isinstance(current_job, dict):
+                job_kind = str(current_job.get("job_kind") or "").strip().lower()
+                if job_kind in {"guideline", "rgb", "cleanup", "train_guideline"}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="현재 guideline/RGB/cleanup 작업이 실행 중입니다. 먼저 강제종료한 뒤 다시 눌러 주세요.",
+                    )
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            if isinstance(pending_jobs, list):
+                launcher_state["queued_jobs"] = [
+                    job
+                    for job in pending_jobs
+                    if not (
+                        isinstance(job, dict)
+                        and str(job.get("job_kind") or "").strip().lower()
+                        in {"guideline", "rgb", "cleanup", "train_guideline"}
+                    )
+                ]
+            clear_guideline_outputs()
+
+        restart_payload = {
+            **payload,
+            "source": str(payload.get("source") or "cumulative").strip() or "cumulative",
+            "include_rgb": payload.get("include_rgb", "1"),
+            "start_train": payload.get("start_train", "0"),
+            "cleanup_after": payload.get("cleanup_after", "1"),
+            "skip_guideline": "0",
+        }
+        result = start_guideline_pipeline_request(restart_payload)
+        return {
+            **result,
+            "message": "guideline 산출물을 지우고 새 설정으로 guideline_clips부터 다시 시작했습니다.",
+        }
+
+    def clear_rgb_feature_outputs() -> None:
+        workspace_dir = paths.get("workspace_dir")
+        target = workspace_dir / "rgb_clip_features" if isinstance(workspace_dir, Path) else None
+        if isinstance(target, Path) and target.exists():
+            remove_transient_path_with_retries(target, recreate_dir=False, retries=12, delay_seconds=1.0)
+
+    def guideline_manifests_are_stale() -> bool:
+        source_paths = [
+            paths["active_prepared_train"],
+            paths["active_prepared_val"],
+            paths["active_prepared_test"],
+            paths["prepared_train"],
+            paths["prepared_val"],
+            paths["prepared_test"],
+        ]
+        guideline_paths = [
+            paths["guideline_prepared_train"],
+            paths["guideline_prepared_val"],
+            paths["guideline_prepared_test"],
+        ]
+        existing_sources = [path for path in source_paths if isinstance(path, Path) and path.exists()]
+        existing_guidelines = [path for path in guideline_paths if isinstance(path, Path) and path.exists()]
+        if not existing_sources:
+            return False
+        if len(existing_guidelines) < len(guideline_paths):
+            return True
+        try:
+            newest_source = max(path.stat().st_mtime for path in existing_sources)
+            oldest_guideline = min(path.stat().st_mtime for path in existing_guidelines)
+        except OSError:
+            return True
+        return newest_source > oldest_guideline + 0.5
+
+    def restart_rgb_pipeline_request(payload: dict) -> dict:
+        with state_lock:
+            update_process_state()
+            current_job = launcher_state.get("current_job")
+            if isinstance(current_job, dict):
+                job_kind = str(current_job.get("job_kind") or "").strip().lower()
+                if job_kind in {"guideline", "rgb", "cleanup", "train_guideline"}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="현재 guideline/RGB/cleanup 작업이 실행 중입니다. 먼저 강제종료하거나 완료 후 다시 눌러 주세요.",
+                    )
+            if not paths["guideline_prepared_train"].exists() or not paths["guideline_prepared_val"].exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="guideline clip manifest가 아직 없습니다. guideline_clips 완료 후 RGB/I3D부터 재시작할 수 있습니다.",
+                )
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            if isinstance(pending_jobs, list):
+                launcher_state["queued_jobs"] = [
+                    job
+                    for job in pending_jobs
+                    if not (
+                        isinstance(job, dict)
+                        and str(job.get("job_kind") or "").strip().lower()
+                        in {"rgb", "cleanup", "train_guideline"}
+                    )
+                ]
+            if str(payload.get("clear_rgb_features") or "").strip().lower() in {"1", "true", "yes", "on"}:
+                clear_rgb_feature_outputs()
+            refresh_guideline_first = guideline_manifests_are_stale()
+
+        restart_payload = {
+            **payload,
+            "skip_guideline": "0" if refresh_guideline_first else "1",
+            "include_rgb": "1",
+            "start_train": payload.get("start_train", "0"),
+            "cleanup_after": payload.get("cleanup_after", "1"),
+            "rgb_model": payload.get("rgb_model") or "i3d_r50",
+        }
+        result = start_guideline_pipeline_request(restart_payload)
+        message = (
+            "guideline manifest가 최신 active prepared보다 오래되어 guideline_clips부터 다시 만든 뒤 RGB/I3D feature 추출을 시작했습니다."
+            if refresh_guideline_first
+            else "RGB/I3D feature 산출물을 지우고 RGB/I3D feature 추출부터 다시 시작했습니다."
+        )
+        return {
+            **result,
+            "message": message,
+        }
+
     def pause_after_current_request() -> dict:
         with state_lock:
             update_process_state()
@@ -6945,6 +8538,32 @@ def create_app(config_path: Path) -> FastAPI:
         return {
             "ok": True,
             "message": "현재 작업까지만 진행하고, 다음 큐 자동 시작을 멈춥니다.",
+            "launcher": get_launcher_status(),
+        }
+
+    def stop_after_queue_request() -> dict:
+        with state_lock:
+            launcher_state["auto_start_enabled"] = True
+            launcher_state["auto_enqueue_enabled"] = False
+            launcher_state["auto_extract_enabled"] = False
+            launcher_state["auto_enqueue_datasetkey"] = None
+            launcher_state["auto_enqueue_api_key"] = ""
+            update_process_state()
+            current_job = launcher_state.get("current_job")
+            pending_jobs = launcher_state.get("queued_jobs", [])
+            pending_count = len(pending_jobs) if isinstance(pending_jobs, list) else 0
+            if current_job or pending_count > 0:
+                launcher_state["last_state"] = "queued" if pending_count > 0 else "running"
+                launcher_state["last_message"] = (
+                    f"자동 전처리 추가를 중단했습니다. 현재 큐 {pending_count}개까지 처리한 뒤 멈춥니다."
+                )
+            else:
+                launcher_state["last_state"] = "idle"
+                launcher_state["last_message"] = "자동 전처리 추가를 중단했습니다. 대기 중인 큐가 없습니다."
+
+        return {
+            "ok": True,
+            "message": "이번 큐 이후에는 새 filekey 전처리를 자동으로 추가하지 않습니다.",
             "launcher": get_launcher_status(),
         }
 
@@ -7020,8 +8639,17 @@ def create_app(config_path: Path) -> FastAPI:
             persist_launcher_history(launcher_history_path, launcher_state)
 
             retry_job = build_retry_job_from(current_job)
+            try:
+                retry_count = int(retry_job.get("retry_count", 0) or 0)
+            except (TypeError, ValueError):
+                retry_count = 0
+            scope = retry_job.get("recommendation_scope") if isinstance(retry_job.get("recommendation_scope"), dict) else {}
+            zip_group = str(scope.get("zip_group") or "").strip().lower()
+            should_requeue_retry = retry_count < 3 and (
+                not zip_group or zip_group in set(AIHUB_AUTO_RECOMMEND_ZIP_GROUPS)
+            )
             pending_jobs = launcher_state.setdefault("queued_jobs", [])
-            if isinstance(pending_jobs, list):
+            if should_requeue_retry and isinstance(pending_jobs, list):
                 pending_jobs.insert(0, retry_job)
 
             launcher_state["process"] = None
@@ -7049,6 +8677,29 @@ def create_app(config_path: Path) -> FastAPI:
                 current_filekey=current_job.get("filekey"),
                 current_datasetkey=current_job.get("datasetkey"),
             )
+            abort_message = str(current_job.get("message") or launcher_state.get("last_message") or "")
+            if filekey_pipeline_step_id(current_job):
+                record_filekey_pipeline_finished(current_job, "aborted", abort_message)
+                _, datasetkey, filekey = filekey_pipeline_identity(current_job)
+                dispatch_dashboard_notification(
+                    "aborted",
+                    title=f"Filekey stopped: {filekey or '-'}",
+                    message=(
+                        f"filekey: {filekey or '-'}\n"
+                        "status: aborted\n"
+                        f"datasetkey: {datasetkey or '-'}\n"
+                        "파일키 전체 작업이 중단되었습니다.\n"
+                        f"{abort_message}"
+                    ),
+                    priority="high",
+                )
+            else:
+                notify_title, notify_body, notify_priority = build_job_notification_payload(
+                    current_job,
+                    "aborted",
+                    abort_message,
+                )
+                dispatch_dashboard_notification("aborted", title=notify_title, message=notify_body, priority=notify_priority)
 
         return {
             "ok": True,
@@ -7221,10 +8872,39 @@ def create_app(config_path: Path) -> FastAPI:
         payload = await request.json()
         return start_training_request(payload)
 
+    @app.post("/api/guideline-pipeline")
+    async def start_guideline_pipeline(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
+        payload = await request.json()
+        return start_guideline_pipeline_request(payload)
+
+    @app.post("/api/performance-plan")
+    async def start_performance_plan(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
+        payload = await request.json()
+        return start_performance_plan_request(payload)
+
+    @app.post("/api/restart-guideline")
+    async def restart_guideline_pipeline(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
+        payload = await request.json()
+        return restart_guideline_pipeline_request(payload)
+
+    @app.post("/api/restart-rgb")
+    async def restart_rgb_pipeline(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
+        payload = await request.json()
+        return restart_rgb_pipeline_request(payload)
+
     @app.post("/api/pause")
     def pause_after_current(request: Request) -> dict:
         ensure_dashboard_control_access(request)
         return pause_after_current_request()
+
+    @app.post("/api/stop-after-queue")
+    def stop_after_queue(request: Request) -> dict:
+        ensure_dashboard_control_access(request)
+        return stop_after_queue_request()
 
     @app.post("/api/remove-queued-job")
     async def remove_queued_job(request: Request) -> dict:
@@ -7262,6 +8942,118 @@ def create_app(config_path: Path) -> FastAPI:
                 status_code=exc.status_code,
             )
 
+    @app.post("/actions/guideline-pipeline")
+    async def start_guideline_pipeline_action(request: Request):
+        ensure_dashboard_control_access(request)
+        payload = await read_form_payload(request)
+        try:
+            result = start_guideline_pipeline_request(payload)
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "가이드라인 개선 파이프라인을 시작했습니다."),
+                level="good",
+            )
+        except HTTPException as exc:
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"작업 시작 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
+
+    @app.post("/actions/performance-plan")
+    async def start_performance_plan_action(request: Request):
+        ensure_dashboard_control_access(request)
+        payload = await read_form_payload(request)
+        try:
+            result = start_performance_plan_request(payload)
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "최고 성능 자동 플랜을 시작했습니다."),
+                level="good",
+            )
+        except HTTPException as exc:
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"성능 플랜 시작 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
+
+    @app.post("/actions/restart-guideline")
+    async def restart_guideline_pipeline_action(request: Request):
+        ensure_dashboard_control_access(request)
+        payload = await read_form_payload(request)
+        try:
+            result = restart_guideline_pipeline_request(payload)
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "guideline_clips를 다시 시작했습니다."),
+                level="warn",
+            )
+        except HTTPException as exc:
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"guideline 재시작 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
+
+    @app.post("/actions/restart-rgb")
+    async def restart_rgb_pipeline_action(request: Request):
+        ensure_dashboard_control_access(request)
+        payload = await read_form_payload(request)
+        try:
+            result = restart_rgb_pipeline_request(payload)
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "RGB/I3D feature 추출을 다시 시작했습니다."),
+                level="warn",
+            )
+        except HTTPException as exc:
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"RGB/I3D 재시작 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
+
     @app.post("/actions/pause")
     def pause_after_current_action(request: Request):
         ensure_dashboard_control_access(request)
@@ -7279,6 +9071,41 @@ def create_app(config_path: Path) -> FastAPI:
                 level="danger",
                 ok=False,
                 status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"학습 파이프라인 시작 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
+
+    @app.post("/actions/stop-after-queue")
+    def stop_after_queue_action(request: Request):
+        ensure_dashboard_control_access(request)
+        try:
+            result = stop_after_queue_request()
+            return build_dashboard_action_response(
+                request,
+                message=str(result.get("message") or "이번 큐 이후 자동 전처리를 중단합니다."),
+                level="warn",
+            )
+        except HTTPException as exc:
+            return build_dashboard_action_response(
+                request,
+                message=str(exc.detail),
+                level="danger",
+                ok=False,
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"전처리 중단 예약 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
             )
 
     @app.post("/actions/remove-queued")
@@ -7338,7 +9165,17 @@ def create_app(config_path: Path) -> FastAPI:
                 ok=False,
                 status_code=exc.status_code,
             )
+        except Exception as exc:
+            return build_dashboard_action_response(
+                request,
+                message=f"초기화 중 오류가 발생했습니다: {exc}",
+                level="danger",
+                ok=False,
+                status_code=500,
+            )
 
+    worker = threading.Thread(target=queue_worker, daemon=True)
+    worker.start()
     return app
 
 
@@ -7353,6 +9190,9 @@ def build_overview_file_diagnostics(paths: dict) -> dict:
         "current_prepared_train": build_path_diagnostic(paths["current_prepared_train"]),
         "current_prepared_val": build_path_diagnostic(paths["current_prepared_val"]),
         "current_prepared_test": build_path_diagnostic(paths["current_prepared_test"]),
+        "guideline_prepared_train": build_path_diagnostic(paths["guideline_prepared_train"]),
+        "guideline_prepared_val": build_path_diagnostic(paths["guideline_prepared_val"]),
+        "guideline_prepared_test": build_path_diagnostic(paths["guideline_prepared_test"]),
     }
 
 
@@ -7441,6 +9281,158 @@ def build_prepared_pose_items(paths: dict, *, limit: int = 100) -> list[dict]:
         }
         for key, value in list(grouped.items())[:limit]
     ]
+
+
+def build_current_job_filekey_summary(paths: dict, current_job: dict | None, *, limit: int = 16) -> dict:
+    if not isinstance(current_job, dict):
+        return {"source": "", "total_items": 0, "filekey_count": 0, "filekeys": []}
+
+    job_kind = infer_dashboard_job_kind(current_job)
+    if job_kind in {"rgb", "train_guideline"}:
+        manifest_specs = (
+            ("train", "guideline_prepared_train"),
+            ("val", "guideline_prepared_val"),
+            ("test", "guideline_prepared_test"),
+        )
+        source = "guideline_prepared"
+    elif job_kind == "guideline":
+        manifest_specs = (
+            ("train", "split_train"),
+            ("val", "split_val"),
+            ("test", "split_test"),
+        )
+        source = "cumulative_split"
+    else:
+        manifest_specs = (
+            ("train", "current_split_train"),
+            ("val", "current_split_val"),
+            ("test", "current_split_test"),
+        )
+        source = "current_split"
+
+    grouped: dict[str, dict] = {}
+    for split_name, path_key in manifest_specs:
+        manifest_path = paths.get(path_key)
+        if not isinstance(manifest_path, Path) or not manifest_path.exists():
+            continue
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    filekey = manifest_row_filekey(row)
+                    item = grouped.setdefault(
+                        filekey,
+                        {
+                            "filekey": filekey,
+                            "total": 0,
+                            "splits": Counter(),
+                            "labels": Counter(),
+                            "rgb_ready": 0,
+                            "rgb_missing": 0,
+                        },
+                    )
+                    item["total"] += 1
+                    item["splits"][split_name] += 1
+                    item["labels"][str(row.get("target_label") or row.get("source_label") or "unknown")] += 1
+                    if str(row.get("rgb_feature_path") or "").strip():
+                        item["rgb_ready"] += 1
+                    else:
+                        item["rgb_missing"] += 1
+        except OSError:
+            continue
+
+    items = [
+        {
+            "filekey": value["filekey"],
+            "total": value["total"],
+            "splits": dict(value["splits"]),
+            "labels": dict(value["labels"].most_common(5)),
+            "rgb_ready": value["rgb_ready"],
+            "rgb_missing": value["rgb_missing"],
+        }
+        for value in sorted(grouped.values(), key=lambda entry: (-int(entry["total"]), str(entry["filekey"])))[:limit]
+    ]
+    return {
+        "source": source,
+        "total_items": sum(int(value["total"]) for value in grouped.values()),
+        "filekey_count": len(grouped),
+        "filekeys": items,
+    }
+
+
+def manifest_row_filekey(row: dict) -> str:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    for container in (row, metadata):
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "source_filekey",
+            "filekey",
+            "file_key",
+            "fileKey",
+            "aihub_filekey",
+            "job_filekey",
+            "dataset_filekey",
+            "rgb_feature_filekey",
+        ):
+            value = container.get(key)
+            if isinstance(value, list):
+                value = ",".join(str(item).strip() for item in value if str(item).strip())
+            text = str(value or "").strip()
+            if text:
+                return text
+    for key in ("rgb_feature_path", "video_path", "source_video_path", "pose_path"):
+        value = str(row.get(key) or metadata.get(key) or "").strip()
+        for part in Path(value).parts:
+            lower = part.lower()
+            if lower.startswith("job_"):
+                parts = part.split("_")
+                return parts[1] if len(parts) > 1 and parts[1].isdigit() else part
+            if part.isdigit() and len(part) >= 4:
+                return part
+    return "unknown"
+
+
+def infer_guideline_pipeline_source_filekeys(paths: dict, *, use_guideline: bool) -> str:
+    specs = (
+        (
+            ("guideline_prepared_train", "guideline_prepared_val", "guideline_prepared_test")
+            if use_guideline
+            else ("split_train", "split_val", "split_test")
+        )
+    )
+    counts: Counter[str] = Counter()
+    for path_key in specs:
+        manifest_path = paths.get(path_key)
+        if not isinstance(manifest_path, Path) or not manifest_path.exists():
+            continue
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    filekey = manifest_row_filekey(row)
+                    if filekey and filekey != "unknown":
+                        counts[filekey] += 1
+        except OSError:
+            continue
+    if not counts:
+        return ""
+    ordered = [filekey for filekey, _ in counts.most_common()]
+    if len(ordered) <= 6:
+        return ",".join(ordered)
+    return ",".join([*ordered[:6], f"+{len(ordered) - 6}more"])
 
 
 def build_overview(
@@ -7574,12 +9566,52 @@ def build_overview(
     progress_ratio = ((completed_count + prepared_count + failed_count) / total_count) if total_count > 0 else 0.0
     current_job_progress = build_current_job_progress(pipeline_status, training_progress, effective_launcher_status)
     eta = estimate_eta(current_job_progress, effective_launcher_status)
-    dataset_summary = (
+    cumulative_dataset_summary = (
         build_manifest_summary_group(paths, OVERVIEW_DATASET_MANIFEST_SPECS)
         if not lite
         else {}
     )
+    dataset_summary = dict(cumulative_dataset_summary)
+    guideline_dataset_summary = (
+        build_manifest_summary_group(
+            paths,
+            (
+                ("prepared_train", "guideline_prepared_train"),
+                ("prepared_val", "guideline_prepared_val"),
+                ("prepared_test", "guideline_prepared_test"),
+            ),
+        )
+        if not lite
+        else {}
+    )
+    if guideline_dataset_summary and int((guideline_dataset_summary.get("prepared_train") or {}).get("total", 0) or 0) > 0:
+        dataset_summary.update(guideline_dataset_summary)
+    active_dataset_summary = (
+        build_manifest_summary_group(
+            paths,
+            (
+                ("prepared_train", "active_prepared_train"),
+                ("prepared_val", "active_prepared_val"),
+                ("prepared_test", "active_prepared_test"),
+            ),
+        )
+        if not lite
+        else {}
+    )
+    if active_dataset_summary and int((active_dataset_summary.get("prepared_train") or {}).get("total", 0) or 0) > 0:
+        dataset_summary.update(active_dataset_summary)
+    guideline_quality = build_guideline_quality_summary(paths, config=config) if not lite else {}
     current_dataset_summary = build_manifest_summary_group(paths, OVERVIEW_CURRENT_DATASET_MANIFEST_SPECS)
+    distribution_sources = (
+        {
+            "cumulative": cumulative_dataset_summary,
+            "guideline": guideline_dataset_summary,
+            "active": active_dataset_summary,
+            "current": current_dataset_summary,
+        }
+        if not lite
+        else {}
+    )
     if "train_distribution" not in training_progress and dataset_summary:
         training_progress["train_distribution"] = analyze_class_balance(
             target_labels,
@@ -7614,8 +9646,8 @@ def build_overview(
         metric_history[-1] if isinstance(metric_history, list) and metric_history else {}
     )
     final_validation = (
-        training_progress.get("final_validation")
-        or metrics.get("final_validation")
+        metrics.get("final_validation")
+        or training_progress.get("final_validation")
         or {}
     )
     insight_metrics = {
@@ -7624,11 +9656,11 @@ def build_overview(
         "history": metric_history if isinstance(metric_history, list) else [],
         "latest": latest_metrics if isinstance(latest_metrics, dict) else {},
         "final_validation": final_validation if isinstance(final_validation, dict) else {},
-        "best_epoch": training_progress.get("best_epoch") or metrics.get("best_epoch"),
-        "best_val_macro_f1": training_progress.get("best_val_macro_f1") or metrics.get("best_val_macro_f1"),
-        "best_validation": training_progress.get("best_validation") or metrics.get("best_validation") or {},
+        "best_epoch": metrics.get("best_epoch") or training_progress.get("best_epoch"),
+        "best_val_macro_f1": metrics.get("best_val_macro_f1") or training_progress.get("best_val_macro_f1"),
+        "best_validation": metrics.get("best_validation") or training_progress.get("best_validation") or {},
     }
-    insights = interpret_training_results(
+    insights = {} if lite else interpret_training_results(
         insight_metrics,
         history=insight_metrics["history"],
         class_report=insight_metrics["final_validation"].get("per_class") or [],
@@ -7643,6 +9675,14 @@ def build_overview(
             "val_distribution": training_progress.get("val_distribution") or metrics.get("val_distribution") or {},
         },
     )
+    predownload_log_payload = build_predownload_log_payload(
+        effective_launcher_status.get("predownload") if isinstance(effective_launcher_status, dict) else {},
+        get_cached_log_tail,
+    )
+    current_job_filekeys = build_current_job_filekey_summary(paths, current_job)
+
+    final_model_summary = build_final_model_summary(paths, metrics, training_progress)
+    task_performance_summary = build_task_performance_summary(paths, metrics)
 
     overview = {
         "overview_revision": overview_revision,
@@ -7680,6 +9720,7 @@ def build_overview(
             "ratio": round(progress_ratio, 4),
         },
         "current_job_progress": current_job_progress,
+        "current_job_filekeys": current_job_filekeys,
         "eta": eta,
         "gpu": gpu_status,
         "logs": {
@@ -7703,9 +9744,12 @@ def build_overview(
                 "path": latest_error_log_path,
                 "tail": latest_error_log_tail,
             },
+            "predownload": predownload_log_payload,
         } if not lite else {},
         "dataset": dataset_summary,
+        "distribution_sources": distribution_sources,
         "current_dataset": current_dataset_summary,
+        "guideline_quality": guideline_quality,
         "prepared_pose_items": build_prepared_pose_items(paths, limit=100) if not lite else [],
         "continual_state": read_json(paths["continual_state"]),
         "artifacts": {
@@ -7714,6 +9758,8 @@ def build_overview(
             "has_labels": (paths["artifacts_dir"] / "labels.json").exists(),
         },
         "diagnostics": diagnostics,
+        "final_model_summary": final_model_summary,
+        "task_performance_summary": task_performance_summary,
         "insights": insights,
         "skip_report": current_skip_report,
         "cumulative_skip_report": cumulative_skip_report if not lite else {},
@@ -7727,6 +9773,278 @@ def build_overview(
                 break
             OVERVIEW_CACHE.pop(oldest_key, None)
     return overview
+
+
+def build_final_model_summary(paths: dict, metrics: dict, training_progress: dict) -> dict:
+    artifacts_dir = paths.get("artifacts_dir")
+    if not isinstance(artifacts_dir, Path):
+        return {}
+
+    pose_validation = {}
+    if isinstance(metrics, dict):
+        pose_validation = metrics.get("final_validation") if isinstance(metrics.get("final_validation"), dict) else {}
+    if not pose_validation and isinstance(training_progress, dict):
+        pose_validation = (
+            training_progress.get("final_validation")
+            if isinstance(training_progress.get("final_validation"), dict)
+            else {}
+        )
+
+    hybrid_summary_path = artifacts_dir / "hybrid_summary.json"
+    hybrid_summary = read_json(hybrid_summary_path) or {}
+    hybrid_best = hybrid_summary.get("best_result") if isinstance(hybrid_summary.get("best_result"), dict) else {}
+    promoted_hybrid_validation = {}
+    promoted_hybrid_test = {}
+    if str(metrics.get("model_type") or "").strip().lower() == "hybrid_ensemble":
+        promoted_hybrid_validation = (
+            metrics.get("final_validation") if isinstance(metrics.get("final_validation"), dict) else {}
+        )
+        promoted_hybrid_test = metrics.get("holdout_test") if isinstance(metrics.get("holdout_test"), dict) else {}
+
+    ensemble_summary_path = artifacts_dir / "ensemble_summary.json"
+    ensemble_summary = read_json(ensemble_summary_path) or {}
+    ensemble_best = ensemble_summary.get("best_result") if isinstance(ensemble_summary.get("best_result"), dict) else {}
+    ensemble_metrics = (
+        ensemble_best.get("metrics", {}).get("final_validation")
+        if isinstance(ensemble_best.get("metrics"), dict)
+        else {}
+    )
+    if not isinstance(ensemble_metrics, dict):
+        ensemble_metrics = {}
+
+    pose_entry = {
+        "name": "Pose only",
+        "kind": "pose",
+        "available": bool(pose_validation),
+        "accuracy": coerce_optional_float(pose_validation.get("accuracy")),
+        "macro_f1": coerce_optional_float(pose_validation.get("macro_f1")),
+        "macro_f1_supported": coerce_optional_float(pose_validation.get("macro_f1_supported")),
+        "balanced_accuracy": coerce_optional_float(pose_validation.get("balanced_accuracy")),
+        "source_path": str(artifacts_dir / "metrics.json"),
+    }
+    ensemble_entry = {
+        "name": "Pose ensemble",
+        "kind": "ensemble",
+        "available": bool(ensemble_metrics),
+        "accuracy": coerce_optional_float(ensemble_metrics.get("accuracy")),
+        "macro_f1": coerce_optional_float(ensemble_metrics.get("macro_f1")),
+        "macro_f1_supported": coerce_optional_float(ensemble_metrics.get("macro_f1_supported")),
+        "balanced_accuracy": coerce_optional_float(ensemble_metrics.get("balanced_accuracy")),
+        "source_path": str(ensemble_summary_path),
+    }
+    hybrid_entry = {
+        "name": "RGB/I3D + Pose hybrid",
+        "kind": "hybrid",
+        "available": bool(hybrid_best or promoted_hybrid_validation),
+        "accuracy": coerce_optional_float(hybrid_best.get("val_accuracy"))
+        or coerce_optional_float(promoted_hybrid_validation.get("accuracy")),
+        "macro_f1": coerce_optional_float(hybrid_best.get("macro_f1"))
+        or coerce_optional_float(promoted_hybrid_validation.get("macro_f1")),
+        "macro_f1_supported": coerce_optional_float(hybrid_best.get("macro_f1_supported"))
+        or coerce_optional_float(promoted_hybrid_validation.get("macro_f1_supported")),
+        "balanced_accuracy": coerce_optional_float(hybrid_best.get("balanced_accuracy"))
+        or coerce_optional_float(promoted_hybrid_validation.get("balanced_accuracy")),
+        "test_accuracy": coerce_optional_float(hybrid_best.get("test_accuracy"))
+        or coerce_optional_float(promoted_hybrid_test.get("accuracy")),
+        "test_macro_f1": coerce_optional_float(hybrid_best.get("test_macro_f1"))
+        or coerce_optional_float(promoted_hybrid_test.get("macro_f1")),
+        "test_macro_f1_supported": coerce_optional_float(hybrid_best.get("test_macro_f1_supported"))
+        or coerce_optional_float(promoted_hybrid_test.get("macro_f1_supported")),
+        "feature_model": hybrid_best.get("feature_model"),
+        "feature_weight": coerce_optional_float(hybrid_best.get("feature_weight")),
+        "neural_weight": coerce_optional_float(hybrid_best.get("neural_weight")),
+        "class_bias_name": hybrid_best.get("class_bias_name"),
+        "promoted": bool(hybrid_summary.get("promoted")),
+        "source_path": str(hybrid_summary_path),
+    }
+    recommended = hybrid_entry if hybrid_entry["available"] else (ensemble_entry if ensemble_entry["available"] else pose_entry)
+    return {
+        "recommended_kind": recommended.get("kind"),
+        "recommended_name": recommended.get("name"),
+        "recommended_accuracy": recommended.get("test_accuracy") or recommended.get("accuracy"),
+        "recommended_macro_f1": recommended.get("test_macro_f1") or recommended.get("macro_f1"),
+        "recommended_macro_f1_supported": recommended.get("test_macro_f1_supported")
+        or recommended.get("macro_f1_supported"),
+        "pose": pose_entry,
+        "ensemble": ensemble_entry,
+        "hybrid": hybrid_entry,
+        "note": "RGB/I3D feature까지 적용한 최종 판단 기준은 hybrid 항목입니다.",
+    }
+
+
+def build_task_performance_summary(paths: dict, metrics: dict) -> dict:
+    artifacts_dir = paths.get("artifacts_dir")
+    if not isinstance(artifacts_dir, Path):
+        return {}
+    labels = [str(label) for label in metrics.get("labels", [])] if isinstance(metrics, dict) else []
+    final_validation = metrics.get("final_validation") if isinstance(metrics.get("final_validation"), dict) else {}
+    holdout_test = metrics.get("holdout_test") if isinstance(metrics.get("holdout_test"), dict) else {}
+    specialized_dir = artifacts_dir / "specialized_tasks"
+    detection_metrics = read_json(specialized_dir / "detection" / "metrics.json") or {}
+    classification_metrics = read_json(specialized_dir / "classification" / "metrics.json") or {}
+    pose_classification_metrics = read_json(specialized_dir / "pose_classification" / "metrics.json") or {}
+    specialized_summary = read_json(specialized_dir / "summary.json") or {}
+    derived_validation = build_derived_task_metrics(final_validation, labels=labels)
+    derived_test = build_derived_task_metrics(holdout_test, labels=labels) if holdout_test else {}
+    return {
+        "source": "specialized_feature_models",
+        "summary_path": str(specialized_dir / "summary.json"),
+        "updated_at": specialized_summary.get("updated_at") or specialized_summary.get("created_at"),
+        "detection": compact_specialized_task_metrics(detection_metrics, "detection"),
+        "classification": compact_specialized_task_metrics(
+            classification_metrics,
+            "classification",
+            active_labels=labels,
+        ),
+        "pose_classification": compact_specialized_task_metrics(
+            pose_classification_metrics,
+            "pose_classification",
+            active_labels=labels,
+        ),
+        "derived_from_final_model": {
+            "validation": derived_validation,
+            "holdout_test": derived_test,
+            "source_path": str(artifacts_dir / "metrics.json"),
+        },
+        "note": (
+            "감지 전용은 normal/abnormal 기준, 분류 전용은 abnormal 4클래스 기준입니다. "
+            "specialized 결과가 없으면 현재 최종 모델의 confusion matrix에서 파생 지표를 함께 보여줍니다."
+        ),
+    }
+
+
+def compact_specialized_task_metrics(payload: dict, task_name: str, *, active_labels: list[str] | None = None) -> dict:
+    if not isinstance(payload, dict) or not payload.get("available"):
+        return {
+            "available": False,
+            "task": task_name,
+            "reason": payload.get("reason") if isinstance(payload, dict) else None,
+        }
+    best = payload.get("best_result") if isinstance(payload.get("best_result"), dict) else {}
+    validation = best.get("validation") if isinstance(best.get("validation"), dict) else {}
+    holdout = best.get("holdout_test") if isinstance(best.get("holdout_test"), dict) else {}
+    labels = payload.get("labels") if isinstance(payload.get("labels"), list) else []
+    if task_name in {"classification", "pose_classification"} and active_labels:
+        expected_labels = [str(label) for label in active_labels if str(label) != "normal"]
+        payload_labels = [str(label) for label in labels]
+        if expected_labels and payload_labels != expected_labels:
+            return {
+                "available": False,
+                "task": task_name,
+                "reason": "stale_label_set",
+                "labels": payload_labels,
+                "expected_labels": expected_labels,
+                "source_path": str(Path("specialized_tasks") / task_name / "metrics.json"),
+            }
+    if task_name in {"classification", "pose_classification"}:
+        if isinstance(validation, dict) and "classification" not in validation:
+            validation = {**validation, "classification": derive_abnormal_classification_metrics(validation, labels=labels)}
+        if isinstance(holdout, dict) and holdout and "classification" not in holdout:
+            holdout = {**holdout, "classification": derive_abnormal_classification_metrics(holdout, labels=labels)}
+    return {
+        "available": True,
+        "task": task_name,
+        "model": best.get("model"),
+        "threshold": coerce_optional_float(best.get("threshold")),
+        "score": coerce_optional_float(best.get("score")),
+        "labels": labels,
+        "train_samples": payload.get("train_samples"),
+        "val_samples": payload.get("val_samples"),
+        "test_samples": payload.get("test_samples"),
+        "validation": validation,
+        "holdout_test": holdout,
+        "source_path": str(Path("specialized_tasks") / task_name / "metrics.json"),
+    }
+
+
+def build_derived_task_metrics(metrics_payload: dict, *, labels: list[str]) -> dict:
+    if not isinstance(metrics_payload, dict) or not labels:
+        return {}
+    return {
+        "detection": derive_detection_metrics(metrics_payload, labels=labels),
+        "classification": derive_abnormal_classification_metrics(metrics_payload, labels=labels),
+    }
+
+
+def derive_detection_metrics(metrics_payload: dict, *, labels: list[str]) -> dict:
+    confusion = metrics_payload.get("confusion_matrix")
+    if not isinstance(confusion, list) or not confusion:
+        return {}
+    try:
+        normal_index = labels.index("normal")
+    except ValueError:
+        normal_index = 0
+    total = 0
+    tn = fp = fn = tp = 0
+    for row_index, row in enumerate(confusion):
+        if not isinstance(row, list):
+            continue
+        for column_index, value in enumerate(row):
+            count = int(coerce_float_default(value, 0.0))
+            total += count
+            actual_normal = row_index == normal_index
+            predicted_normal = column_index == normal_index
+            if actual_normal and predicted_normal:
+                tn += count
+            elif actual_normal and not predicted_normal:
+                fp += count
+            elif not actual_normal and predicted_normal:
+                fn += count
+            else:
+                tp += count
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = (2.0 * precision * recall / max(precision + recall, 1e-12)) if total else 0.0
+    return {
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "accuracy": (tp + tn) / max(total, 1),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_alarm_rate": fp / max(fp + tn, 1),
+        "miss_rate": fn / max(fn + tp, 1),
+    }
+
+
+def derive_abnormal_classification_metrics(metrics_payload: dict, *, labels: list[str]) -> dict:
+    per_class = metrics_payload.get("per_class") if isinstance(metrics_payload.get("per_class"), list) else []
+    danger_rows = [
+        row
+        for row in per_class
+        if isinstance(row, dict) and str(row.get("label") or "") != "normal" and int(coerce_float_default(row.get("support"), 0.0)) > 0
+    ]
+    if not danger_rows:
+        return {}
+    supports = [int(coerce_float_default(row.get("support"), 0.0)) for row in danger_rows]
+    f1_values = [float(coerce_float_default(row.get("f1"), 0.0)) for row in danger_rows]
+    recall_values = [float(coerce_float_default(row.get("recall"), 0.0)) for row in danger_rows]
+    precision_values = [float(coerce_float_default(row.get("precision"), 0.0)) for row in danger_rows]
+    total_support = sum(supports)
+    return {
+        "macro_f1": sum(f1_values) / max(len(f1_values), 1),
+        "macro_recall": sum(recall_values) / max(len(recall_values), 1),
+        "macro_precision": sum(precision_values) / max(len(precision_values), 1),
+        "weighted_f1": sum(f1 * support for f1, support in zip(f1_values, supports)) / max(total_support, 1),
+        "support": total_support,
+        "classes": [str(row.get("label") or "") for row in danger_rows],
+    }
+
+
+def coerce_optional_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_float_default(value, default: float = 0.0) -> float:
+    result = coerce_optional_float(value)
+    return default if result is None else result
 
 
 def parse_filekeys(raw_value) -> list[str]:
@@ -7767,33 +10085,199 @@ def parse_filekeys(raw_value) -> list[str]:
     return cleaned
 
 
-def reset_training_workspace(paths: dict) -> None:
-    transient_dirs = ("raw_dir", "import_dir", "extracted_dir")
-    transient_files = (
-        "current_raw_manifest",
-        "current_split_train",
-        "current_split_val",
-        "current_split_test",
-        "current_prepared_train",
-        "current_prepared_val",
-        "current_prepared_test",
-        "current_skip_report",
+FILEKEY_MANIFEST_KEYS = (
+    "raw_manifest",
+    "split_train",
+    "split_val",
+    "split_test",
+    "prepared_train",
+    "prepared_val",
+    "prepared_test",
+    "guideline_prepared_train",
+    "guideline_prepared_val",
+    "guideline_prepared_test",
+    "active_prepared_train",
+    "active_prepared_val",
+    "active_prepared_test",
+    "current_raw_manifest",
+    "current_split_train",
+    "current_split_val",
+    "current_split_test",
+    "current_prepared_train",
+    "current_prepared_val",
+    "current_prepared_test",
+)
+
+
+FILEKEY_VALUE_FIELDS = (
+    "filekey",
+    "file_key",
+    "source_filekey",
+    "job_filekey",
+    "dataset_filekey",
+    "rgb_feature_filekey",
+    "annotation_cache_filekey",
+)
+
+
+FILEKEY_PATH_FIELDS = (
+    "video_path",
+    "source_path",
+    "xml_path",
+    "annotation_path",
+    "cached_xml_path",
+    "pose_path",
+    "feature_path",
+    "rgb_feature_path",
+    "relative_path",
+)
+
+
+def _iter_filekey_candidate_values(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        candidates: list[str] = []
+        for item in value:
+            candidates.extend(_iter_filekey_candidate_values(item))
+        return candidates
+    if isinstance(value, dict):
+        candidates = []
+        for nested in value.values():
+            candidates.extend(_iter_filekey_candidate_values(nested))
+        return candidates
+    text = str(value).strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in re.split(r"[\s,;]+", text) if part.strip()]
+    return parts or [text]
+
+
+def manifest_row_matches_filekey(row: dict, filekey: str) -> bool:
+    target = str(filekey or "").strip()
+    if not target or not isinstance(row, dict):
+        return False
+
+    containers = [row]
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        containers.append(metadata)
+
+    for container in containers:
+        for field in FILEKEY_VALUE_FIELDS:
+            for candidate in _iter_filekey_candidate_values(container.get(field)):
+                if candidate == target:
+                    return True
+
+    path_tokens = (
+        f"/job_{target}/",
+        f"job_{target}",
+        f"__{target}/",
+        f"/{target}/",
+        f"\\{target}\\",
+        f"\\job_{target}\\",
     )
+    for container in containers:
+        for field in FILEKEY_PATH_FIELDS:
+            raw_value = container.get(field)
+            if raw_value is None:
+                continue
+            normalized = str(raw_value).replace("\\", "/")
+            if any(token.replace("\\", "/") in normalized for token in path_tokens):
+                return True
+    return False
 
-    for key in transient_dirs:
-        target = paths.get(key)
-        if not isinstance(target, Path):
-            continue
-        if target.exists():
-            shutil.rmtree(target)
-        target.mkdir(parents=True, exist_ok=True)
 
-    for key in transient_files:
-        target = paths.get(key)
-        if not isinstance(target, Path):
-            continue
-        if target.exists():
-            target.unlink()
+def reset_filekey_training_outputs(paths: dict, *, datasetkey: str, filekey: str) -> dict:
+    target_filekey = str(filekey or "").strip()
+    if not target_filekey:
+        return {"filekey": target_filekey, "removed_rows": {}, "removed_paths": []}
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    manifest_dir = paths.get("manifests_dir")
+    backup_dir = None
+    removed_rows: dict[str, int] = {}
+    removed_paths: list[str] = []
+
+    if isinstance(manifest_dir, Path):
+        backup_dir = manifest_dir / f"backup_before_reextract_{target_filekey}_{timestamp}"
+        for key in FILEKEY_MANIFEST_KEYS:
+            manifest_path = paths.get(key)
+            if not isinstance(manifest_path, Path) or not manifest_path.exists():
+                continue
+            entries = read_jsonl_entries(manifest_path)
+            kept = [entry for entry in entries if not manifest_row_matches_filekey(entry, target_filekey)]
+            removed_count = len(entries) - len(kept)
+            if removed_count <= 0:
+                continue
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(manifest_path, backup_dir / manifest_path.name)
+            write_jsonl_entries(manifest_path, kept)
+            removed_rows[key] = removed_count
+
+        active_state = paths.get("active_manifest_state")
+        if isinstance(active_state, Path) and active_state.exists():
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(active_state, backup_dir / active_state.name)
+            remove_transient_path_with_retries(active_state)
+
+    datasetkey_text = str(datasetkey or "").strip()
+    prepared_dir = paths.get("prepared_dir")
+    if isinstance(prepared_dir, Path):
+        prepared_targets = [prepared_dir / target_filekey]
+        if datasetkey_text:
+            prepared_targets.append(prepared_dir / f"{datasetkey_text}__{target_filekey}")
+        for target in prepared_targets:
+            if target.exists() and remove_transient_path_with_retries(target):
+                removed_paths.append(str(target))
+
+    xml_cache_dir = paths.get("xml_cache_dir")
+    if isinstance(xml_cache_dir, Path):
+        target = xml_cache_dir / f"job_{target_filekey}"
+        if target.exists() and remove_transient_path_with_retries(target):
+            removed_paths.append(str(target))
+
+    workspace_dir = paths.get("workspace_dir")
+    rgb_root = workspace_dir / "rgb_clip_features" if isinstance(workspace_dir, Path) else None
+    if isinstance(rgb_root, Path) and rgb_root.exists():
+        for model_dir in rgb_root.iterdir():
+            if not model_dir.is_dir():
+                continue
+            for split_dir in model_dir.iterdir():
+                if not split_dir.is_dir():
+                    continue
+                target = split_dir / target_filekey
+                if target.exists() and remove_transient_path_with_retries(target):
+                    removed_paths.append(str(target))
+
+    summary = {
+        "filekey": target_filekey,
+        "datasetkey": datasetkey_text,
+        "reset_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "removed_rows": removed_rows,
+        "removed_paths": removed_paths,
+        "backup_dir": str(backup_dir) if backup_dir and backup_dir.exists() else None,
+    }
+    if isinstance(manifest_dir, Path):
+        write_json_atomic(
+            manifest_dir / f"reextract_reset_{target_filekey}_{timestamp}.json",
+            summary,
+        )
+    print(
+        f"[dashboard] filekey {target_filekey} reextract reset: "
+        f"rows={sum(removed_rows.values())}, paths={len(removed_paths)}"
+    )
+    return summary
+
+
+def reset_training_workspace(paths: dict) -> None:
+    cleanup_transient_job_data(paths)
+    current_skip_report = paths.get("current_skip_report")
+    if isinstance(current_skip_report, Path) and current_skip_report.exists():
+        try:
+            current_skip_report.unlink()
+        except OSError:
+            pass
 
     for key in ("manifests_dir", "prepared_dir", "artifacts_dir"):
         target = paths.get(key)

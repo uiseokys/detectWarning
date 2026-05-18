@@ -127,44 +127,44 @@ def interpret_training_results(
         add("recommendations", level, "Next action", message, key=key)
 
     train_loss = _metric(metrics, latest, final_validation, best_validation, keys=("train_loss",))
-    val_loss = _metric(metrics, latest, final_validation, best_validation, keys=("val_loss", "loss"))
+    val_loss = _metric(metrics, final_validation, best_validation, latest, keys=("val_loss", "loss"))
     val_cross_entropy = _metric(
         metrics,
-        latest,
         final_validation,
         best_validation,
+        latest,
         keys=("val_cross_entropy_loss", "cross_entropy_loss"),
     )
-    val_accuracy = _metric(metrics, latest, final_validation, best_validation, keys=("val_accuracy", "accuracy"))
-    val_macro_f1 = _metric(metrics, latest, final_validation, best_validation, keys=("val_macro_f1", "macro_f1"))
+    val_accuracy = _metric(metrics, final_validation, best_validation, latest, keys=("val_accuracy", "accuracy"))
+    val_macro_f1 = _metric(metrics, final_validation, best_validation, latest, keys=("val_macro_f1", "macro_f1"))
     train_accuracy = _metric(metrics, latest, keys=("train_accuracy", "accuracy_train"))
     train_macro_f1 = _metric(metrics, latest, keys=("train_macro_f1", "macro_f1_train"))
     balanced_accuracy = _metric(
         metrics,
-        latest,
         final_validation,
         best_validation,
+        latest,
         keys=("val_balanced_accuracy", "balanced_accuracy"),
     )
     supported_macro_f1 = _metric(
         metrics,
-        latest,
         final_validation,
         best_validation,
+        latest,
         keys=("val_macro_f1_supported", "macro_f1_supported", "supported_macro_f1"),
     )
     mean_pred_confidence = _metric(
         metrics,
-        latest,
         final_validation,
         best_validation,
+        latest,
         keys=("mean_pred_confidence", "val_mean_pred_confidence"),
     )
     mean_true_confidence = _metric(
         metrics,
-        latest,
         final_validation,
         best_validation,
+        latest,
         keys=("mean_true_confidence", "val_mean_true_confidence"),
     )
 

@@ -16,6 +16,7 @@
   },
   "dataset": {
     "target_labels": [
+      "normal",
       "violence",
       "collapse",
       "abduction",
@@ -28,6 +29,8 @@
       "fight": "violence",
       "fighting": "violence",
       "violence": "violence",
+      "normal": "normal",
+      "background": "normal",
       "싸움": "violence",
       "싸움(fight)": "violence",
       "데이트폭력 및 폭행": "violence",
@@ -89,15 +92,76 @@
     "test_ratio": 0.15,
     "seed": 42
   },
+  "guideline_sampling": {
+    "enabled": true,
+    "normal_label": "normal",
+    "include_normal": true,
+    "context_before_seconds": 12,
+    "context_after_seconds": 12,
+    "clip_seconds": 6,
+    "clip_stride_seconds": 6,
+    "normal_clip_seconds": 6,
+    "normal_stride_seconds": 30,
+    "max_event_context_clips_per_video": 16,
+    "max_normal_clips_per_video": 8,
+    "max_total_clips_per_video": 24,
+    "target_normal_clip_ratio": 0.25,
+    "auto_normal_ratio": {
+      "enabled": true,
+      "min_ratio": 0.2,
+      "max_ratio": 0.35,
+      "step": 0.05,
+      "danger_to_normal_threshold": 0.2,
+      "normal_to_danger_threshold": 0.25,
+      "predicted_normal_bias_threshold": 0.15
+    },
+    "pose_mode": "reuse_existing",
+    "fallback_event_start_ratio": 0.25,
+    "fallback_event_end_ratio": 0.75,
+    "event_sample_weight": 1.0,
+    "normal_sample_weight": 1.0,
+    "hard_negative_sample_weight": 1.5,
+    "keep_pose_failed_clips": true,
+    "include_pose_skipped_videos": true,
+    "min_pose_valid_frames": 1,
+    "fallback_min_pose_valid_frames": 1,
+    "min_confirmed_pose_frames": 0,
+    "min_pose_total_keypoints": 1,
+    "max_pose_missing_frames_ratio": 1.0,
+    "max_pose_fallback_frames_ratio": 1.0,
+    "low_pose_valid_frame_ratio": 0.25,
+    "low_pose_confidence": 0.12,
+    "low_pose_sample_weight_multiplier": 0.35,
+    "rgb_only_sample_weight_multiplier": 0.15,
+    "rgb_ready_fallback_sample_weight_multiplier": 0.45,
+    "xml_roots": [],
+    "rgb_feature_dir": ""
+  },
   "preprocess": {
     "device": "cuda:0",
     "person_score_threshold": 0.25,
     "person_imgsz": 640,
+    "person_not_detected_retry": {
+      "enabled": true,
+      "reasons": [
+        "person_not_detected"
+      ],
+      "attempts": [
+        {
+          "person_score_threshold": 0.15,
+          "person_imgsz": 960
+        },
+        {
+          "person_score_threshold": 0.1,
+          "person_imgsz": 1280
+        }
+      ]
+    },
     "detector_batch_size": 24,
     "video_prefetch_workers": 2,
     "compress_prepared_pose": false,
-    "sequence_length": 64,
-    "max_frames_to_scan": 220,
+    "sequence_length": 32,
+    "max_frames_to_scan": 120,
     "min_frames_with_person": 10,
     "fallback_min_frames_with_person": 6,
     "min_confirmed_frames_with_person": 3,
@@ -120,27 +184,32 @@
     "amp_dtype": "auto",
     "compile_model": true,
     "compile_backend": "auto",
-    "epochs": 25,
-    "early_stopping_patience": 4,
-    "early_stopping_min_delta": 0.003,
+    "epochs": 30,
+    "early_stopping_patience": 12,
+    "early_stopping_min_delta": 0.0015,
+    "overfit_guard_enabled": false,
+    "overfit_guard_min_epoch": 16,
+    "overfit_guard_loss_gap": 8.0,
+    "overfit_guard_patience": 3,
     "imbalance_warn_min_samples": 8,
     "imbalance_warn_ratio": 3.0,
     "batch_size": 48,
     "eval_batch_size": 96,
     "dataset_cache_size": 2048,
-    "learning_rate": 0.0005,
-    "weight_decay": 0.005,
+    "learning_rate": 0.0003,
+    "selection_metric": "accuracy",
+    "weight_decay": 0.003,
     "hidden_dim": 128,
-    "temporal_pooling": "mean_max",
+    "temporal_pooling": "mean",
     "num_layers": 2,
-    "dropout": 0.45,
-    "label_smoothing": 0.06,
+    "dropout": 0.35,
+    "label_smoothing": 0.0,
     "loss": "focal",
     "focal_gamma": 1.0,
     "class_weight": "balanced",
     "balanced_sampler": true,
     "class_weight_multipliers": {
-      "abduction": 1.25
+      "abduction": 1.75
     },
     "adaptive_class_weighting": {
       "enabled": true,
@@ -149,7 +218,12 @@
       "low_recall_multiplier": 2.0,
       "low_f1_multiplier": 1.6,
       "missing_prediction_multiplier": 2.5,
-      "minority_count_multiplier": 1.25,
+      "minority_count_multiplier": 1.5,
+      "normal_ratio_multiplier_enabled": true,
+      "normal_ratio_target": 0.25,
+      "normal_ratio_min": 0.2,
+      "normal_ratio_multiplier": 1.35,
+      "normal_ratio_max_multiplier": 1.6,
       "min_multiplier": 1.0,
       "max_multiplier": 2.5,
       "min_validation_support": 1
@@ -185,11 +259,179 @@
   },
   "continual_learning": {
     "enabled": true,
-    "resume_from_best": true,
+    "resume_from_best": false,
     "cleanup_raw_after_job": true
   },
+  "training_tasks": {
+    "enabled": true,
+    "normal_label": "normal",
+    "detection_enabled": true,
+    "classification_enabled": true,
+    "pose_classification_enabled": true,
+    "detection_target_metric": "detection_practical",
+    "detection_min_recall": 0.85,
+    "detection_max_false_alarm_rate": 0.55,
+    "classification_target_metric": "macro_f1_supported",
+    "classification_class_bias_multipliers": [
+      0.65,
+      0.75,
+      0.8,
+      0.85,
+      0.9,
+      0.95,
+      1.0,
+      1.1,
+      1.15,
+      1.25,
+      1.35,
+      1.4,
+      1.6,
+      1.75,
+      1.9,
+      2.1,
+      2.3
+    ],
+    "pose_classification_epochs": 30,
+    "pose_classification_learning_rate": 0.0007,
+    "pose_classification_selection_metric": "accuracy",
+    "pose_classification_weight_decay": 0.003,
+    "pose_classification_dropout": 0.35,
+    "pose_classification_label_smoothing": 0.0,
+    "pose_classification_loss": "focal",
+    "pose_classification_focal_gamma": 1.5,
+    "pose_classification_early_stopping_patience": 12,
+    "pose_classification_early_stopping_min_delta": 0.0015,
+    "pose_classification_overfit_guard_enabled": false,
+    "pose_classification_overfit_guard_min_epoch": 16,
+    "pose_classification_overfit_guard_loss_gap": 8.0,
+    "pose_classification_overfit_guard_patience": 3,
+    "pose_classification_max_duplicate_pose_label_samples": 0,
+    "pose_classification_class_weight_multipliers": {
+      "abduction": 2.5
+    },
+    "feature_models": [
+      "extra_trees_fast",
+      "extra_trees_leaf2_fast",
+      "extra_trees_accuracy",
+      "random_forest_leaf2",
+      "hist_gradient",
+      "logreg"
+    ]
+  },
+  "auto_tune": {
+    "max_trials": 24,
+    "target_recall": 0.35,
+    "target_metric": "macro_f1_supported",
+    "exploration_enabled": true,
+    "seed_sweep_enabled": true,
+    "seeds": [
+      13,
+      42,
+      77,
+      123
+    ],
+    "ensemble_enabled": true,
+    "ensemble_top_k": 16,
+    "ensemble_max_size": 5,
+    "ensemble_temperature_values": [
+      0.75,
+      0.85,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "ensemble_probability_power_values": [
+      0.75,
+      0.9,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "ensemble_class_bias_multipliers": [
+      0.7,
+      0.9,
+      1.0,
+      1.05,
+      1.2
+    ],
+    "promote_ensemble": true,
+    "hybrid_enabled": true,
+    "hybrid_feature_weight_max": 0.95,
+    "hybrid_feature_weight_step": 0.05,
+    "hybrid_auto_feature_weighting": {
+      "enabled": true,
+      "min_rgb_ready_ratio": 0.8,
+      "low_fallback_ratio": 0.05,
+      "medium_fallback_ratio": 0.15,
+      "high_fallback_ratio": 0.3,
+      "low_feature_weight_max": 0.8,
+      "medium_feature_weight_max": 0.9,
+      "high_feature_weight_max": 0.95
+    },
+    "hybrid_temperature_values": [
+      0.8,
+      1.0,
+      1.25
+    ],
+    "hybrid_class_bias_multipliers": [
+      0.8,
+      0.9,
+      1.0,
+      1.05,
+      1.2
+    ],
+    "promote_hybrid": true,
+    "promote_best": true,
+    "update_config_with_best": true,
+    "output_dir": "",
+    "last_best_config_path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\auto_tune\\best_training_config.json",
+    "last_best_trial": {
+      "trial_number": 12,
+      "name": "mean_pooling_control",
+      "reason": "mean+max pooling과 기존 mean pooling을 같은 설정에서 비교합니다.",
+      "score": 0.4768,
+      "target_metric": "accuracy",
+      "best_val_macro_f1": 0.478074,
+      "macro_f1": 0.4780741050074029,
+      "balanced_accuracy": 0.5030745,
+      "val_accuracy": 0.48031496062992124,
+      "min_recall": 0.352941,
+      "missing_prediction_classes": [],
+      "best_epoch": 17,
+      "stopped_early": true,
+      "started_at": "2026-05-07T15:02:10.998195+09:00",
+      "finished_at": "2026-05-07T15:02:30.811598+09:00",
+      "output_dir": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\auto_tune\\runs\\20260507_145830_trial_12_mean_pooling_control",
+      "metrics_path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\auto_tune\\runs\\20260507_145830_trial_12_mean_pooling_control\\metrics.json",
+      "model_path": "C:\\Users\\Administrator\\Documents\\GitHub\\detectWarning\\training_data\\action_pipeline_aihub\\artifacts\\auto_tune\\runs\\20260507_145830_trial_12_mean_pooling_control\\best_action_model.pt",
+      "params": {
+        "class_weight_multipliers": {
+          "abduction": 1.75
+        },
+        "balanced_sampler": true,
+        "loss": "focal",
+        "focal_gamma": 1.0,
+        "label_smoothing": 0.0,
+        "learning_rate": 0.0003,
+        "temporal_pooling": "mean",
+        "early_stopping_patience": 8
+      }
+    }
+  },
   "dashboard": {
-    "allowed_origins": []
+    "allowed_origins": [],
+    "notifications": {
+      "enabled": false,
+      "provider": "ntfy",
+      "ntfy_server": "https://ntfy.sh",
+      "ntfy_topic": "",
+      "notify_on": [
+        "completed",
+        "completed_warning",
+        "error",
+        "aborted"
+      ]
+    }
   },
   "pages_sync": {
     "enabled": true,
