@@ -435,14 +435,14 @@ def main() -> None:
                 if isinstance(upload_hint, dict):
                     hinted_fps = float(upload_hint.get("max_fps") or args.max_fps)
                     hinted_width = int(upload_hint.get("frame_width") or args.frame_width)
-                    hinted_fps = max(0.5, min(max(float(args.max_fps), hinted_fps), hinted_fps))
+                    hinted_fps = max(0.5, min(12.0, hinted_fps))
                     dynamic_interval = 1.0 / max(hinted_fps, 0.1)
                     if args.frame_width > 0:
                         dynamic_frame_width = max(480, min(int(args.frame_width), hinted_width))
                 print(
-                    f"\r전송 성공 | 사람 {len(payload.get('tracked_people', []))} | "
-                    f"얼굴 {len(payload.get('faces', []))} | "
-                    f"지연 {payload.get('latency_ms', 0)}ms",
+                    f"\rupload ok | people {len(payload.get('tracked_people', []))} | "
+                    f"latency {payload.get('latency_ms', 0)}ms | "
+                    f"fps {1.0 / max(dynamic_interval, 1e-6):.1f} | width {dynamic_frame_width}",
                     end="",
                     flush=True,
                 )

@@ -41,13 +41,13 @@ if "%ACCEL_DEVICE%"=="cuda" (
 
 echo [launcher] Device: %ACCEL_DEVICE%
 
-start "detectWarning inference server" cmd /k ""%PYTHON_EXE%" -X utf8 "app\inference_server.py" --host 127.0.0.1 --port 8000 --yolo-device %YOLO_DEVICE% --person-imgsz %PERSON_IMGSZ% --person-score-threshold %PERSON_SCORE% --stt-model medium --stt-device %STT_DEVICE% --stt-compute-type %STT_COMPUTE_TYPE% --stt-beam-size 5 --stt-best-of 5 --stt-no-speech-threshold 0.45 --action-artifacts-dir "training_data\action_pipeline_aihub\artifacts" --action-rgb-model i3d_r50 --action-clip-seconds 4 --action-interval-seconds 2 --action-normal-threshold 0.78 --action-min-confidence 0.45 --action-collapse-static-motion-threshold 4 --action-collapse-static-abnormal-threshold 0.90"
+start "detectWarning inference server" cmd /k ""%PYTHON_EXE%" -X utf8 "app\inference_server.py" --host 127.0.0.1 --port 8000 --yolo-device %YOLO_DEVICE% --person-imgsz %PERSON_IMGSZ% --person-score-threshold %PERSON_SCORE% --person-detect-interval 2 --stt-model medium --stt-device %STT_DEVICE% --stt-compute-type %STT_COMPUTE_TYPE% --stt-beam-size 5 --stt-best-of 5 --stt-no-speech-threshold 0.45 --action-artifacts-dir "training_data\action_pipeline_aihub\artifacts" --action-rgb-model i3d_r50 --action-clip-seconds 4 --action-interval-seconds 2 --action-normal-threshold 0.78 --action-min-confidence 0.45 --action-collapse-static-motion-threshold 4 --action-collapse-static-abnormal-threshold 0.90"
 
 timeout /t 5 /nobreak >nul
 start "" "%DASHBOARD_URL%"
 
 timeout /t 2 /nobreak >nul
-start "detectWarning desktop webcam" cmd /k ""%PYTHON_EXE%" -X utf8 "app\camera_uploader.py" --source 0 --server-url "%SERVER_URL%" --show-local-preview --stt --stt-phrase-seconds 2.5 --stt-silence-seconds 0.5"
+start "detectWarning desktop webcam" cmd /k ""%PYTHON_EXE%" -X utf8 "app\camera_uploader.py" --source 0 --server-url "%SERVER_URL%" --show-local-preview --max-fps 12 --frame-width 840 --jpeg-quality 65 --stt --stt-phrase-seconds 2.5 --stt-silence-seconds 0.5"
 
 echo [launcher] Server, browser dashboard, and desktop webcam uploader were started.
 echo [launcher] Close the two detectWarning command windows to stop them.

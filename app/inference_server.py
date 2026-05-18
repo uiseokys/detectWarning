@@ -41,8 +41,10 @@ class ClientSession:
     last_seen: float
     latest_frame_jpeg: bytes | None = None
     latest_people: list[dict] | None = None
+    latest_tracked_people: list[dict] | None = None
     latest_meta: dict | None = None
     last_detection_log_at: float = 0.0
+    frame_index: int = 0
 
 
 @dataclass
@@ -327,12 +329,12 @@ def write_detection_event_log(payload: dict) -> None:
 
 def build_adaptive_upload_hint(latency_ms: float, risk_score: int, action_label: str) -> dict:
     if risk_score >= 45 or (action_label and action_label != "normal"):
-        return {"max_fps": 6.0, "frame_width": 960, "reason": "risk_active"}
+        return {"max_fps": 12.0, "frame_width": 840, "reason": "risk_active"}
     if latency_ms >= 900:
         return {"max_fps": 3.0, "frame_width": 720, "reason": "server_latency_high"}
     if latency_ms >= 550:
         return {"max_fps": 4.0, "frame_width": 840, "reason": "server_latency_medium"}
-    return {"max_fps": 5.0, "frame_width": 960, "reason": "balanced"}
+    return {"max_fps": 12.0, "frame_width": 840, "reason": "balanced"}
 
 
 def draw_server_overlay(frame, client_id: str, faces, latency_ms: float, people_count: int) -> None:
@@ -424,6 +426,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=640,
         help="YOLO 입력 크기",
+    )
+    parser.add_argument(
+        "--person-detect-interval",
+        type=int,
+        default=2,
+        help="YOLO person detection interval in frames. 1 runs every frame; 2 reuses tracking every other frame.",
+    )
+    parser.add_argument(
+        "--enable-face-detection",
+        action="store_true",
+        help="Enable lightweight face counting overlay. Disabled by default for higher FPS.",
     )
     parser.add_argument(
         "--client-session-ttl",
@@ -558,7 +571,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         collapse_static_motion_threshold=args.action_collapse_static_motion_threshold,
         collapse_static_abnormal_threshold=args.action_collapse_static_abnormal_threshold,
     )
-    face_detector = FaceDetector()
+    face_detector = FaceDetector() if args.enable_face_detection else None
     speech_recognizer = ServerSpeechRecognizer(
         model_size=args.stt_model,
         compute_type=args.stt_compute_type,
@@ -609,6 +622,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "last_seen_seconds": round(monotonic() - session.last_seen, 1),
                         "people_count": int(meta.get("people_count", 0)),
                         "face_count": int(meta.get("face_count", 0)),
+                        "face_detection_enabled": bool(meta.get("face_detection_enabled", False)),
                         "latency_ms": float(meta.get("latency_ms", 0.0)),
                         "speech_status": str(meta.get("speech_status", "idle")),
                         "transcript": str(meta.get("transcript", "")),
@@ -1251,8 +1265,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
               <div class="metric-value" id="peopleCount">0</div>
             </article>
             <article class="metric-card">
-              <div class="metric-label">얼굴 수</div>
-              <div class="metric-value" id="faceCount">0</div>
+              <div class="metric-label">Face Detect</div>
+              <div class="metric-value" id="faceCount">OFF</div>
             </article>
             <article class="metric-card">
               <div class="metric-label">지연 시간</div>
@@ -1322,7 +1336,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           <section class="screen-shell">
             <div class="screen-head">
               <div class="screen-title">실시간 분석 프레임</div>
-              <div class="screen-subtitle">Pose / Face / Risk Overlay</div>
+              <div class="screen-subtitle">Pose / Action / Risk Overlay</div>
             </div>
             <div class="screen" id="screen">
               <div class="screen-empty">
@@ -1447,7 +1461,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           </div>
           <div class="client-stats">
             <div class="client-stat">사람<strong>${client.people_count}</strong></div>
-            <div class="client-stat">얼굴<strong>${client.face_count}</strong></div>
+            <div class="client-stat">Face<strong>${client.face_detection_enabled ? client.face_count : 'OFF'}</strong></div>
             <div class="client-stat">Action<strong>${escapeHtml(client.action_label_label || '-')}</strong></div>
             <div class="client-stat">Abnormal<strong>${Number(client.action_abnormal_score || 0).toFixed(2)}</strong></div>
             <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
@@ -1510,7 +1524,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     function updateMeta(data) {
       document.getElementById('clientName').textContent = data ? data.client_id : '-';
       document.getElementById('peopleCount').textContent = `${data ? data.people_count : 0}`;
-      document.getElementById('faceCount').textContent = `${data ? data.face_count : 0}`;
+      document.getElementById('faceCount').textContent = data && data.face_detection_enabled ? `${data.face_count}` : 'OFF';
       document.getElementById('latency').textContent = `${data ? data.latency_ms.toFixed(1) : 0}ms`;
       document.getElementById('lastSeen').textContent = data ? `${data.last_seen_seconds.toFixed(1)}초 전` : '-';
 
@@ -1604,6 +1618,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "client_id": client_id,
                 "people_count": int(meta.get("people_count", 0)),
                 "face_count": int(meta.get("face_count", 0)),
+                "face_detection_enabled": bool(meta.get("face_detection_enabled", False)),
                 "latency_ms": float(meta.get("latency_ms", 0.0)),
                 "speech_status": str(meta.get("speech_status", "idle")),
                 "speech_status_label": localize_speech_status(str(meta.get("speech_status", "idle"))),
@@ -1694,9 +1709,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
         session = get_session(client_id)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        people = person_detector.detect(frame)
-        tracked_people = session.tracker.update(people)
-        faces = face_detector.detect(frame)
+        previous_risk_score = int((session.latest_meta or {}).get("risk_score", 0) or 0)
+        session.frame_index += 1
+        detect_interval = max(int(args.person_detect_interval), 1)
+        force_person_detect = previous_risk_score >= 35 or session.latest_tracked_people is None
+        should_detect_person = force_person_detect or ((session.frame_index - 1) % detect_interval == 0)
+        if should_detect_person:
+            people = person_detector.detect(frame)
+            tracked_people = session.tracker.update(people)
+            session.latest_tracked_people = tracked_people
+        else:
+            tracked_people = session.latest_tracked_people or []
+        faces = face_detector.detect(frame) if face_detector is not None else []
         evaluated_people = session.person_filter.evaluate(
             tracked_people=tracked_people,
             faces=faces,
@@ -1708,7 +1732,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             for person in evaluated_people
             if person.get("person_state") in {"full_body_person", "upper_body_person"}
         ]
-        previous_risk_score = int((session.latest_meta or {}).get("risk_score", 0) or 0)
         if previous_risk_score >= 35 or float((session.latest_meta or {}).get("audio_level", 0.0) or 0.0) >= 0.12:
             action_recognizer.min_interval_seconds = min(action_recognizer.min_interval_seconds, 1.0)
         elif not confirmed_people:
@@ -1739,6 +1762,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 ),
                 "candidate_count": len(evaluated_people),
                 "face_count": len(faces),
+                "face_detection_enabled": bool(face_detector is not None),
+                "person_detect_reused": not should_detect_person,
+                "person_detect_interval": detect_interval,
                 "latency_ms": round(latency_ms, 1),
                 "action_status": action_result.status,
                 "action_label": action_result.label,
@@ -1798,6 +1824,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "client_id": client_id,
             "tracked_people": evaluated_people,
             "faces": [list(map(int, face)) for face in faces],
+            "face_detection_enabled": bool(face_detector is not None),
+            "person_detect_reused": not should_detect_person,
             "latency_ms": round(latency_ms, 1),
             "action": {
                 "available": bool(action_result.available),
