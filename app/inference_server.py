@@ -6,8 +6,10 @@ import json
 import os
 import platform
 import queue
+import secrets
 import shutil
 import socket
+import string
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -60,6 +62,46 @@ class ServerSpeechResult:
     status: str
     transcript: str = ""
     audio_level: float = 0.0
+
+
+PAIRING_CODE_ALPHABET = string.ascii_uppercase + string.digits
+
+
+def generate_pairing_code(length: int = 6) -> str:
+    return "".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(length))
+
+
+def normalize_pairing_code(code: object) -> str:
+    return "".join(ch for ch in str(code or "").upper() if ch.isalnum())[:12]
+
+
+def build_server_identity_path() -> Path:
+    return Path("training_data") / "action_pipeline_aihub" / "server_identity.json"
+
+
+def save_server_pairing_code(code: str, path: Path | None = None) -> None:
+    identity_path = path or build_server_identity_path()
+    identity_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = identity_path.with_name(f".{identity_path.name}.tmp")
+    payload = {"pairing_code": normalize_pairing_code(code)[:6]}
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    temp_path.replace(identity_path)
+
+
+def load_or_create_server_pairing_code(path: Path | None = None) -> str:
+    identity_path = path or build_server_identity_path()
+    try:
+        with identity_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        code = normalize_pairing_code(payload.get("pairing_code"))[:6]
+        if len(code) == 6:
+            return code
+    except Exception:
+        pass
+    code = generate_pairing_code()
+    save_server_pairing_code(code, identity_path)
+    return code
 
 
 class SystemMonitor:
@@ -735,6 +777,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
+    pairing_lock = threading.Lock()
+    pairing_code = load_or_create_server_pairing_code()
+    paired_clients: dict[str, dict] = {}
     audio_job_queue: queue.Queue[AudioJob] = queue.Queue(maxsize=32)
     system_monitor = SystemMonitor(args, audio_job_queue)
     system_monitor.start()
@@ -791,6 +836,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "action_confidence": float(meta.get("action_confidence", 0.0)),
                         "action_abnormal_score": float(meta.get("action_abnormal_score", 0.0)),
                         "action_available": bool(meta.get("action_available", False)),
+                        "client_type": str(meta.get("client_type", "uploader")),
+                        "device_name": str(meta.get("device_name", "")),
+                        "paired": bool(meta.get("paired", False)),
                         "has_frame": session.latest_frame_jpeg is not None,
                     }
                 )
@@ -1385,6 +1433,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         <div class="system-title">Runtime</div>
         <div class="system-value" id="desktopRuntime">-</div>
       </article>
+      <article class="system-card">
+        <div class="system-title">iOS Pair Code</div>
+        <div class="system-value" id="pairingCode">------</div>
+      </article>
     </section>
 
     <section class="dashboard-grid">
@@ -1578,6 +1630,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       const runtimeLine =
         `오디오 큐 ${data.audio_queue_size}\nYOLO ${data.yolo_device}\nSTT ${data.stt_device} / ${data.stt_compute_type}\nbeam ${data.stt_beam_size} | best_of ${data.stt_best_of}`;
       document.getElementById('desktopRuntime').textContent = runtimeLine;
+      const pairingElement = document.getElementById('pairingCode');
+      if (pairingElement) {
+        pairingElement.textContent = `${data.pairing_code || '------'}\npaired ${data.paired_clients || 0}`;
+      }
     }
 
     async function refreshClients() {
@@ -1759,7 +1815,76 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         snapshot["action_model_enabled"] = bool(action_recognizer.enabled)
         snapshot["action_model_status"] = action_recognizer.latest.status
         snapshot["action_model_reason"] = action_recognizer.latest.reason
+        with pairing_lock:
+            snapshot["pairing_code"] = pairing_code
+            snapshot["paired_clients"] = len(paired_clients)
         return snapshot
+
+    @app.get("/api/pairing")
+    def api_pairing() -> dict:
+        with pairing_lock:
+            return {
+                "pairing_code": pairing_code,
+                "paired_clients": list(paired_clients.values()),
+            }
+
+    @app.post("/api/pairing/regenerate")
+    def api_pairing_regenerate() -> dict:
+        nonlocal pairing_code
+        with pairing_lock:
+            pairing_code = generate_pairing_code()
+            save_server_pairing_code(pairing_code)
+            return {
+                "pairing_code": pairing_code,
+                "paired_clients": len(paired_clients),
+            }
+
+    @app.post("/api/pair/register")
+    def api_pair_register(payload: dict = Body(...)) -> dict:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body is required.")
+        submitted_code = normalize_pairing_code(payload.get("code"))
+        with pairing_lock:
+            expected_code = pairing_code
+        if submitted_code != expected_code:
+            raise HTTPException(status_code=403, detail="Invalid pairing code.")
+
+        raw_client_id = str(payload.get("client_id") or "").strip()
+        if raw_client_id:
+            safe_client_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw_client_id)[:48]
+        else:
+            safe_client_id = f"ios-{secrets.token_hex(3).upper()}"
+        if len(safe_client_id) < 3:
+            safe_client_id = f"ios-{secrets.token_hex(3).upper()}"
+
+        device_name = str(payload.get("device_name") or payload.get("name") or "iOS App").strip()[:80]
+        session = get_session(safe_client_id)
+        if session.latest_meta is None:
+            session.latest_meta = {}
+        session.latest_meta.update(
+            {
+                "client_type": "ios_app",
+                "device_name": device_name,
+                "paired": True,
+                "paired_at_monotonic": round(monotonic(), 3),
+            }
+        )
+        with pairing_lock:
+            paired_clients[safe_client_id] = {
+                "client_id": safe_client_id,
+                "device_name": device_name,
+                "client_type": "ios_app",
+                "paired_at_monotonic": session.latest_meta["paired_at_monotonic"],
+            }
+        return {
+            "ok": True,
+            "client_id": safe_client_id,
+            "device_name": device_name,
+            "upload": {
+                "frame_url": f"/analyze/frame?client_id={safe_client_id}&lite=1",
+                "audio_url": f"/analyze/audio?client_id={safe_client_id}",
+            },
+        }
 
     @app.get("/api/client/{client_id}")
     def api_client(client_id: str) -> dict:

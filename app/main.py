@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from app_backend_client import AppBackendEventClient
 from audio_detector import SpeechResult, SpeechToTextListener, list_input_devices
 from detector import FaceDetector, POSE_CONNECTIONS, PersonDetector
 from event_logger import WarningEventLogger
@@ -196,6 +197,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=60,
         help="이 점수 이상일 때만 위험 이벤트 로그를 저장합니다.",
+    )
+    parser.add_argument(
+        "--app-backend-url",
+        default="",
+        help="위험 이벤트를 전송할 앱 백엔드 Base URL. 예: https://desktop-phtp8km.tailc597eb.ts.net",
+    )
+    parser.add_argument(
+        "--app-backend-cctv-code",
+        default="",
+        help="앱 백엔드에 등록된 CCTV 연결 코드. 예: 7K29QB",
+    )
+    parser.add_argument(
+        "--app-backend-token",
+        default="",
+        help="앱 백엔드 /inference/events 전송용 X-Inference-Token.",
+    )
+    parser.add_argument(
+        "--app-backend-timeout-seconds",
+        type=float,
+        default=3.0,
+        help="앱 백엔드 위험 이벤트 전송 제한 시간(초).",
     )
     parser.add_argument(
         "--server-url",
@@ -481,6 +503,12 @@ def main() -> None:
         log_path=Path(args.warning_log_path),
         min_score=args.warning_log_min_score,
     )
+    app_backend_client = AppBackendEventClient(
+        base_url=args.app_backend_url,
+        cctv_code=args.app_backend_cctv_code,
+        token=args.app_backend_token,
+        timeout_seconds=args.app_backend_timeout_seconds,
+    )
     speech_listener = None
     if args.stt:
         speech_listener = SpeechToTextListener(
@@ -587,7 +615,7 @@ def main() -> None:
             face_count=len(faces),
         )
         draw_risk(frame, risk_assessment)
-        event_logger.maybe_log(
+        warning_event = event_logger.maybe_log(
             now_monotonic=monotonic(),
             source=str(args.source),
             assessment=risk_assessment,
@@ -595,6 +623,11 @@ def main() -> None:
             people_count=len(visible_people),
             face_count=len(faces),
         )
+        if warning_event is not None and app_backend_client.enabled:
+            try:
+                app_backend_client.send_warning_event(warning_event, risk_assessment)
+            except Exception as exc:
+                print(f"[app-backend] 위험 이벤트 전송 실패: {exc}", file=sys.stderr, flush=True)
 
         cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
@@ -606,6 +639,7 @@ def main() -> None:
         speech_listener.stop()
     if remote_client is not None:
         remote_client.close()
+    app_backend_client.close()
     cv2.destroyAllWindows()
 
 
