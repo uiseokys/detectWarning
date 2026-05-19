@@ -12,7 +12,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic, perf_counter
+from time import monotonic, perf_counter, sleep
 import wave
 
 import cv2
@@ -226,6 +226,7 @@ class ClovaCsrClient:
         self.language = clova_language_code(language)
         self.timeout_seconds = max(float(timeout_seconds), 1.0)
         self.enabled = bool(self.client_id and self.client_secret)
+        self.last_error = ""
 
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
         if not self.enabled:
@@ -233,20 +234,42 @@ class ClovaCsrClient:
         payload = encode_wav_bytes(audio, sample_rate)
         if len(payload) > 3 * 1024 * 1024:
             raise RuntimeError("CLOVA CSR request is larger than 3MB.")
-        response = requests.post(
-            f"https://naveropenapi.apigw.ntruss.com/recog/v1/stt?lang={self.language}",
-            data=payload,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "x-ncp-apigw-api-key-id": self.client_id,
-                "x-ncp-apigw-api-key": self.client_secret,
-            },
-            timeout=self.timeout_seconds,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(f"CLOVA CSR failed: HTTP {response.status_code} {response.text[:160]}")
-        payload_json = response.json()
-        return str(payload_json.get("text", "")).strip()
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "x-ncp-apigw-api-key-id": self.client_id,
+            "x-ncp-apigw-api-key": self.client_secret,
+        }
+        last_error = ""
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    f"https://naveropenapi.apigw.ntruss.com/recog/v1/stt?lang={self.language}",
+                    data=payload,
+                    headers=headers,
+                    timeout=self.timeout_seconds,
+                )
+                if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                    last_error = f"HTTP {response.status_code}"
+                    sleep(0.12)
+                    continue
+                if response.status_code >= 400:
+                    raise RuntimeError(f"CLOVA CSR failed: HTTP {response.status_code} {response.text[:160]}")
+                payload_json = response.json()
+                self.last_error = ""
+                return str(payload_json.get("text", "")).strip()
+            except requests.Timeout as exc:
+                last_error = f"timeout: {exc}"
+                if attempt == 0:
+                    continue
+                raise RuntimeError(f"CLOVA CSR timeout: {exc}") from exc
+            except requests.RequestException as exc:
+                last_error = f"network: {exc}"
+                if attempt == 0:
+                    sleep(0.12)
+                    continue
+                raise RuntimeError(f"CLOVA CSR network error: {exc}") from exc
+        self.last_error = last_error
+        return ""
 
 
 class ServerSpeechRecognizer:
@@ -314,9 +337,13 @@ class ServerSpeechRecognizer:
                 if transcript:
                     self.last_provider = "clova"
                     return transcript, audio_level
+                self.last_provider = "clova_empty"
             except Exception:
+                self.last_provider = "clova_error"
                 if not self.use_whisper:
                     raise
+        elif self.use_clova and not self.clova.enabled:
+            self.last_provider = "clova_missing_credentials"
         if self.model is None:
             self.last_provider = "none"
             return "", audio_level
@@ -1496,6 +1523,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
 
     function riskTone(level) {
+      if (level === 'CRITICAL') return 'tone-danger';
       if (level === 'HIGH') return 'tone-danger';
       if (level === 'MEDIUM') return 'tone-warn';
       if (level === 'ELEVATED') return 'tone-accent';
@@ -2063,6 +2091,7 @@ def localize_risk_level(level: str) -> str:
         "ELEVATED": "주의",
         "MEDIUM": "경계",
         "HIGH": "위험",
+        "CRITICAL": "긴급",
     }
     return labels.get(level, level)
 
@@ -2070,9 +2099,11 @@ def localize_risk_level(level: str) -> str:
 def main() -> None:
     args = parse_args()
     print(f"[detectWarning] YOLO device: {args.yolo_device}")
-    print(f"[detectWarning] Whisper device: {args.stt_device}")
-    print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")
-    print(f"[detectWarning] Whisper beam/best_of: {args.stt_beam_size}/{args.stt_best_of}")
+    print(f"[detectWarning] STT provider: {args.stt_provider}")
+    if args.stt_provider != "clova":
+        print(f"[detectWarning] Whisper device: {args.stt_device}")
+        print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")
+        print(f"[detectWarning] Whisper beam/best_of: {args.stt_beam_size}/{args.stt_best_of}")
     try:
         app = create_app(args)
     except Exception as exc:

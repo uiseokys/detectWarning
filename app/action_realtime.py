@@ -144,7 +144,7 @@ class RealtimeActionRecognizer:
         if detection_payload:
             detection_labels = detection_payload["labels"]
             abnormal_index = detection_labels.index("abnormal") if "abnormal" in detection_labels else min(len(detection_labels) - 1, 1)
-            abnormal_score = float(detection_payload["probabilities"][abnormal_index])
+            abnormal_score = float(np.clip(detection_payload["probabilities"][abnormal_index], 0.0, 1.0))
 
         classification_payload = self._predict_with_model(self.classification, feature_vector)
         effective_threshold = max(self.detection_threshold, self.normal_threshold)
@@ -156,8 +156,8 @@ class RealtimeActionRecognizer:
             probs = classification_payload["probabilities"]
             best_index = int(np.argmax(probs))
             candidate_label = str(labels[best_index])
-            candidate_confidence = float(probs[best_index])
-            scaled_confidence = float(abnormal_score * candidate_confidence)
+            candidate_confidence = float(np.clip(probs[best_index], 0.0, 1.0))
+            scaled_confidence = float(np.clip(abnormal_score * candidate_confidence, 0.0, 1.0))
             action_probabilities = {
                 str(label_name): float(abnormal_score * probs[index])
                 for index, label_name in enumerate(labels)
@@ -172,9 +172,14 @@ class RealtimeActionRecognizer:
                 label = candidate_label
                 confidence = scaled_confidence
         elif classification_payload:
+            self._last_candidate_label = ""
+            self._candidate_streak = 0
             labels = classification_payload["labels"]
             probs = classification_payload["probabilities"]
             probabilities.update({str(label_name): float(abnormal_score * probs[index]) for index, label_name in enumerate(labels)})
+        else:
+            self._last_candidate_label = ""
+            self._candidate_streak = 0
 
         return RealtimeActionResult(
             available=True,
@@ -308,7 +313,7 @@ class RealtimeActionRecognizer:
             return None
         expected_dim = self._expected_feature_dim(model)
         features = self._pad_or_trim(feature_vector, expected_dim).reshape(1, -1)
-        probabilities = np.asarray(model.predict_proba(features), dtype=np.float64)[0]
+        probabilities = self._safe_probabilities(np.asarray(model.predict_proba(features), dtype=np.float64)[0])
         return {"labels": labels, "probabilities": probabilities}
 
     @staticmethod
@@ -323,9 +328,20 @@ class RealtimeActionRecognizer:
 
     @staticmethod
     def _pad_or_trim(values: np.ndarray, expected_dim: int) -> np.ndarray:
-        values = np.asarray(values, dtype=np.float32).ravel()
+        values = np.nan_to_num(np.asarray(values, dtype=np.float32).ravel(), nan=0.0, posinf=0.0, neginf=0.0)
         if expected_dim <= 0 or values.size == expected_dim:
             return values
         output = np.zeros(expected_dim, dtype=np.float32)
         output[: min(values.size, expected_dim)] = values[: min(values.size, expected_dim)]
         return output
+
+    @staticmethod
+    def _safe_probabilities(values: np.ndarray) -> np.ndarray:
+        probabilities = np.nan_to_num(np.asarray(values, dtype=np.float64).ravel(), nan=0.0, posinf=0.0, neginf=0.0)
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+        total = float(probabilities.sum())
+        if total <= 0.0:
+            if probabilities.size == 0:
+                return probabilities
+            return np.full_like(probabilities, 1.0 / probabilities.size, dtype=np.float64)
+        return probabilities / total

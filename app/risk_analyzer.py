@@ -62,6 +62,7 @@ class RiskAnalyzer:
         self._audio_history: list[tuple[float, float]] = []
         self._recent_text_events: list[tuple[float, tuple[str, ...], str]] = []
         self._recent_risk_hits: list[tuple[float, float]] = []
+        self._recent_action_events: list[tuple[float, str, float]] = []
         self._risk_hold_until = 0.0
         self._risk_hold_score = 0.0
 
@@ -1523,6 +1524,9 @@ class RiskAnalyzer:
         self._recent_text_events = [
             event for event in self._recent_text_events if now - event[0] <= self._repetition_window_seconds
         ]
+        self._recent_action_events = [
+            event for event in self._recent_action_events if now - event[0] <= 5.0
+        ]
 
         score = 0.0
         audio_component_score = 0.0
@@ -1567,12 +1571,32 @@ class RiskAnalyzer:
             reasons.extend(video_categories)
             categories.extend(video_categories)
 
+        has_people = len(tracked_people) > 0
         if action_result is not None and bool(getattr(action_result, "available", False)):
             action_label = str(getattr(action_result, "label", "") or "")
             action_confidence = float(getattr(action_result, "confidence", 0.0) or 0.0)
             abnormal_score = float(getattr(action_result, "abnormal_score", 0.0) or 0.0)
             if action_label and action_label != "normal":
                 action_score = 24.0 + min(action_confidence, 1.0) * 26.0 + min(abnormal_score, 1.0) * 18.0
+                if not has_people and not active_text_codes:
+                    if abnormal_score < 0.92 or action_confidence < 0.65:
+                        action_score *= 0.25
+                        context_flags.append(f"AI:tentative_no_person:{action_label}")
+                    else:
+                        action_score *= 0.55
+                        context_flags.append(f"AI:high_no_person:{action_label}")
+                elif not has_people:
+                    action_score *= 0.70
+                    context_flags.append(f"AI:no_person_audio_context:{action_label}")
+                recent_same_actions = [
+                    value
+                    for ts, label, value in self._recent_action_events
+                    if label == action_label and now - ts <= 5.0
+                ]
+                self._recent_action_events.append((now, action_label, action_score))
+                if recent_same_actions:
+                    action_score += min(10.0, max(recent_same_actions) * 0.15)
+                    context_flags.append(f"AI:stable:{action_label}")
                 score += action_score
                 video_component_score += action_score
                 categories.append(f"action:{action_label}")
@@ -1878,6 +1902,8 @@ class RiskAnalyzer:
 
     @staticmethod
     def _score_to_level(score: int) -> str:
+        if score >= 90:
+            return "CRITICAL"
         if score >= 75:
             return "HIGH"
         if score >= 45:

@@ -29,6 +29,34 @@ class RiskAnalyzerTests(unittest.TestCase):
 
         self.assertLess(assessment.score, 40)
 
+    def test_rescue_speech_with_person_becomes_critical(self) -> None:
+        speech_result = SimpleNamespace(transcript="\uc0b4\ub824\uc8fc\uc138\uc694", audio_level=0.14)
+        assessment = self.analyzer.update(
+            speech_result,
+            tracked_people=[{"bbox": (0, 0, 80, 160), "movement": 5}],
+            face_count=0,
+        )
+
+        self.assertEqual(assessment.level, "CRITICAL")
+        self.assertGreaterEqual(assessment.audio_score, 80)
+
+    def test_tentative_action_without_person_stays_below_alert(self) -> None:
+        action = SimpleNamespace(
+            available=True,
+            label="collapse",
+            confidence=0.5,
+            abnormal_score=0.8,
+        )
+        speech_result = SimpleNamespace(transcript="", audio_level=0.0)
+        assessment = self.analyzer.update(
+            speech_result,
+            tracked_people=[],
+            face_count=0,
+            action_result=action,
+        )
+
+        self.assertLess(assessment.score, 20)
+
 
 if __name__ == "__main__":
     unittest.main()
