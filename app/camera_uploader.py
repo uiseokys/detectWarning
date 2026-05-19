@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import platform
+import queue
 import socket
+import subprocess
 import threading
 import uuid
 import wave
@@ -74,7 +77,7 @@ def choose_audio_device_interactively() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="노트북 카메라 프레임을 원격 추론 서버로 전송합니다.")
-    parser.add_argument("--source", default="0", help="웹캠 인덱스 또는 영상 파일 경로")
+    parser.add_argument("--source", default="0", help="웹캠 인덱스, 영상 파일 경로, 또는 iphone/continuity")
     parser.add_argument("--server-url", required=True, help="원격 추론 서버 주소. 예: http://100.x.x.x:8000")
     parser.add_argument("--client-id", default="", help="클라이언트 식별자. 비우면 자동 생성")
     parser.add_argument("--jpeg-quality", type=int, default=70, help="전송용 JPEG 품질")
@@ -85,9 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stt", action="store_true", help="맥북 마이크 오디오를 서버로 보내 STT를 함께 수행합니다.")
     parser.add_argument("--stt-device", type=int, default=None, help="입력 오디오 장치 번호")
     parser.add_argument("--select-audio-device", action="store_true", help="실행 전에 마이크 장치를 직접 선택합니다.")
-    parser.add_argument("--stt-phrase-seconds", type=float, default=1.8, help="한 번 인식할 오디오 길이")
-    parser.add_argument("--stt-silence-seconds", type=float, default=0.35, help="이 시간 이상 조용하면 STT 전송")
-    parser.add_argument("--list-video-devices", action="store_true", help="사용 가능한 카메라 인덱스를 간단히 탐색하고 종료합니다.")
+    parser.add_argument("--stt-phrase-seconds", type=float, default=1.2, help="한 번 인식할 오디오 길이")
+    parser.add_argument("--stt-silence-seconds", type=float, default=0.25, help="이 시간 이상 조용하면 STT 전송")
+    parser.add_argument("--list-video-devices", action="store_true", help="사용 가능한 카메라 인덱스를 탐색하고 종료합니다.")
+    parser.add_argument("--video-device-scan-limit", type=int, default=20, help="카메라 인덱스 탐색 범위. 기본 0~19")
     return parser.parse_args()
 
 
@@ -114,7 +118,31 @@ def _probe_camera(index: int, backend=None, backend_name: str = "default") -> Op
     return OpenAttempt(capture=capture, frame=frame, backend_name=backend_name)
 
 
-def list_video_devices(max_index: int = 5) -> list[tuple[int, str]]:
+def list_macos_camera_names() -> list[str]:
+    if platform.system().lower() != "darwin":
+        return []
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPCameraDataType"],
+            capture_output=True,
+            text=True,
+            timeout=4.0,
+            check=False,
+        )
+    except Exception:
+        return []
+    names = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line.endswith(":"):
+            continue
+        name = line[:-1].strip()
+        if name and name not in {"Camera", "Cameras"} and name not in names:
+            names.append(name)
+    return names
+
+
+def list_video_devices(max_index: int = 20) -> list[tuple[int, str]]:
     found = []
     for index in range(max_index):
         attempts = []
@@ -130,7 +158,24 @@ def list_video_devices(max_index: int = 5) -> list[tuple[int, str]]:
     return found
 
 
-def open_source(source: str) -> tuple[cv2.VideoCapture, object | None, str]:
+def open_iphone_source(max_index: int = 20) -> tuple[cv2.VideoCapture, object | None, str]:
+    candidates = list(range(1, max(max_index, 2))) + [0]
+    for index in candidates:
+        attempts = []
+        if hasattr(cv2, "CAP_AVFOUNDATION"):
+            attempts.append((cv2.CAP_AVFOUNDATION, "AVFOUNDATION"))
+        attempts.append((None, "DEFAULT"))
+        for backend, backend_name in attempts:
+            result = _probe_camera(index, backend=backend, backend_name=backend_name)
+            if result.capture is not None:
+                return result.capture, result.frame, f"{backend_name}:iphone-auto:{index}"
+    return cv2.VideoCapture(0), None, "NONE:iphone-auto"
+
+
+def open_source(source: str, max_index: int = 20) -> tuple[cv2.VideoCapture, object | None, str]:
+    normalized_source = source.strip().lower()
+    if normalized_source in {"iphone", "ios", "continuity", "continuity-camera", "auto-iphone"}:
+        return open_iphone_source(max_index=max_index)
     if source.isdigit():
         index = int(source)
         attempts = []
@@ -155,11 +200,13 @@ def open_source(source: str) -> tuple[cv2.VideoCapture, object | None, str]:
 
 def build_open_error(source: str) -> str:
     details = [f"입력 소스를 열 수 없습니다: {source}"]
-    if source.isdigit():
+    if source.isdigit() or source.strip().lower() in {"iphone", "ios", "continuity", "continuity-camera", "auto-iphone"}:
         details.extend(
             [
                 "",
                 "macOS에서 이 터미널 또는 앱의 카메라 권한이 막혀 있을 수 있습니다.",
+                "iPhone 카메라는 macOS 연속성 카메라로 먼저 잡혀야 합니다.",
+                "FaceTime/QuickTime에서 iPhone Camera가 보이는지 먼저 확인해 주세요.",
                 "시스템 설정 > 개인정보 보호 및 보안 > 카메라에서 현재 앱을 허용해 주세요.",
                 "이전에 거부했다면 다음을 실행해 보세요: tccutil reset Camera",
                 "그 뒤 터미널을 완전히 종료한 후 다시 실행해 주세요.",
@@ -170,17 +217,19 @@ def build_open_error(source: str) -> str:
 
 def build_read_error(source: str) -> str:
     details = [f"카메라 첫 프레임을 읽지 못했습니다: {source}"]
-    if source.isdigit():
+    if source.isdigit() or source.strip().lower() in {"iphone", "ios", "continuity", "continuity-camera", "auto-iphone"}:
         details.extend(
             [
                 "",
                 "가능한 원인:",
                 "- macOS 카메라 권한이 허용되지 않음",
+                "- iPhone이 연속성 카메라로 macOS에 노출되지 않음",
                 "- 다른 앱이 카메라를 이미 사용 중임",
                 "- 카메라 초기화가 늦어 첫 프레임을 받지 못함",
                 "",
                 "확인 방법:",
                 "- FaceTime, Zoom, 브라우저 탭 등 카메라를 쓰는 앱 종료",
+                "- FaceTime 또는 QuickTime에서 iPhone Camera가 선택 가능한지 확인",
                 "- 시스템 설정 > 개인정보 보호 및 보안 > 카메라에서 터미널 허용",
                 "- 필요하면 `python3 app/camera_uploader.py --source 0 --server-url ... --show-local-preview`로 미리보기 확인",
             ]
@@ -228,15 +277,25 @@ class AudioStreamer:
         self.sample_rate = sample_rate
         self._stop_event = threading.Event()
         self._thread = None
+        self._send_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+        self._sender_thread = None
 
     def start(self) -> None:
+        self._sender_thread = threading.Thread(target=self._send_worker, daemon=True)
+        self._sender_thread.start()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
+        try:
+            self._send_queue.put_nowait(None)
+        except queue.Full:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if self._sender_thread is not None:
+            self._sender_thread.join(timeout=2.0)
 
     def _run(self) -> None:
         try:
@@ -246,13 +305,15 @@ class AudioStreamer:
             return
 
         audio_queue = deque()
-        speech_level = 0.008
-        block_duration = 0.4
+        speech_level = 0.006
+        min_peak_level = 0.035
+        block_duration = 0.2
         max_phrase_bytes = int(self.sample_rate * self.phrase_seconds * 2)
-        min_phrase_bytes = int(self.sample_rate * min(max(self.phrase_seconds * 0.35, 0.8), 1.2) * 2)
+        min_phrase_bytes = int(self.sample_rate * min(max(self.phrase_seconds * 0.25, 0.45), 0.8) * 2)
         last_voice_at = None
         speech_started_at = None
         buffer = bytearray()
+        active_levels = deque(maxlen=10)
 
         def callback(indata, frames, time_info, status) -> None:
             del frames, time_info
@@ -276,6 +337,7 @@ class AudioStreamer:
                         chunk, level, ts = audio_queue.popleft()
                         buffer.extend(chunk)
                         if level >= speech_level:
+                            active_levels.append(level)
                             if speech_started_at is None:
                                 speech_started_at = ts
                             last_voice_at = ts
@@ -294,11 +356,19 @@ class AudioStreamer:
                         sleep(0.05)
                         continue
 
+                    if not self._should_send_audio(buffer, active_levels, speech_level, min_peak_level):
+                        buffer.clear()
+                        active_levels.clear()
+                        speech_started_at = None
+                        last_voice_at = None
+                        continue
+
                     wav_bytes = self._to_wav_bytes(bytes(buffer))
                     buffer.clear()
+                    active_levels.clear()
                     speech_started_at = None
                     last_voice_at = None
-                    self._send_audio(wav_bytes)
+                    self._queue_latest_audio(wav_bytes)
         except Exception as exc:
             print(f"\n오디오 캡처 실패: {exc}")
 
@@ -327,23 +397,67 @@ class AudioStreamer:
                 f"{exc} | 서버 STT가 느리거나 현재 요청이 밀린 상태일 수 있습니다."
             )
 
+    def _queue_latest_audio(self, wav_bytes: bytes) -> None:
+        while True:
+            try:
+                self._send_queue.get_nowait()
+                self._send_queue.task_done()
+            except queue.Empty:
+                break
+        try:
+            self._send_queue.put_nowait(wav_bytes)
+        except queue.Full:
+            pass
+
+    def _send_worker(self) -> None:
+        while not self._stop_event.is_set():
+            wav_bytes = self._send_queue.get()
+            try:
+                if wav_bytes is None:
+                    return
+                self._send_audio(wav_bytes)
+            finally:
+                self._send_queue.task_done()
+
+    def _should_send_audio(
+        self,
+        buffer: bytearray,
+        active_levels: deque,
+        speech_level: float,
+        min_peak_level: float,
+    ) -> bool:
+        if len(buffer) < int(self.sample_rate * 0.35 * 2):
+            return False
+        if not active_levels:
+            return False
+        peak_level = max(active_levels)
+        mean_level = sum(active_levels) / max(len(active_levels), 1)
+        return peak_level >= min_peak_level or (mean_level >= speech_level * 1.8 and len(active_levels) >= 2)
+
 
 def main() -> None:
     args = parse_args()
     if args.list_video_devices:
-        devices = list_video_devices()
+        camera_names = list_macos_camera_names()
+        if camera_names:
+            print("macOS camera names:")
+            for name in camera_names:
+                print(f"- {name}")
+            print()
+        devices = list_video_devices(max_index=args.video_device_scan_limit)
         if not devices:
             print("프레임을 읽을 수 있는 카메라를 찾지 못했습니다.")
         else:
             print("사용 가능한 카메라:")
             for index, backend_name in devices:
                 print(f"{index}: {backend_name}")
+            print("\niPhone/Continuity Camera가 보이면 `--source iphone` 또는 해당 인덱스를 사용하세요.")
         return
 
     if args.stt and (args.select_audio_device or args.stt_device is None):
         args.stt_device = choose_audio_device_interactively()
 
-    capture, initial_frame, backend_name = open_source(args.source)
+    capture, initial_frame, backend_name = open_source(args.source, max_index=args.video_device_scan_limit)
     if not capture.isOpened():
         raise RuntimeError(build_open_error(args.source))
 
@@ -424,7 +538,7 @@ def main() -> None:
             try:
                 response = session.post(
                     f"{args.server_url.rstrip('/')}/analyze/frame",
-                    params={"client_id": client_id},
+                    params={"client_id": client_id, "lite": "1"},
                     data=encoded.tobytes(),
                     headers={"Content-Type": "image/jpeg"},
                     timeout=args.timeout_seconds,
@@ -440,7 +554,7 @@ def main() -> None:
                     if args.frame_width > 0:
                         dynamic_frame_width = max(480, min(int(args.frame_width), hinted_width))
                 print(
-                    f"\rupload ok | people {len(payload.get('tracked_people', []))} | "
+                    f"\rupload ok | people {payload.get('people_count', len(payload.get('tracked_people', [])))} | "
                     f"latency {payload.get('latency_ms', 0)}ms | "
                     f"fps {1.0 / max(dynamic_interval, 1e-6):.1f} | width {dynamic_frame_width}",
                     end="",

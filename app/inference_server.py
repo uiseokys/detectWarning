@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import platform
 import queue
 import shutil
@@ -16,6 +17,7 @@ import wave
 
 import cv2
 import numpy as np
+import requests
 import uvicorn
 from fastapi import Body
 from fastapi.responses import HTMLResponse, Response
@@ -90,6 +92,7 @@ class SystemMonitor:
             "hostname": socket.gethostname(),
             "platform": platform.platform(),
             "python_version": platform.python_version(),
+            "stt_provider": self.args.stt_provider,
             "yolo_device": self.args.yolo_device,
             "stt_device": self.args.stt_device,
             "stt_compute_type": self.args.stt_compute_type,
@@ -175,6 +178,77 @@ def normalize_audio_for_stt(audio: np.ndarray, *, target_rms: float = 0.075, max
     return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
 
 
+def decode_wav_bytes(wav_bytes: bytes) -> tuple[np.ndarray, int]:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        sample_rate = int(wav_file.getframerate() or 16000)
+        channels = int(wav_file.getnchannels() or 1)
+        frames = wav_file.readframes(wav_file.getnframes())
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1 and audio.size:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio.astype(np.float32, copy=False), sample_rate
+
+
+def encode_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32)
+    pcm = np.clip(audio, -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype(np.int16)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sample_rate or 16000))
+        wav_file.writeframes(pcm.tobytes())
+    return output.getvalue()
+
+
+def clova_language_code(language: str) -> str:
+    normalized = normalize_language(language)
+    if normalized == "en":
+        return "Eng"
+    if normalized == "ja":
+        return "Jpn"
+    if normalized == "zh":
+        return "Chn"
+    return "Kor"
+
+
+class ClovaCsrClient:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        language: str,
+        timeout_seconds: float,
+    ) -> None:
+        self.client_id = client_id.strip()
+        self.client_secret = client_secret.strip()
+        self.language = clova_language_code(language)
+        self.timeout_seconds = max(float(timeout_seconds), 1.0)
+        self.enabled = bool(self.client_id and self.client_secret)
+
+    def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
+        if not self.enabled:
+            raise RuntimeError("CLOVA credentials are not configured.")
+        payload = encode_wav_bytes(audio, sample_rate)
+        if len(payload) > 3 * 1024 * 1024:
+            raise RuntimeError("CLOVA CSR request is larger than 3MB.")
+        response = requests.post(
+            f"https://naveropenapi.apigw.ntruss.com/recog/v1/stt?lang={self.language}",
+            data=payload,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "x-ncp-apigw-api-key-id": self.client_id,
+                "x-ncp-apigw-api-key": self.client_secret,
+            },
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"CLOVA CSR failed: HTTP {response.status_code} {response.text[:160]}")
+        payload_json = response.json()
+        return str(payload_json.get("text", "")).strip()
+
+
 class ServerSpeechRecognizer:
     def __init__(
         self,
@@ -185,19 +259,26 @@ class ServerSpeechRecognizer:
         beam_size: int,
         best_of: int,
         no_speech_threshold: float,
+        provider: str,
+        clova_client_id: str,
+        clova_client_secret: str,
+        clova_timeout_seconds: float,
     ) -> None:
-        try:
-            from faster_whisper import WhisperModel
-        except Exception as exc:
-            raise RuntimeError(
-                "faster-whisper를 불러오지 못했습니다. `pip install -r requirements.txt`를 확인해 주세요."
-            ) from exc
-
+        self.provider = provider.strip().lower()
         self.language = normalize_language(language)
         self.device = device
         self.beam_size = beam_size
         self.best_of = best_of
         self.no_speech_threshold = no_speech_threshold
+        self.last_provider = "none"
+        self.clova = ClovaCsrClient(
+            client_id=clova_client_id,
+            client_secret=clova_client_secret,
+            language=language,
+            timeout_seconds=clova_timeout_seconds,
+        )
+        self.use_clova = self.provider in {"clova", "clova-whisper"}
+        self.use_whisper = self.provider in {"whisper", "clova-whisper"} or not self.use_clova
         self.initial_prompt = (
             "한국어 CCTV 위험상황 감지 음성입니다. "
             "주요 표현: 살려주세요, 도와주세요, 경찰 불러주세요, 신고해주세요, "
@@ -205,23 +286,40 @@ class ServerSpeechRecognizer:
             "때리지 마, 끌고 가지 마, 납치, 칼, 죽여버릴거야, 가만 안 둬, "
             "죽고 싶다, 자살, 위험해요."
         )
-        self.model = WhisperModel(
-            model_size_or_path=model_size,
-            device=device,
-            compute_type=compute_type,
-        )
+        self.model = None
+        if self.use_whisper:
+            try:
+                from faster_whisper import WhisperModel
+            except Exception as exc:
+                raise RuntimeError(
+                    "faster-whisper를 불러오지 못했습니다. `pip install -r requirements.txt`를 확인해 주세요."
+                ) from exc
+            self.model = WhisperModel(
+                model_size_or_path=model_size,
+                device=device,
+                compute_type=compute_type,
+            )
         self._lock = threading.Lock()
 
     def transcribe_wav_bytes(self, wav_bytes: bytes) -> tuple[str, float]:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
-            frames = wav_file.readframes(wav_file.getnframes())
-            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-
+        audio, sample_rate = decode_wav_bytes(wav_bytes)
         if len(audio) == 0:
             return "", 0.0
 
         audio_level = float(np.sqrt(np.mean(np.square(audio))))
         audio = normalize_audio_for_stt(audio)
+        if self.use_clova and self.clova.enabled:
+            try:
+                transcript = self.clova.transcribe(audio, sample_rate)
+                if transcript:
+                    self.last_provider = "clova"
+                    return transcript, audio_level
+            except Exception:
+                if not self.use_whisper:
+                    raise
+        if self.model is None:
+            self.last_provider = "none"
+            return "", audio_level
         with self._lock:
             try:
                 segments, _info = self.model.transcribe(
@@ -256,6 +354,7 @@ class ServerSpeechRecognizer:
         transcript = " ".join(
             segment.text.strip() for segment in segments if segment.text.strip()
         ).strip()
+        self.last_provider = "whisper"
         return transcript, audio_level
 
 
@@ -450,6 +549,28 @@ def parse_args() -> argparse.Namespace:
         help="수신한 팀원 카메라 프레임을 데스크탑 OpenCV 창에 표시합니다.",
     )
     parser.add_argument(
+        "--stt-provider",
+        default="clova",
+        choices=("whisper", "clova", "clova-whisper"),
+        help="Speech-to-text provider. clova-whisper tries CLOVA first and falls back to Whisper.",
+    )
+    parser.add_argument(
+        "--clova-client-id",
+        default=os.environ.get("NCLOUD_CLOVA_CLIENT_ID", ""),
+        help="Naver Cloud CLOVA CSR API key ID. Defaults to NCLOUD_CLOVA_CLIENT_ID.",
+    )
+    parser.add_argument(
+        "--clova-client-secret",
+        default=os.environ.get("NCLOUD_CLOVA_CLIENT_SECRET", ""),
+        help="Naver Cloud CLOVA CSR API key. Defaults to NCLOUD_CLOVA_CLIENT_SECRET.",
+    )
+    parser.add_argument(
+        "--clova-timeout-seconds",
+        type=float,
+        default=3.5,
+        help="CLOVA CSR request timeout before Whisper fallback.",
+    )
+    parser.add_argument(
         "--stt-model",
         default="medium",
         help="서버 STT용 Whisper 모델 크기",
@@ -580,6 +701,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         beam_size=args.stt_beam_size,
         best_of=args.stt_best_of,
         no_speech_threshold=args.stt_no_speech_threshold,
+        provider=args.stt_provider,
+        clova_client_id=args.clova_client_id,
+        clova_client_secret=args.clova_client_secret,
+        clova_timeout_seconds=args.clova_timeout_seconds,
     )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
@@ -625,6 +750,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "face_detection_enabled": bool(meta.get("face_detection_enabled", False)),
                         "latency_ms": float(meta.get("latency_ms", 0.0)),
                         "speech_status": str(meta.get("speech_status", "idle")),
+                        "speech_provider": str(meta.get("speech_provider", "")),
                         "transcript": str(meta.get("transcript", "")),
                         "risk_score": int(meta.get("risk_score", 0)),
                         "risk_audio_score": int(meta.get("risk_audio_score", 0)),
@@ -1570,7 +1696,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     refreshClients();
     setInterval(refreshSystem, 2000);
     setInterval(refreshClients, 1000);
-    setInterval(refreshSelectedClient, 1000);
+    setInterval(refreshSelectedClient, 500);
     setInterval(refreshSelectedFrame, 500);
   </script>
 </body>
@@ -1622,6 +1748,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "latency_ms": float(meta.get("latency_ms", 0.0)),
                 "speech_status": str(meta.get("speech_status", "idle")),
                 "speech_status_label": localize_speech_status(str(meta.get("speech_status", "idle"))),
+                "speech_provider": str(meta.get("speech_provider", "")),
                 "transcript": str(meta.get("transcript", "")),
                 "audio_level": float(meta.get("audio_level", 0.0)),
                 "risk_score": int(meta.get("risk_score", 0)),
@@ -1697,6 +1824,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     def analyze_frame(
         image_bytes: bytes = Body(..., media_type="image/jpeg"),
         client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
+        lite: bool = Query(False, description="Return compact response for uploaders."),
     ) -> dict:
         started_at = perf_counter()
         if not image_bytes:
@@ -1822,8 +1950,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             cv2.waitKey(1)
         return {
             "client_id": client_id,
-            "tracked_people": evaluated_people,
-            "faces": [list(map(int, face)) for face in faces],
+            "tracked_people": [] if lite else evaluated_people,
+            "people_count": len(confirmed_people),
+            "candidate_count": len(evaluated_people),
+            "faces": [] if lite else [list(map(int, face)) for face in faces],
+            "face_count": len(faces),
             "face_detection_enabled": bool(face_detector is not None),
             "person_detect_reused": not should_detect_person,
             "latency_ms": round(latency_ms, 1),
@@ -1864,6 +1995,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 session.latest_meta.update(
                     {
                         "speech_status": speech_status,
+                        "speech_provider": speech_recognizer.last_provider,
                         "transcript": transcript,
                         "audio_level": round(audio_level, 4),
                         "risk_score": risk.score,
