@@ -49,16 +49,24 @@ class CameraUploaderTests(unittest.TestCase):
             streamer._should_send_audio(
                 bytearray(int(16000 * 0.5 * 2)),
                 deque([0.005, 0.006]),
-                0.006,
-                0.035,
+                0.004,
+                0.020,
             )
         )
         self.assertTrue(
             streamer._should_send_audio(
                 bytearray(int(16000 * 0.5 * 2)),
-                deque([0.04]),
-                0.006,
-                0.035,
+                deque([0.021]),
+                0.004,
+                0.020,
+            )
+        )
+        self.assertTrue(
+            streamer._should_send_audio(
+                bytearray(int(16000 * 0.7 * 2)),
+                deque([0.007, 0.007]),
+                0.004,
+                0.020,
             )
         )
 

@@ -92,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stt-silence-seconds", type=float, default=0.25, help="이 시간 이상 조용하면 STT 전송")
     parser.add_argument("--list-video-devices", action="store_true", help="사용 가능한 카메라 인덱스를 탐색하고 종료합니다.")
     parser.add_argument("--video-device-scan-limit", type=int, default=20, help="카메라 인덱스 탐색 범위. 기본 0~19")
+    parser.add_argument("--stt-speech-level", type=float, default=0.004, help="음성 시작으로 볼 평균 오디오 레벨")
+    parser.add_argument("--stt-min-peak-level", type=float, default=0.020, help="STT 전송을 허용할 최소 피크 레벨")
     return parser.parse_args()
 
 
@@ -265,6 +267,8 @@ class AudioStreamer:
         input_device: int | None,
         phrase_seconds: float,
         silence_seconds: float,
+        speech_level: float = 0.004,
+        min_peak_level: float = 0.020,
         sample_rate: int = 16000,
     ) -> None:
         self.session = session
@@ -274,6 +278,8 @@ class AudioStreamer:
         self.input_device = input_device
         self.phrase_seconds = phrase_seconds
         self.silence_seconds = silence_seconds
+        self.speech_level = speech_level
+        self.min_peak_level = min_peak_level
         self.sample_rate = sample_rate
         self._stop_event = threading.Event()
         self._thread = None
@@ -305,15 +311,17 @@ class AudioStreamer:
             return
 
         audio_queue = deque()
-        speech_level = 0.006
-        min_peak_level = 0.035
+        speech_level = float(self.speech_level)
+        min_peak_level = float(self.min_peak_level)
         block_duration = 0.2
+        pre_roll_blocks = max(int(0.45 / block_duration), 1)
         max_phrase_bytes = int(self.sample_rate * self.phrase_seconds * 2)
         min_phrase_bytes = int(self.sample_rate * min(max(self.phrase_seconds * 0.25, 0.45), 0.8) * 2)
         last_voice_at = None
         speech_started_at = None
         buffer = bytearray()
         active_levels = deque(maxlen=10)
+        pre_roll = deque(maxlen=pre_roll_blocks)
 
         def callback(indata, frames, time_info, status) -> None:
             del frames, time_info
@@ -335,12 +343,18 @@ class AudioStreamer:
                 while not self._stop_event.is_set():
                     while audio_queue:
                         chunk, level, ts = audio_queue.popleft()
-                        buffer.extend(chunk)
                         if level >= speech_level:
-                            active_levels.append(level)
                             if speech_started_at is None:
+                                for pre_chunk, _pre_level in pre_roll:
+                                    buffer.extend(pre_chunk)
                                 speech_started_at = ts
+                            buffer.extend(chunk)
+                            active_levels.append(level)
                             last_voice_at = ts
+                        elif speech_started_at is not None:
+                            buffer.extend(chunk)
+                        else:
+                            pre_roll.append((chunk, level))
 
                     now = perf_counter()
                     reached_max = len(buffer) >= max_phrase_bytes
@@ -361,6 +375,7 @@ class AudioStreamer:
                         active_levels.clear()
                         speech_started_at = None
                         last_voice_at = None
+                        pre_roll.clear()
                         continue
 
                     wav_bytes = self._to_wav_bytes(bytes(buffer))
@@ -368,6 +383,7 @@ class AudioStreamer:
                     active_levels.clear()
                     speech_started_at = None
                     last_voice_at = None
+                    pre_roll.clear()
                     self._queue_latest_audio(wav_bytes)
         except Exception as exc:
             print(f"\n오디오 캡처 실패: {exc}")
@@ -426,13 +442,16 @@ class AudioStreamer:
         speech_level: float,
         min_peak_level: float,
     ) -> bool:
-        if len(buffer) < int(self.sample_rate * 0.35 * 2):
+        if len(buffer) < int(self.sample_rate * 0.45 * 2):
             return False
         if not active_levels:
             return False
         peak_level = max(active_levels)
         mean_level = sum(active_levels) / max(len(active_levels), 1)
-        return peak_level >= min_peak_level or (mean_level >= speech_level * 1.8 and len(active_levels) >= 2)
+        active_duration = len(active_levels) * 0.2
+        if peak_level >= min_peak_level and active_duration >= 0.2:
+            return True
+        return mean_level >= speech_level * 1.5 and active_duration >= 0.4
 
 
 def main() -> None:
@@ -490,6 +509,8 @@ def main() -> None:
             input_device=args.stt_device,
             phrase_seconds=args.stt_phrase_seconds,
             silence_seconds=args.stt_silence_seconds,
+            speech_level=args.stt_speech_level,
+            min_peak_level=args.stt_min_peak_level,
         )
         audio_streamer.start()
 

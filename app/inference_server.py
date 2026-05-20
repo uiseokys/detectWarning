@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import io
@@ -12,6 +12,8 @@ import socket
 import string
 import subprocess
 import threading
+from collections import Counter
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
@@ -48,6 +50,8 @@ class ClientSession:
     latest_tracked_people: list[dict] | None = None
     latest_meta: dict | None = None
     last_detection_log_at: float = 0.0
+    last_backend_event_at: float = 0.0
+    last_backend_event_signature: str = ""
     frame_index: int = 0
 
 
@@ -79,29 +83,56 @@ def build_server_identity_path() -> Path:
     return Path("training_data") / "action_pipeline_aihub" / "server_identity.json"
 
 
-def save_server_pairing_code(code: str, path: Path | None = None) -> None:
+def load_server_identity(path: Path | None = None) -> dict:
+    identity_path = path or build_server_identity_path()
+    try:
+        with identity_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def save_server_identity(payload: dict, path: Path | None = None) -> None:
     identity_path = path or build_server_identity_path()
     identity_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = identity_path.with_name(f".{identity_path.name}.tmp")
-    payload = {"pairing_code": normalize_pairing_code(code)[:6]}
     with temp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
     temp_path.replace(identity_path)
 
 
-def load_or_create_server_pairing_code(path: Path | None = None) -> str:
+def save_server_pairing_code(code: str, path: Path | None = None) -> None:
     identity_path = path or build_server_identity_path()
-    try:
-        with identity_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        code = normalize_pairing_code(payload.get("pairing_code"))[:6]
-        if len(code) == 6:
-            return code
-    except Exception:
-        pass
-    code = generate_pairing_code()
-    save_server_pairing_code(code, identity_path)
-    return code
+    payload = load_server_identity(identity_path)
+    payload["pairing_code"] = normalize_pairing_code(code)[:6]
+    save_server_identity(payload, identity_path)
+
+
+def load_or_create_server_identity(path: Path | None = None) -> dict:
+    identity_path = path or build_server_identity_path()
+    payload = load_server_identity(identity_path)
+    code = normalize_pairing_code(payload.get("pairing_code"))[:6]
+    if len(code) != 6:
+        code = generate_pairing_code()
+        payload["pairing_code"] = code
+    if not isinstance(payload.get("cctv"), dict):
+        payload["cctv"] = {}
+    save_server_identity(payload, identity_path)
+    return payload
+
+
+def load_or_create_server_pairing_code(path: Path | None = None) -> str:
+    return str(load_or_create_server_identity(path).get("pairing_code", ""))
+
+
+def save_server_cctv_settings(settings: dict, path: Path | None = None) -> None:
+    identity_path = path or build_server_identity_path()
+    payload = load_or_create_server_identity(identity_path)
+    payload["cctv"] = dict(settings)
+    save_server_identity(payload, identity_path)
 
 
 class SystemMonitor:
@@ -345,11 +376,11 @@ class ServerSpeechRecognizer:
         self.use_clova = self.provider in {"clova", "clova-whisper"}
         self.use_whisper = self.provider in {"whisper", "clova-whisper"} or not self.use_clova
         self.initial_prompt = (
-            "한국어 CCTV 위험상황 감지 음성입니다. "
-            "주요 표현: 살려주세요, 도와주세요, 경찰 불러주세요, 신고해주세요, "
-            "하지 마세요, 그만해, 멈춰, 오지 마, 손대지 마, 놓아줘, "
-            "때리지 마, 끌고 가지 마, 납치, 칼, 죽여버릴거야, 가만 안 둬, "
-            "죽고 싶다, 자살, 위험해요."
+            "?쒓뎅??CCTV ?꾪뿕?곹솴 媛먯? ?뚯꽦?낅땲?? "
+            "二쇱슂 ?쒗쁽: ?대젮二쇱꽭?? ?꾩?二쇱꽭?? 寃쎌같 遺덈윭二쇱꽭?? ?좉퀬?댁＜?몄슂, "
+            "?섏? 留덉꽭?? 洹몃쭔?? 硫덉떠, ?ㅼ? 留? ?먮?吏 留? ?볦븘以? "
+            "?뚮━吏 留? ?뚭퀬 媛吏 留? ?⑹튂, 移? 二쎌뿬踰꾨┫嫄곗빞, 媛留????? "
+            "二쎄퀬 ?띕떎, ?먯궡, ?꾪뿕?댁슂."
         )
         self.model = None
         if self.use_whisper:
@@ -357,7 +388,7 @@ class ServerSpeechRecognizer:
                 from faster_whisper import WhisperModel
             except Exception as exc:
                 raise RuntimeError(
-                    "faster-whisper를 불러오지 못했습니다. `pip install -r requirements.txt`를 확인해 주세요."
+                    "faster-whisper瑜?遺덈윭?ㅼ? 紐삵뻽?듬땲?? `pip install -r requirements.txt`瑜??뺤씤??二쇱꽭??"
                 ) from exc
             self.model = WhisperModel(
                 model_size_or_path=model_size,
@@ -369,9 +400,17 @@ class ServerSpeechRecognizer:
     def transcribe_wav_bytes(self, wav_bytes: bytes) -> tuple[str, float]:
         audio, sample_rate = decode_wav_bytes(wav_bytes)
         if len(audio) == 0:
+            self.last_provider = "empty_audio"
             return "", 0.0
 
         audio_level = float(np.sqrt(np.mean(np.square(audio))))
+        duration_seconds = len(audio) / float(sample_rate or 16000)
+        if duration_seconds < 0.45:
+            self.last_provider = "audio_too_short"
+            return "", audio_level
+        if audio_level < 0.0015:
+            self.last_provider = "audio_too_quiet"
+            return "", audio_level
         audio = normalize_audio_for_stt(audio)
         if self.use_clova and self.clova.enabled:
             try:
@@ -387,7 +426,8 @@ class ServerSpeechRecognizer:
         elif self.use_clova and not self.clova.enabled:
             self.last_provider = "clova_missing_credentials"
         if self.model is None:
-            self.last_provider = "none"
+            if not self.last_provider:
+                self.last_provider = "none"
             return "", audio_level
         with self._lock:
             try:
@@ -495,6 +535,263 @@ def write_detection_event_log(payload: dict) -> None:
         pass
 
 
+
+def parse_detection_event_datetime(event: dict) -> datetime:
+    value = str(event.get("timestamp") or event.get("occurred_at") or event.get("occurredAt") or "").strip()
+    if value:
+        try:
+            normalized = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def detection_event_is_risk(event: dict) -> bool:
+    try:
+        score = int(event.get("risk_score", event.get("riskScore", 0)) or 0)
+    except Exception:
+        score = 0
+    level = str(event.get("risk_level", event.get("riskLevel", "")) or "").upper()
+    action_label = str(event.get("action_label", "") or "").lower()
+    categories = event.get("risk_categories", []) or []
+    if action_label and action_label not in {"normal", "unknown"}:
+        return True
+    if level in {"ELEVATED", "MEDIUM", "HIGH", "CRITICAL", "WARNING", "DANGER"}:
+        return True
+    return score >= 20 or bool(categories)
+
+
+def detection_event_class(event: dict) -> str:
+    action_label = str(event.get("action_label", "") or "").lower()
+    if action_label == "collapse":
+        return "fall"
+    if action_label and action_label not in {"normal", "unknown"}:
+        return action_label
+    categories = event.get("risk_categories", []) or []
+    if isinstance(categories, list):
+        for category in categories:
+            text = str(category or "").lower()
+            if "fall" in text or "collapse" in text:
+                return "fall"
+            if "violence" in text:
+                return "violence"
+            if "loiter" in text:
+                return "loitering"
+            if "abduction" in text:
+                return "abduction"
+    source = str(event.get("source", "") or "").lower()
+    if source == "audio":
+        return "audio_risk"
+    return "abnormal"
+
+
+def detection_stats_points(counter: Counter) -> list[dict]:
+    if not counter:
+        return []
+    peak = max(counter.values())
+    return [
+        {"label": label, "count": int(count), "isPeak": int(count) == peak}
+        for label, count in sorted(counter.items())
+    ]
+
+
+def build_detection_stats(client_id: str = "") -> dict:
+    by_day = Counter()
+    by_week = Counter()
+    by_month = Counter()
+    by_class = Counter()
+    target_client_id = str(client_id or "").strip()
+    path = build_realtime_event_log_path()
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if target_client_id and str(event.get("client_id", "") or "") != target_client_id:
+                        continue
+                    if not detection_event_is_risk(event):
+                        continue
+                    occurred_at = parse_detection_event_datetime(event)
+                    by_day[occurred_at.strftime("%Y-%m-%d")] += 1
+                    by_week[occurred_at.strftime("%G-W%V")] += 1
+                    by_month[occurred_at.strftime("%Y-%m")] += 1
+                    by_class[detection_event_class(event)] += 1
+        except Exception:
+            pass
+    return {
+        "daily": detection_stats_points(by_day),
+        "weekly": detection_stats_points(by_week),
+        "monthly": detection_stats_points(by_month),
+        "byClass": dict(by_class),
+        "source": "detectWarning",
+    }
+
+
+def build_app_backend_url(base_url: str, path: str) -> str:
+    base = str(base_url or "").rstrip("/")
+    suffix = str(path or "").strip() or "/"
+    if not suffix.startswith("/"):
+        suffix = "/" + suffix
+    return base + suffix
+
+
+def post_app_backend_json(args, path: str, payload: dict) -> bool:
+    if bool(getattr(args, "disable_app_backend_sync", False)):
+        return False
+    base_url = str(getattr(args, "app_backend_base_url", "") or "").strip()
+    token = str(getattr(args, "app_backend_token", "") or "").strip()
+    if not base_url or not token:
+        return False
+    try:
+        response = requests.post(
+            build_app_backend_url(base_url, path),
+            json=payload,
+            headers={
+                "X-Inference-Token": token,
+                "Content-Type": "application/json",
+            },
+            timeout=float(getattr(args, "app_backend_timeout_seconds", 2.5) or 2.5),
+        )
+        return 200 <= response.status_code < 300
+    except Exception:
+        return False
+
+
+def post_app_backend_json_async(args, path: str, payload: dict) -> None:
+    if bool(getattr(args, "disable_app_backend_sync", False)):
+        return
+    thread = threading.Thread(
+        target=post_app_backend_json,
+        args=(args, path, payload),
+        daemon=True,
+        name="app-backend-post",
+    )
+    thread.start()
+
+
+def map_backend_risk_level(level: str, score: int) -> str:
+    normalized = str(level or "").upper()
+    if normalized in {"CRITICAL", "HIGH"} or score >= 75:
+        return "danger"
+    if normalized == "MEDIUM" or score >= 45:
+        return "warning"
+    if normalized == "ELEVATED" or score >= 20:
+        return "caution"
+    return "normal"
+
+
+def map_backend_risk_class(action_label: str, categories: list[str], audio_risk: bool) -> str:
+    label = str(action_label or "").lower()
+    if label == "collapse":
+        return "fall"
+    if label == "violence":
+        return "violence"
+    if label == "loitering":
+        return "loitering"
+    if label == "abduction":
+        return "abduction"
+    if label and label not in {"normal", "unknown"}:
+        return label
+    if audio_risk:
+        return "audio_risk"
+    for category in categories or []:
+        text = str(category).lower()
+        if "collapse" in text or "fall" in text or "?곕윭" in text:
+            return "fall"
+        if "violence" in text or "??뻾" in text:
+            return "violence"
+    return "abnormal"
+
+
+def build_backend_video_reason(risk, action_result) -> str:
+    action_label = str(getattr(action_result, "label", "") or "")
+    action_confidence = float(getattr(action_result, "confidence", 0.0) or 0.0)
+    reasons = []
+    if action_label and action_label not in {"normal", "unknown"}:
+        reasons.append(f"action:{action_label}:{action_confidence:.2f}")
+    for reason in list(getattr(risk, "categories", []) or []) + list(getattr(risk, "context_flags", []) or []):
+        reason_text = str(reason)
+        if reason_text and not reason_text.startswith("諛쒗솕") and "matched" not in reason_text.lower():
+            reasons.append(reason_text)
+    return ", ".join(list(dict.fromkeys(reasons))[:4]) or "risk metadata detected"
+
+
+def build_backend_cctv_payload(
+    cctv_code: str,
+    *,
+    name: str = "",
+    location: str = "",
+    status: str = "?뺤긽",
+    latest_risk_score: int = 0,
+    stream_url: str | None = None,
+    inference_stream_url: str | None = None,
+) -> dict:
+    code = normalize_pairing_code(cctv_code)[:6]
+    return {
+        "code": code,
+        "name": str(name or f"detectWarning CCTV {code}"),
+        "location": str(location or socket.gethostname()),
+        "status": str(status or "?뺤긽"),
+        "latestRiskScore": int(max(0, min(100, latest_risk_score))),
+        "streamUrl": stream_url or None,
+        "inferenceStreamUrl": inference_stream_url or None,
+    }
+
+
+def is_audio_risk_signal_detected(risk) -> bool:
+    audio_score = int(getattr(risk, "audio_score", 0) or 0)
+    match_quality = str(getattr(risk, "speech_match_quality", "") or "").lower()
+    return audio_score >= 20 or match_quality in {"weak", "medium", "strong", "critical"}
+
+
+def build_backend_event_payload(cctv_code: str, risk, action_result=None) -> dict:
+    categories = list(getattr(risk, "categories", []) or [])
+    action_label = str(getattr(action_result, "label", "") or "")
+    audio_risk = is_audio_risk_signal_detected(risk)
+    score = int(getattr(risk, "score", 0) or 0)
+    return {
+        "cctvCode": normalize_pairing_code(cctv_code)[:6],
+        "riskLevel": map_backend_risk_level(str(getattr(risk, "level", "") or ""), score),
+        "riskClass": map_backend_risk_class(action_label, categories, audio_risk),
+        "riskScore": score,
+        "videoReason": build_backend_video_reason(risk, action_result),
+        "audioRiskSignalDetected": bool(audio_risk),
+        "snapshotUrl": None,
+        "clipUrl": None,
+    }
+
+
+def should_send_backend_event(session: ClientSession, payload: dict) -> bool:
+    score = int(payload.get("riskScore", 0) or 0)
+    level = str(payload.get("riskLevel", "") or "")
+    if level == "normal" and score < 20:
+        return False
+
+    now = monotonic()
+    signature = "|".join(
+        [
+            level,
+            str(payload.get("riskClass", "")),
+            str(score // 10),
+            str(bool(payload.get("audioRiskSignalDetected", False))),
+        ]
+    )
+    if signature == session.last_backend_event_signature and now - session.last_backend_event_at < 5.0:
+        return False
+    if now - session.last_backend_event_at < 2.0 and score < 75:
+        return False
+
+    session.last_backend_event_at = now
+    session.last_backend_event_signature = signature
+    return True
+
+
 def build_adaptive_upload_hint(latency_ms: float, risk_score: int, action_label: str) -> dict:
     if risk_score >= 45 or (action_label and action_label != "normal"):
         return {"max_fps": 12.0, "frame_width": 840, "reason": "risk_active"}
@@ -580,20 +877,20 @@ def draw_pose_overlay(frame, keypoints) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="원격 영상 추론 서버를 실행합니다.")
-    parser.add_argument("--host", default="0.0.0.0", help="서버 바인드 주소")
-    parser.add_argument("--port", type=int, default=8000, help="서버 포트")
+    parser = argparse.ArgumentParser(description="?먭꺽 ?곸긽 異붾줎 ?쒕쾭瑜??ㅽ뻾?⑸땲??")
+    parser.add_argument("--host", default="0.0.0.0", help="?쒕쾭 諛붿씤??二쇱냼")
+    parser.add_argument("--port", type=int, default=8000, help="?쒕쾭 ?ы듃")
     parser.add_argument(
         "--person-score-threshold",
         type=float,
         default=0.25,
-        help="사람 감지 최소 신뢰도",
+        help="Minimum confidence for person detection.",
     )
     parser.add_argument(
         "--person-imgsz",
         type=int,
         default=640,
-        help="YOLO 입력 크기",
+        help="YOLO ?낅젰 ?ш린",
     )
     parser.add_argument(
         "--person-detect-interval",
@@ -610,12 +907,12 @@ def parse_args() -> argparse.Namespace:
         "--client-session-ttl",
         type=float,
         default=30.0,
-        help="클라이언트 추적 상태를 유지할 최대 유휴 시간(초)",
+        help="?대씪?댁뼵??異붿쟻 ?곹깭瑜??좎???理쒕? ?좏쑕 ?쒓컙(珥?",
     )
     parser.add_argument(
         "--show-windows",
         action="store_true",
-        help="수신한 팀원 카메라 프레임을 데스크탑 OpenCV 창에 표시합니다.",
+        help="?섏떊?????移대찓???꾨젅?꾩쓣 ?곗뒪?ы깙 OpenCV 李쎌뿉 ?쒖떆?⑸땲??",
     )
     parser.add_argument(
         "--stt-provider",
@@ -642,102 +939,158 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stt-model",
         default="medium",
-        help="서버 STT용 Whisper 모델 크기",
+        help="?쒕쾭 STT??Whisper 紐⑤뜽 ?ш린",
     )
     parser.add_argument(
         "--stt-compute-type",
         default="int8",
-        help="서버 STT용 Whisper 연산 타입",
+        help="Whisper compute type for server STT.",
     )
     parser.add_argument(
         "--stt-beam-size",
         type=int,
         default=3,
-        help="서버 STT beam size. 클수록 보통 더 정확하지만 느려집니다.",
+        help="?쒕쾭 STT beam size. ?댁닔濡?蹂댄넻 ???뺥솗?섏?留??먮젮吏묐땲??",
     )
     parser.add_argument(
         "--stt-best-of",
         type=int,
         default=3,
-        help="서버 STT best_of. 클수록 보통 더 정확하지만 느려집니다.",
+        help="?쒕쾭 STT best_of. ?댁닔濡?蹂댄넻 ???뺥솗?섏?留??먮젮吏묐땲??",
     )
     parser.add_argument(
         "--stt-no-speech-threshold",
         type=float,
         default=0.55,
-        help="낮출수록 더 많은 오디오를 음성으로 간주합니다.",
+        help="??텧?섎줉 ??留롮? ?ㅻ뵒?ㅻ? ?뚯꽦?쇰줈 媛꾩＜?⑸땲??",
     )
     parser.add_argument(
         "--stt-language",
         default="ko-KR",
-        help="서버 STT 언어 코드. 예: ko-KR",
+        help="?쒕쾭 STT ?몄뼱 肄붾뱶. ?? ko-KR",
     )
     parser.add_argument(
         "--person-debug",
         action="store_true",
-        help="사람 후보 상태와 제거 이유를 서버 오버레이/응답에 포함해 디버깅합니다.",
+        help="Minimum confidence for person detection.",
     )
     parser.add_argument(
         "--yolo-device",
         default="cuda:0",
-        help="YOLO 추론 장치. 예: cuda:0, cpu",
+        help="YOLO 異붾줎 ?μ튂. ?? cuda:0, cpu",
     )
     parser.add_argument(
         "--stt-device",
         default="cuda",
-        help="Whisper 추론 장치. 예: cuda, cpu",
+        help="Whisper 異붾줎 ?μ튂. ?? cuda, cpu",
     )
     parser.add_argument(
         "--action-artifacts-dir",
         default="training_data/action_pipeline_aihub/artifacts",
-        help="학습된 action/RGB-I3D 모델 artifacts 디렉터리",
+        help="?숈뒿??action/RGB-I3D 紐⑤뜽 artifacts ?붾젆?곕━",
     )
     parser.add_argument(
         "--action-rgb-model",
         default="i3d_r50",
         choices=("i3d_r50", "r3d_18", "mc3_18", "r2plus1d_18"),
-        help="실시간 RGB feature 추출 모델",
+        help="?ㅼ떆媛?RGB feature 異붿텧 紐⑤뜽",
     )
     parser.add_argument(
         "--disable-action-model",
         action="store_true",
-        help="학습된 action 모델 연결을 끕니다.",
+        help="?숈뒿??action 紐⑤뜽 ?곌껐???뺣땲??",
     )
     parser.add_argument(
         "--action-clip-seconds",
         type=float,
         default=4.0,
-        help="실시간 action 판단에 사용할 최근 clip 길이(초)",
+        help="?ㅼ떆媛?action ?먮떒???ъ슜??理쒓렐 clip 湲몄씠(珥?",
     )
     parser.add_argument(
         "--action-interval-seconds",
         type=float,
         default=2.0,
-        help="action 모델 추론 최소 간격(초)",
+        help="action 紐⑤뜽 異붾줎 理쒖냼 媛꾧꺽(珥?",
     )
     parser.add_argument(
         "--action-normal-threshold",
         type=float,
         default=0.78,
-        help="실시간 action 판단에서 normal로 남길 최소 abnormal threshold. 높을수록 오탐이 줄어듭니다.",
+        help="?ㅼ떆媛?action ?먮떒?먯꽌 normal濡??④만 理쒖냼 abnormal threshold. ?믪쓣?섎줉 ?ㅽ깘??以꾩뼱??땲??",
     )
     parser.add_argument(
         "--action-min-confidence",
         type=float,
         default=0.45,
-        help="이상행동 라벨을 표시하기 위한 최소 분류 confidence.",
+        help="?댁긽?됰룞 ?쇰꺼???쒖떆?섍린 ?꾪븳 理쒖냼 遺꾨쪟 confidence.",
     )
     parser.add_argument(
         "--action-collapse-static-motion-threshold",
         type=float,
         default=4.0,
-        help="collapse 오탐 완화용 정지 상태 motion threshold.",
+        help="collapse ?ㅽ깘 ?꾪솕???뺤? ?곹깭 motion threshold.",
     )
     parser.add_argument(
         "--action-collapse-static-abnormal-threshold",
         type=float,
         default=0.90,
-        help="정지 상태에서 collapse로 인정할 최소 abnormal score.",
+        help="?뺤? ?곹깭?먯꽌 collapse濡??몄젙??理쒖냼 abnormal score.",
+    )
+    parser.add_argument(
+        "--app-backend-base-url",
+        default=os.environ.get("APP_BACKEND_BASE_URL", "https://desktop-phtp8km.tailc597eb.ts.net"),
+        help="App backend base URL for CCTV sync and risk event delivery.",
+    )
+    parser.add_argument(
+        "--app-backend-token",
+        default=os.environ.get("INFERENCE_BACKEND_TOKEN", "dev-inference-token"),
+        help="Inference API token. Prefer INFERENCE_BACKEND_TOKEN in production.",
+    )
+    parser.add_argument(
+        "--app-backend-cctv-sync-path",
+        default=os.environ.get("APP_BACKEND_CCTV_SYNC_PATH", "/inference/cctvs"),
+        help="Best-effort CCTV registration/sync path on the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-cctv-name",
+        default=os.environ.get("APP_BACKEND_CCTV_NAME", ""),
+        help="CCTV display name sent to the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-cctv-location",
+        default=os.environ.get("APP_BACKEND_CCTV_LOCATION", ""),
+        help="CCTV location text sent to the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-cctv-status",
+        default=os.environ.get("APP_BACKEND_CCTV_STATUS", "normal"),
+        help="CCTV status text sent to the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-stream-url",
+        default=os.environ.get("APP_BACKEND_STREAM_URL", ""),
+        help="Optional streamUrl sent to the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-inference-stream-url",
+        default=os.environ.get("APP_BACKEND_INFERENCE_STREAM_URL", ""),
+        help="Optional inferenceStreamUrl sent to the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-event-path",
+        default=os.environ.get("APP_BACKEND_EVENT_PATH", "/inference/events"),
+        help="Risk event ingestion path on the app backend.",
+    )
+    parser.add_argument(
+        "--app-backend-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("APP_BACKEND_TIMEOUT_SECONDS", "2.5")),
+        help="Timeout for app backend POST requests.",
+    )
+    parser.add_argument(
+        "--disable-app-backend-sync",
+        action="store_true",
+        help="Disable app backend CCTV sync and event delivery.",
     )
     return parser.parse_args()
 
@@ -778,11 +1131,89 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
     pairing_lock = threading.Lock()
-    pairing_code = load_or_create_server_pairing_code()
+    cctv_settings_lock = threading.Lock()
+    server_identity = load_or_create_server_identity()
+    pairing_code = str(server_identity.get("pairing_code", ""))
+    stored_cctv_settings = server_identity.get("cctv", {}) if isinstance(server_identity.get("cctv"), dict) else {}
+    cctv_settings = {
+        "name": str(args.app_backend_cctv_name or stored_cctv_settings.get("name") or ""),
+        "location": str(args.app_backend_cctv_location or stored_cctv_settings.get("location") or ""),
+        "status": str(args.app_backend_cctv_status or stored_cctv_settings.get("status") or "?뺤긽"),
+        "stream_url": str(args.app_backend_stream_url or stored_cctv_settings.get("stream_url") or ""),
+        "inference_stream_url": str(
+            args.app_backend_inference_stream_url or stored_cctv_settings.get("inference_stream_url") or ""
+        ),
+    }
     paired_clients: dict[str, dict] = {}
     audio_job_queue: queue.Queue[AudioJob] = queue.Queue(maxsize=32)
     system_monitor = SystemMonitor(args, audio_job_queue)
     system_monitor.start()
+
+    def latest_server_risk_score() -> int:
+        with session_lock:
+            scores = [
+                int((session.latest_meta or {}).get("risk_score", 0) or 0)
+                for session in sessions.values()
+                if monotonic() - session.last_seen <= args.client_session_ttl
+            ]
+        return max(scores, default=0)
+
+    def effective_cctv_status(configured_status: str) -> str:
+        with session_lock:
+            has_recent_frame = any(
+                session.latest_frame_jpeg is not None and monotonic() - session.last_seen <= args.client_session_ttl
+                for session in sessions.values()
+            )
+        if not has_recent_frame:
+            return "?ㅽ봽?쇱씤"
+        return str(configured_status or "?뺤긽")
+
+    def current_cctv_settings() -> dict:
+        with cctv_settings_lock:
+            settings = dict(cctv_settings)
+        risk_score = latest_server_risk_score()
+        payload = build_backend_cctv_payload(
+            pairing_code,
+            name=settings.get("name", ""),
+            location=settings.get("location", ""),
+            status=effective_cctv_status(settings.get("status", "?뺤긽")),
+            latest_risk_score=risk_score,
+            stream_url=settings.get("stream_url", ""),
+            inference_stream_url=settings.get("inference_stream_url", ""),
+        )
+        return {
+            "code": payload["code"],
+            "name": payload["name"],
+            "location": payload["location"],
+            "status": payload["status"],
+            "latestRiskScore": payload["latestRiskScore"],
+            "streamUrl": payload["streamUrl"],
+            "inferenceStreamUrl": payload["inferenceStreamUrl"],
+        }
+
+    def sync_cctv_code_with_backend(code: str) -> None:
+        with cctv_settings_lock:
+            current_settings = dict(cctv_settings)
+        post_app_backend_json_async(
+            args,
+            args.app_backend_cctv_sync_path,
+            build_backend_cctv_payload(
+                code,
+                name=current_settings.get("name", ""),
+                location=current_settings.get("location", ""),
+                status=effective_cctv_status(current_settings.get("status", "?뺤긽")),
+                latest_risk_score=latest_server_risk_score(),
+                stream_url=current_settings.get("stream_url", ""),
+                inference_stream_url=current_settings.get("inference_stream_url", ""),
+            ),
+        )
+
+    def send_backend_event_if_needed(session: ClientSession, risk, action_result=None) -> None:
+        payload = build_backend_event_payload(pairing_code, risk, action_result)
+        if should_send_backend_event(session, payload):
+            post_app_backend_json_async(args, args.app_backend_event_path, payload)
+
+    sync_cctv_code_with_backend(pairing_code)
 
     def get_session(client_id: str) -> ClientSession:
         now = monotonic()
@@ -823,7 +1254,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "latency_ms": float(meta.get("latency_ms", 0.0)),
                         "speech_status": str(meta.get("speech_status", "idle")),
                         "speech_provider": str(meta.get("speech_provider", "")),
-                        "transcript": str(meta.get("transcript", "")),
                         "risk_score": int(meta.get("risk_score", 0)),
                         "risk_audio_score": int(meta.get("risk_audio_score", 0)),
                         "risk_video_score": int(meta.get("risk_video_score", 0)),
@@ -991,6 +1421,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       flex-direction: column;
       gap: 12px;
     }
+    .system-card-wide {
+      grid-column: span 2;
+    }
     .system-title {
       font-size: 12px;
       font-weight: 700;
@@ -1004,6 +1437,49 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       line-height: 1.6;
       white-space: pre-line;
       color: var(--ink);
+    }
+    .cctv-settings {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .cctv-input {
+      width: 100%;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 700;
+      outline: none;
+    }
+    .cctv-input:focus {
+      border-color: rgba(37, 99, 235, 0.48);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10);
+    }
+    .cctv-button {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(37, 99, 235, 0.28);
+      background: #2563eb;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .cctv-button:disabled {
+      cursor: default;
+      opacity: 0.58;
+    }
+    .cctv-status {
+      grid-column: 1 / -1;
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
     }
     .dashboard-grid {
       display: grid;
@@ -1399,6 +1875,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       .detail-grid {
         grid-template-columns: 1fr;
       }
+      .system-card-wide {
+        grid-column: auto;
+      }
     }
   </style>
 </head>
@@ -1408,11 +1887,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       <div class="hero-copy">
         <span class="eyebrow">AI Monitoring System</span>
         <h1>detectWarning 실시간 모니터링 대시보드</h1>
-        <p>팀원 노트북에서 들어오는 영상과 음성을 데스크탑 서버가 분석하고, 현재 상태를 한눈에 볼 수 있도록 정리한 실시간 대시보드입니다.</p>
+        <p>카메라 영상과 음성 위험 신호를 추론 서버가 분석하고, 현재 CCTV 상태와 위험도를 한 화면에서 확인할 수 있습니다.</p>
       </div>
       <div class="hero-summary">
         <div class="hero-summary-label">Presentation Ready</div>
-        <div class="hero-summary-value">실시간 분석 화면, 위험도, 시스템 상태를 한 화면에서 확인</div>
+        <div class="hero-summary-value">실시간 분석 화면, 위험도, 시스템 상태를 한 번에 확인</div>
       </div>
     </header>
 
@@ -1436,6 +1915,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       <article class="system-card">
         <div class="system-title">iOS Pair Code</div>
         <div class="system-value" id="pairingCode">------</div>
+      </article>
+      <article class="system-card system-card-wide">
+        <div class="system-title">CCTV Name</div>
+        <div class="cctv-settings">
+          <input class="cctv-input" id="cctvNameInput" maxlength="80" placeholder="detectWarning CCTV" />
+          <button class="cctv-button" id="cctvNameSave" type="button">Save</button>
+          <div class="cctv-status" id="cctvNameStatus"></div>
+        </div>
       </article>
     </section>
 
@@ -1547,7 +2034,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
               <div class="screen-empty">
                 <div class="screen-empty-icon">AI</div>
                 <div class="screen-empty-title">분석 화면을 준비하는 중입니다</div>
-                <div class="screen-empty-copy">클라이언트가 연결되면 여기에 실시간 영상과 분석 오버레이가 표시됩니다.</div>
+                <div class="screen-empty-copy">카메라 클라이언트가 연결되면 실시간 영상과 분석 오버레이가 표시됩니다.</div>
               </div>
             </div>
           </section>
@@ -1557,6 +2044,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
   </div>
   <script>
     let selectedClientId = null;
+    let lastCctvSettings = null;
 
     function escapeHtml(value) {
       return String(value ?? '')
@@ -1568,9 +2056,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
 
     function speechTone(status) {
-      if (status === 'recognized') return 'tone-good';
-      if (status === 'processing') return 'tone-warn';
-      if (status === 'error') return 'tone-danger';
+      if (status === 'recognized' || status === 'clova') return 'tone-good';
+      if (status === 'processing' || status === 'clova_empty' || status === 'listening' || status === 'audio_too_short' || status === 'audio_too_quiet') return 'tone-warn';
+      if (status === 'error' || status === 'clova_error' || status === 'clova_missing_credentials' || status === 'none') return 'tone-danger';
       return 'tone-neutral';
     }
 
@@ -1600,7 +2088,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       if (!image) {
         screen.innerHTML = '';
         image = document.createElement('img');
-        image.alt = '분석 화면';
+        image.alt = '遺꾩꽍 ?붾㈃';
         screen.appendChild(image);
       }
       return image;
@@ -1608,6 +2096,48 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     function setScreenPlaceholder(title, copy) {
       document.getElementById('screen').innerHTML = screenPlaceholder(title, copy);
+    }
+
+    function setCctvNameStatus(message, tone = 'neutral') {
+      const status = document.getElementById('cctvNameStatus');
+      if (!status) return;
+      status.textContent = message || '';
+      status.style.color = tone === 'error' ? '#dc2626' : (tone === 'ok' ? '#059669' : '');
+    }
+
+    async function saveCctvName() {
+      const input = document.getElementById('cctvNameInput');
+      const button = document.getElementById('cctvNameSave');
+      if (!input || !button) return;
+      const nextName = input.value.trim();
+      button.disabled = true;
+      setCctvNameStatus('Saving...');
+      try {
+        const response = await fetch('/api/cctv/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            name: nextName,
+            location: lastCctvSettings ? lastCctvSettings.location : '',
+            status: lastCctvSettings ? lastCctvSettings.status : '?뺤긽',
+            streamUrl: lastCctvSettings ? lastCctvSettings.streamUrl : null,
+            inferenceStreamUrl: lastCctvSettings ? lastCctvSettings.inferenceStreamUrl : null,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        lastCctvSettings = data.cctv || lastCctvSettings;
+        if (lastCctvSettings && document.activeElement !== input) {
+          input.value = lastCctvSettings.name || '';
+        }
+        setCctvNameStatus('Saved and synced', 'ok');
+      } catch (error) {
+        setCctvNameStatus('Save failed', 'error');
+      } finally {
+        button.disabled = false;
+      }
     }
 
     async function refreshSystem() {
@@ -1634,6 +2164,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       if (pairingElement) {
         pairingElement.textContent = `${data.pairing_code || '------'}\npaired ${data.paired_clients || 0}`;
       }
+      if (data.cctv) {
+        lastCctvSettings = data.cctv;
+        const cctvInput = document.getElementById('cctvNameInput');
+        if (cctvInput && document.activeElement !== cctvInput) {
+          cctvInput.value = data.cctv.name || '';
+        }
+      }
     }
 
     async function refreshClients() {
@@ -1649,7 +2186,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       if (!clients.length) {
         container.innerHTML = '<div class="client-empty">아직 연결된 클라이언트가 없습니다.</div>';
         selectedClientHasFrame = false;
-        setScreenPlaceholder('클라이언트를 기다리는 중입니다', '맥북 업로더를 실행하면 이곳에 실시간 분석 화면이 표시됩니다.');
+        setScreenPlaceholder('클라이언트를 기다리는 중입니다', '카메라 업로더를 실행하면 실시간 분석 화면이 표시됩니다.');
         updateMeta(null);
         return;
       }
@@ -1677,7 +2214,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
             <div class="client-stat">지연<strong>${client.latency_ms.toFixed(1)}ms</strong></div>
           </div>
-          <div class="client-transcript">${escapeHtml(client.transcript ? client.transcript : '최근 인식된 음성이 없습니다.')}</div>
+          <div class="client-transcript">STT 원문은 앱 백엔드 조회 목록에 표시하지 않습니다.</div>
           <div class="client-categories">카테고리 ${escapeHtml(client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '없음')}</div>
         `;
         item.onclick = () => {
@@ -1776,6 +2313,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       selectedClientId = requestedClientId;
     }
 
+    const cctvNameSaveButton = document.getElementById('cctvNameSave');
+    const cctvNameInput = document.getElementById('cctvNameInput');
+    if (cctvNameSaveButton) {
+      cctvNameSaveButton.addEventListener('click', saveCctvName);
+    }
+    if (cctvNameInput) {
+      cctvNameInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          saveCctvName();
+        }
+      });
+    }
+
     refreshSystem();
     refreshClients();
     setInterval(refreshSystem, 2000);
@@ -1808,6 +2358,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     def api_clients() -> list[dict]:
         return list_client_summaries()
 
+    @app.get("/api/stats")
+    def api_stats(code: str = "", client_id: str = "") -> dict:
+        return build_detection_stats(client_id=client_id)
+
     @app.get("/api/system")
     def api_system() -> dict:
         snapshot = system_monitor.get_snapshot()
@@ -1815,9 +2369,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         snapshot["action_model_enabled"] = bool(action_recognizer.enabled)
         snapshot["action_model_status"] = action_recognizer.latest.status
         snapshot["action_model_reason"] = action_recognizer.latest.reason
+        snapshot["app_backend_enabled"] = bool(
+            str(getattr(args, "app_backend_base_url", "") or "").strip()
+            and str(getattr(args, "app_backend_token", "") or "").strip()
+            and not bool(getattr(args, "disable_app_backend_sync", False))
+        )
+        snapshot["app_backend_base_url"] = str(getattr(args, "app_backend_base_url", "") or "")
         with pairing_lock:
             snapshot["pairing_code"] = pairing_code
             snapshot["paired_clients"] = len(paired_clients)
+        snapshot["cctv"] = current_cctv_settings()
         return snapshot
 
     @app.get("/api/pairing")
@@ -1826,7 +2387,46 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             return {
                 "pairing_code": pairing_code,
                 "paired_clients": list(paired_clients.values()),
+                "cctv": current_cctv_settings(),
             }
+
+    @app.get("/api/cctv/settings")
+    def api_cctv_settings() -> dict:
+        return current_cctv_settings()
+
+    @app.post("/api/cctv/settings")
+    def api_cctv_settings_update(payload: dict = Body(...)) -> dict:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body is required.")
+
+        def clean_text(value: object, limit: int = 120) -> str:
+            return str(value or "").strip()[:limit]
+
+        with cctv_settings_lock:
+            updated = dict(cctv_settings)
+            if "name" in payload:
+                updated["name"] = clean_text(payload.get("name"), 80)
+            if "location" in payload:
+                updated["location"] = clean_text(payload.get("location"), 160)
+            if "status" in payload:
+                updated["status"] = clean_text(payload.get("status") or "?뺤긽", 40)
+            if "streamUrl" in payload or "stream_url" in payload:
+                updated["stream_url"] = clean_text(payload.get("streamUrl", payload.get("stream_url")), 512)
+            if "inferenceStreamUrl" in payload or "inference_stream_url" in payload:
+                updated["inference_stream_url"] = clean_text(
+                    payload.get("inferenceStreamUrl", payload.get("inference_stream_url")),
+                    512,
+                )
+            cctv_settings.update(updated)
+            stored_settings = dict(cctv_settings)
+        save_server_cctv_settings(stored_settings)
+        with pairing_lock:
+            current_code = pairing_code
+        sync_cctv_code_with_backend(current_code)
+        return {
+            "ok": True,
+            "cctv": current_cctv_settings(),
+        }
 
     @app.post("/api/pairing/regenerate")
     def api_pairing_regenerate() -> dict:
@@ -1834,6 +2434,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         with pairing_lock:
             pairing_code = generate_pairing_code()
             save_server_pairing_code(pairing_code)
+            sync_cctv_code_with_backend(pairing_code)
             return {
                 "pairing_code": pairing_code,
                 "paired_clients": len(paired_clients),
@@ -1891,7 +2492,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         with session_lock:
             session = sessions.get(client_id)
             if session is None:
-                raise HTTPException(status_code=404, detail="클라이언트를 찾을 수 없습니다.")
+                raise HTTPException(status_code=404, detail="?대씪?댁뼵?몃? 李얠쓣 ???놁뒿?덈떎.")
             meta = session.latest_meta or {}
             return {
                 "client_id": client_id,
@@ -1931,7 +2532,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         with session_lock:
             session = sessions.get(client_id)
             if session is None:
-                raise HTTPException(status_code=404, detail="클라이언트를 찾을 수 없습니다.")
+                raise HTTPException(status_code=404, detail="?대씪?댁뼵?몃? 李얠쓣 ???놁뒿?덈떎.")
             frame_bytes = session.latest_frame_jpeg
         if not frame_bytes:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
@@ -1944,11 +2545,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     @app.post("/analyze/audio")
     def analyze_audio(
         audio_bytes: bytes = Body(..., media_type="audio/wav"),
-        client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
+        client_id: str = Query(..., min_length=3, description="Per-client tracking identifier"),
     ) -> dict:
         started_at = perf_counter()
         if not audio_bytes:
-            raise HTTPException(status_code=400, detail="빈 오디오 요청입니다.")
+            raise HTTPException(status_code=400, detail="鍮??ㅻ뵒???붿껌?낅땲??")
 
         session = get_session(client_id)
         latency_ms = (perf_counter() - started_at) * 1000.0
@@ -1961,7 +2562,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             session.latest_meta.update(
                 {
                     "speech_status": "error",
-                    "speech_error": "오디오 처리 대기열이 가득 찼습니다.",
+                    "speech_error": "?ㅻ뵒??泥섎━ ?湲곗뿴??媛??李쇱뒿?덈떎.",
                 }
             )
         return {
@@ -1976,17 +2577,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     @app.post("/analyze/frame")
     def analyze_frame(
         image_bytes: bytes = Body(..., media_type="image/jpeg"),
-        client_id: str = Query(..., min_length=3, description="팀원별 추적 상태 식별자"),
+        client_id: str = Query(..., min_length=3, description="Per-client tracking identifier"),
         lite: bool = Query(False, description="Return compact response for uploaders."),
     ) -> dict:
         started_at = perf_counter()
         if not image_bytes:
-            raise HTTPException(status_code=400, detail="빈 이미지 요청입니다.")
+            raise HTTPException(status_code=400, detail="鍮??대?吏 ?붿껌?낅땲??")
 
         np_buffer = np.frombuffer(image_bytes, dtype=np.uint8)
         frame = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
         if frame is None:
-            raise HTTPException(status_code=400, detail="JPEG 이미지를 디코딩하지 못했습니다.")
+            raise HTTPException(status_code=400, detail="JPEG ?대?吏瑜??붿퐫?⑺븯吏 紐삵뻽?듬땲??")
 
         session = get_session(client_id)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -2069,6 +2670,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         )
         upload_hint = build_adaptive_upload_hint(latency_ms, risk.score, action_result.label)
         session.latest_meta["upload_hint"] = upload_hint
+        send_backend_event_if_needed(session, risk, action_result)
         if should_log_detection_event(
             session,
             risk.score,
@@ -2133,7 +2735,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 session.latest_meta = {}
             try:
                 transcript, audio_level = speech_recognizer.transcribe_wav_bytes(job.wav_bytes)
-                speech_status = "recognized" if transcript else "listening"
+                speech_status = "recognized" if transcript else str(speech_recognizer.last_provider or "listening")
                 tracked_people = session.latest_people or []
                 face_count = int((session.latest_meta or {}).get("face_count", 0))
                 risk = session.risk_analyzer.update(
@@ -2162,6 +2764,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "risk_context_flags": list(risk.context_flags),
                     }
                 )
+                send_backend_event_if_needed(session, risk, None)
                 if should_log_detection_event(session, risk.score, transcript, str(session.latest_meta.get("action_label", "normal"))):
                     write_detection_event_log(
                         {
@@ -2202,21 +2805,29 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
 def localize_speech_status(status: str) -> str:
     labels = {
-        "idle": "대기",
-        "listening": "듣는 중",
-        "recognized": "인식됨",
-        "error": "오류",
+        "idle": "idle",
+        "listening": "listening",
+        "recognized": "recognized",
+        "clova": "recognized",
+        "clova_empty": "CLOVA empty",
+        "clova_error": "CLOVA error",
+        "clova_missing_credentials": "CLOVA credentials missing",
+        "empty_audio": "empty audio",
+        "audio_too_short": "audio too short",
+        "audio_too_quiet": "audio too quiet",
+        "none": "STT unavailable",
+        "error": "error",
     }
     return labels.get(status, status)
 
 
 def localize_risk_level(level: str) -> str:
     labels = {
-        "LOW": "낮음",
-        "ELEVATED": "주의",
-        "MEDIUM": "경계",
-        "HIGH": "위험",
-        "CRITICAL": "긴급",
+        "LOW": "low",
+        "ELEVATED": "caution",
+        "MEDIUM": "warning",
+        "HIGH": "danger",
+        "CRITICAL": "critical",
     }
     return labels.get(level, level)
 
@@ -2233,14 +2844,21 @@ def main() -> None:
         app = create_app(args)
     except Exception as exc:
         raise RuntimeError(
-            "서버 시작 중 추론 장치 초기화에 실패했습니다.\n"
+            "?쒕쾭 ?쒖옉 以?異붾줎 ?μ튂 珥덇린?붿뿉 ?ㅽ뙣?덉뒿?덈떎.\n"
             f"{exc}\n\n"
-            "해결 방법:\n"
-            "1. Windows 데스크탑에서 CUDA 지원 PyTorch를 설치합니다.\n"
-            "2. 또는 임시로 --yolo-device cpu --stt-device cpu 로 실행합니다."
+            "?닿껐 諛⑸쾿:\n"
+            "1. Windows ?곗뒪?ы깙?먯꽌 CUDA 吏??PyTorch瑜??ㅼ튂?⑸땲??\n"
+            "2. ?먮뒗 ?꾩떆濡?--yolo-device cpu --stt-device cpu 濡??ㅽ뻾?⑸땲??"
         ) from exc
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
