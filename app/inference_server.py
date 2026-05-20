@@ -71,6 +71,41 @@ class ServerSpeechResult:
 PAIRING_CODE_ALPHABET = string.ascii_uppercase + string.digits
 
 
+def env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+def load_local_env_files() -> list[str]:
+    loaded: list[str] = []
+    env_paths = [
+        Path(".env"),
+        Path("clova.env"),
+        Path("training_data") / "action_pipeline_aihub" / "clova.env",
+    ]
+    for env_path in env_paths:
+        if not env_path.exists():
+            continue
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().lstrip("\ufeff")
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        loaded.append(str(env_path))
+    return loaded
+
+
 def generate_pairing_code(length: int = 6) -> str:
     return "".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(length))
 
@@ -922,13 +957,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--clova-client-id",
-        default=os.environ.get("NCLOUD_CLOVA_CLIENT_ID", ""),
-        help="Naver Cloud CLOVA CSR API key ID. Defaults to NCLOUD_CLOVA_CLIENT_ID.",
+        default=env_first("NCLOUD_CLOVA_CLIENT_ID", "CLOVA_CLIENT_ID", "CLOVA_API_KEY_ID"),
+        help="Naver Cloud CLOVA CSR API key ID. Defaults to NCLOUD_CLOVA_CLIENT_ID/CLOVA_CLIENT_ID.",
     )
     parser.add_argument(
         "--clova-client-secret",
-        default=os.environ.get("NCLOUD_CLOVA_CLIENT_SECRET", ""),
-        help="Naver Cloud CLOVA CSR API key. Defaults to NCLOUD_CLOVA_CLIENT_SECRET.",
+        default=env_first("NCLOUD_CLOVA_CLIENT_SECRET", "CLOVA_CLIENT_SECRET", "CLOVA_API_KEY"),
+        help="Naver Cloud CLOVA CSR API key. Defaults to NCLOUD_CLOVA_CLIENT_SECRET/CLOVA_CLIENT_SECRET.",
     )
     parser.add_argument(
         "--clova-timeout-seconds",
@@ -2369,6 +2404,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         snapshot["action_model_enabled"] = bool(action_recognizer.enabled)
         snapshot["action_model_status"] = action_recognizer.latest.status
         snapshot["action_model_reason"] = action_recognizer.latest.reason
+        snapshot["clova_credentials_configured"] = bool(speech_recognizer.clova.enabled)
         snapshot["app_backend_enabled"] = bool(
             str(getattr(args, "app_backend_base_url", "") or "").strip()
             and str(getattr(args, "app_backend_token", "") or "").strip()
@@ -2833,9 +2869,13 @@ def localize_risk_level(level: str) -> str:
 
 
 def main() -> None:
+    loaded_env_files = load_local_env_files()
     args = parse_args()
     print(f"[detectWarning] YOLO device: {args.yolo_device}")
     print(f"[detectWarning] STT provider: {args.stt_provider}")
+    if loaded_env_files:
+        print(f"[detectWarning] Loaded env files: {', '.join(loaded_env_files)}")
+    print(f"[detectWarning] CLOVA credentials configured: {bool(args.clova_client_id and args.clova_client_secret)}")
     if args.stt_provider != "clova":
         print(f"[detectWarning] Whisper device: {args.stt_device}")
         print(f"[detectWarning] Whisper compute type: {args.stt_compute_type}")

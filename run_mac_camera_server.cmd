@@ -47,6 +47,29 @@ echo [launcher] MacBook command example:
 echo python3 app/camera_uploader.py --source iphone --server-url http://WINDOWS_PC_IP:8001 --max-fps 12 --frame-width 840 --jpeg-quality 65 --stt --stt-phrase-seconds 2.0 --stt-silence-seconds 0.45 --stt-speech-level 0.004 --stt-min-peak-level 0.020 --select-audio-device
 echo [launcher] MacBook camera scan:
 echo python3 app/camera_uploader.py --list-video-devices --server-url http://WINDOWS_PC_IP:8001
+if exist "clova.env" (
+  echo [launcher] Loading CLOVA settings from clova.env
+  for /f "usebackq tokens=1,* delims==" %%A in ("clova.env") do (
+    if /I "%%A"=="NCLOUD_CLOVA_CLIENT_ID" set "NCLOUD_CLOVA_CLIENT_ID=%%B"
+    if /I "%%A"=="NCLOUD_CLOVA_CLIENT_SECRET" set "NCLOUD_CLOVA_CLIENT_SECRET=%%B"
+    if /I "%%A"=="CLOVA_CLIENT_ID" set "CLOVA_CLIENT_ID=%%B"
+    if /I "%%A"=="CLOVA_CLIENT_SECRET" set "CLOVA_CLIENT_SECRET=%%B"
+    if /I "%%A"=="CLOVA_API_KEY" set "CLOVA_API_KEY=%%B"
+  )
+)
+if "%NCLOUD_CLOVA_CLIENT_ID%"=="" if not "%CLOVA_CLIENT_ID%"=="" set NCLOUD_CLOVA_CLIENT_ID=%CLOVA_CLIENT_ID%
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" if not "%CLOVA_CLIENT_SECRET%"=="" set NCLOUD_CLOVA_CLIENT_SECRET=%CLOVA_CLIENT_SECRET%
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" if not "%CLOVA_API_KEY%"=="" set NCLOUD_CLOVA_CLIENT_SECRET=%CLOVA_API_KEY%
+if "%NCLOUD_CLOVA_CLIENT_ID%"=="" (
+  echo [launcher] CLOVA client id: MISSING
+) else (
+  echo [launcher] CLOVA client id: SET
+)
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" (
+  echo [launcher] CLOVA client secret: MISSING
+) else (
+  echo [launcher] CLOVA client secret: SET
+)
 echo [launcher] CLOVA STT only: set NCLOUD_CLOVA_CLIENT_ID and NCLOUD_CLOVA_CLIENT_SECRET before running this file.
 echo.
 

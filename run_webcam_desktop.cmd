@@ -41,6 +41,30 @@ if "%ACCEL_DEVICE%"=="cuda" (
 
 echo [launcher] Device: %ACCEL_DEVICE%
 
+if exist "clova.env" (
+  echo [launcher] Loading CLOVA settings from clova.env
+  for /f "usebackq tokens=1,* delims==" %%A in ("clova.env") do (
+    if /I "%%A"=="NCLOUD_CLOVA_CLIENT_ID" set "NCLOUD_CLOVA_CLIENT_ID=%%B"
+    if /I "%%A"=="NCLOUD_CLOVA_CLIENT_SECRET" set "NCLOUD_CLOVA_CLIENT_SECRET=%%B"
+    if /I "%%A"=="CLOVA_CLIENT_ID" set "CLOVA_CLIENT_ID=%%B"
+    if /I "%%A"=="CLOVA_CLIENT_SECRET" set "CLOVA_CLIENT_SECRET=%%B"
+    if /I "%%A"=="CLOVA_API_KEY" set "CLOVA_API_KEY=%%B"
+  )
+)
+if "%NCLOUD_CLOVA_CLIENT_ID%"=="" if not "%CLOVA_CLIENT_ID%"=="" set NCLOUD_CLOVA_CLIENT_ID=%CLOVA_CLIENT_ID%
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" if not "%CLOVA_CLIENT_SECRET%"=="" set NCLOUD_CLOVA_CLIENT_SECRET=%CLOVA_CLIENT_SECRET%
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" if not "%CLOVA_API_KEY%"=="" set NCLOUD_CLOVA_CLIENT_SECRET=%CLOVA_API_KEY%
+if "%NCLOUD_CLOVA_CLIENT_ID%"=="" (
+  echo [launcher] CLOVA client id: MISSING
+) else (
+  echo [launcher] CLOVA client id: SET
+)
+if "%NCLOUD_CLOVA_CLIENT_SECRET%"=="" (
+  echo [launcher] CLOVA client secret: MISSING
+) else (
+  echo [launcher] CLOVA client secret: SET
+)
+
 start "detectWarning inference server" cmd /k ""%PYTHON_EXE%" -X utf8 "app\inference_server.py" --host 127.0.0.1 --port 8001 --yolo-device %YOLO_DEVICE% --person-imgsz %PERSON_IMGSZ% --person-score-threshold %PERSON_SCORE% --person-detect-interval 2 --stt-provider clova --clova-timeout-seconds 2.0 --stt-model medium --stt-device %STT_DEVICE% --stt-compute-type %STT_COMPUTE_TYPE% --stt-beam-size 5 --stt-best-of 5 --stt-no-speech-threshold 0.45 --action-artifacts-dir "training_data\action_pipeline_aihub\artifacts" --action-rgb-model i3d_r50 --action-clip-seconds 4 --action-interval-seconds 2 --action-normal-threshold 0.78 --action-min-confidence 0.45 --action-collapse-static-motion-threshold 4 --action-collapse-static-abnormal-threshold 0.90"
 
 timeout /t 5 /nobreak >nul
