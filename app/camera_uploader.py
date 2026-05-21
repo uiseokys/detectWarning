@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import platform
 import queue
 import socket
 import subprocess
 import threading
-import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter, sleep
 
 import cv2
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default="0", help="웹캠 인덱스, 영상 파일 경로, 또는 iphone/continuity")
     parser.add_argument("--server-url", required=True, help="원격 추론 서버 주소. 예: http://100.x.x.x:8000")
     parser.add_argument("--client-id", default="", help="클라이언트 식별자. 비우면 자동 생성")
+    parser.add_argument(
+        "--client-id-file",
+        default="",
+        help="Path for persistent auto client_id. Defaults to ~/.detectwarning/camera_client_id.txt",
+    )
     parser.add_argument("--jpeg-quality", type=int, default=70, help="전송용 JPEG 품질")
     parser.add_argument("--max-fps", type=float, default=5.0, help="최대 전송 FPS")
     parser.add_argument("--frame-width", type=int, default=960, help="전송 전 프레임 가로 크기. 0이면 원본 유지")
@@ -94,7 +100,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-device-scan-limit", type=int, default=20, help="카메라 인덱스 탐색 범위. 기본 0~19")
     parser.add_argument("--stt-speech-level", type=float, default=0.004, help="음성 시작으로 볼 평균 오디오 레벨")
     parser.add_argument("--stt-min-peak-level", type=float, default=0.020, help="STT 전송을 허용할 최소 피크 레벨")
+    parser.add_argument("--stt-gain", type=float, default=3.0, help="STT 전송 전 마이크 음량 증폭 배율")
+    parser.add_argument("--stt-auto-gain-target", type=float, default=0.08, help="STT 전송 전 RMS 자동 증폭 목표값")
     return parser.parse_args()
+
+
+def clamp_upload_hint(
+    hinted_fps: float,
+    hinted_width: int,
+    configured_max_fps: float,
+    configured_frame_width: int,
+) -> tuple[float, int]:
+    max_fps = max(float(configured_max_fps or 0.1), 0.1)
+    fps = max(0.5, min(max_fps, float(hinted_fps or max_fps)))
+    configured_width = int(configured_frame_width or 0)
+    if configured_width <= 0:
+        return fps, int(hinted_width or 0)
+    width = max(480, min(configured_width, int(hinted_width or configured_width)))
+    return fps, width
 
 
 def _probe_camera(index: int, backend=None, backend_name: str = "default") -> OpenAttempt:
@@ -239,11 +262,46 @@ def build_read_error(source: str) -> str:
     return "\n".join(details)
 
 
-def build_client_id(client_id: str) -> str:
+def build_client_id(client_id: str, source: str = "", host: str | None = None) -> str:
     if client_id.strip():
         return client_id.strip()
-    host = socket.gethostname().replace(" ", "-")
-    return f"{host}-{uuid.uuid4().hex[:6]}"
+    raw_host = str(host if host is not None else socket.gethostname()).strip() or "camera"
+    safe_host = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw_host)[:32].strip("-")
+    safe_host = safe_host or "camera"
+    source_key = str(source or "0").strip().lower() or "0"
+    source_digest = hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:6]
+    return f"{safe_host}-{source_digest}"
+
+
+def default_client_id_file() -> Path:
+    return Path.home() / ".detectwarning" / "camera_client_id.txt"
+
+
+def load_or_create_client_id(
+    client_id: str,
+    source: str = "",
+    host: str | None = None,
+    client_id_file: str | Path | None = None,
+) -> str:
+    explicit = str(client_id or "").strip()
+    if explicit:
+        return explicit
+
+    path = Path(client_id_file).expanduser() if client_id_file else default_client_id_file()
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if len(existing) >= 3:
+            return existing
+    except OSError:
+        pass
+
+    generated = build_client_id("", source=source, host=host)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(generated + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return generated
 
 
 def resize_frame_for_upload(frame, target_width: int):
@@ -269,6 +327,8 @@ class AudioStreamer:
         silence_seconds: float,
         speech_level: float = 0.004,
         min_peak_level: float = 0.020,
+        gain: float = 3.0,
+        auto_gain_target: float = 0.08,
         sample_rate: int = 16000,
     ) -> None:
         self.session = session
@@ -280,10 +340,12 @@ class AudioStreamer:
         self.silence_seconds = silence_seconds
         self.speech_level = speech_level
         self.min_peak_level = min_peak_level
+        self.gain = max(float(gain), 1.0)
+        self.auto_gain_target = max(float(auto_gain_target), 0.0)
         self.sample_rate = sample_rate
         self._stop_event = threading.Event()
         self._thread = None
-        self._send_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+        self._send_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=6)
         self._sender_thread = None
 
     def start(self) -> None:
@@ -378,7 +440,7 @@ class AudioStreamer:
                         pre_roll.clear()
                         continue
 
-                    wav_bytes = self._to_wav_bytes(bytes(buffer))
+                    wav_bytes = self._to_wav_bytes(self._amplify_pcm(bytes(buffer)))
                     buffer.clear()
                     active_levels.clear()
                     speech_started_at = None
@@ -387,6 +449,20 @@ class AudioStreamer:
                     self._queue_latest_audio(wav_bytes)
         except Exception as exc:
             print(f"\n오디오 캡처 실패: {exc}")
+
+    def _amplify_pcm(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes:
+            return pcm_bytes
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        if audio.size == 0:
+            return pcm_bytes
+        rms = float(np.sqrt(np.mean(np.square(audio / 32768.0))))
+        auto_gain = 1.0
+        if self.auto_gain_target > 0.0 and rms > 1e-5:
+            auto_gain = min(self.auto_gain_target / rms, 8.0)
+        gain = min(max(self.gain, auto_gain), 10.0)
+        amplified = np.clip(audio * gain, -32768, 32767).astype(np.int16)
+        return amplified.tobytes()
 
     def _to_wav_bytes(self, pcm_bytes: bytes) -> bytes:
         output = io.BytesIO()
@@ -414,16 +490,31 @@ class AudioStreamer:
             )
 
     def _queue_latest_audio(self, wav_bytes: bytes) -> None:
+        try:
+            self._send_queue.put_nowait(wav_bytes)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._send_queue.get_nowait()
+            self._send_queue.task_done()
+        except queue.Empty:
+            pass
+        try:
+            self._send_queue.put_nowait(wav_bytes)
+        except queue.Full:
+            try:
+                self._send_queue.put(wav_bytes, timeout=0.2)
+            except queue.Full:
+                pass
+
+    def _discard_pending_audio(self) -> None:
         while True:
             try:
                 self._send_queue.get_nowait()
                 self._send_queue.task_done()
             except queue.Empty:
                 break
-        try:
-            self._send_queue.put_nowait(wav_bytes)
-        except queue.Full:
-            pass
 
     def _send_worker(self) -> None:
         while not self._stop_event.is_set():
@@ -480,7 +571,7 @@ def main() -> None:
     if not capture.isOpened():
         raise RuntimeError(build_open_error(args.source))
 
-    client_id = build_client_id(args.client_id)
+    client_id = load_or_create_client_id(args.client_id, source=args.source, client_id_file=args.client_id_file)
     interval = 1.0 / max(args.max_fps, 0.1)
     dynamic_interval = interval
     dynamic_frame_width = int(args.frame_width)
@@ -511,6 +602,8 @@ def main() -> None:
             silence_seconds=args.stt_silence_seconds,
             speech_level=args.stt_speech_level,
             min_peak_level=args.stt_min_peak_level,
+            gain=args.stt_gain,
+            auto_gain_target=args.stt_auto_gain_target,
         )
         audio_streamer.start()
 
@@ -570,10 +663,15 @@ def main() -> None:
                 if isinstance(upload_hint, dict):
                     hinted_fps = float(upload_hint.get("max_fps") or args.max_fps)
                     hinted_width = int(upload_hint.get("frame_width") or args.frame_width)
-                    hinted_fps = max(0.5, min(12.0, hinted_fps))
+                    hinted_fps, hinted_width = clamp_upload_hint(
+                        hinted_fps,
+                        hinted_width,
+                        configured_max_fps=args.max_fps,
+                        configured_frame_width=args.frame_width,
+                    )
                     dynamic_interval = 1.0 / max(hinted_fps, 0.1)
                     if args.frame_width > 0:
-                        dynamic_frame_width = max(480, min(int(args.frame_width), hinted_width))
+                        dynamic_frame_width = hinted_width
                 print(
                     f"\rupload ok | people {payload.get('people_count', len(payload.get('tracked_people', [])))} | "
                     f"latency {payload.get('latency_ms', 0)}ms | "

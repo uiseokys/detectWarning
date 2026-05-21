@@ -9,6 +9,9 @@ from pathlib import Path
 from time import monotonic
 
 
+SUPPORTED_ACTION_LABELS = {"violence", "collapse", "loitering"}
+
+
 @dataclass(frozen=True)
 class CategoryRule:
     code: str
@@ -29,6 +32,9 @@ class RiskAssessment:
     audio_score: int = 0
     fusion_score: int = 0
     raw_score: int = 0
+    video_only_score: int = 0
+    audio_video_gain: int = 0
+    audio_confirmed_class: str = ""
     speech_match_quality: str = ""
 
 
@@ -1532,6 +1538,7 @@ class RiskAnalyzer:
         audio_component_score = 0.0
         video_component_score = 0.0
         fusion_bonus_score = 0.0
+        audio_confirmed_class = ""
         reasons: list[str] = []
         matched_keywords: list[str] = []
         categories: list[str] = []
@@ -1573,10 +1580,14 @@ class RiskAnalyzer:
 
         has_people = len(tracked_people) > 0
         if action_result is not None and bool(getattr(action_result, "available", False)):
-            action_label = str(getattr(action_result, "label", "") or "")
+            raw_action_label = str(getattr(action_result, "label", "") or "").lower()
+            action_label = raw_action_label if raw_action_label in SUPPORTED_ACTION_LABELS else raw_action_label
+            if raw_action_label and raw_action_label not in SUPPORTED_ACTION_LABELS | {"normal", "unknown", "abnormal"}:
+                action_label = "abnormal"
+                context_flags.append(f"AI:unsupported_action:{raw_action_label}")
             action_confidence = float(getattr(action_result, "confidence", 0.0) or 0.0)
             abnormal_score = float(getattr(action_result, "abnormal_score", 0.0) or 0.0)
-            if action_label and action_label != "normal":
+            if action_label in SUPPORTED_ACTION_LABELS:
                 action_score = 24.0 + min(action_confidence, 1.0) * 26.0 + min(abnormal_score, 1.0) * 18.0
                 if not has_people and not active_text_codes:
                     if abnormal_score < 0.92 or action_confidence < 0.65:
@@ -1597,11 +1608,41 @@ class RiskAnalyzer:
                 if recent_same_actions:
                     action_score += min(10.0, max(recent_same_actions) * 0.15)
                     context_flags.append(f"AI:stable:{action_label}")
+                if (
+                    not has_people
+                    and len(recent_same_actions) >= 2
+                    and abnormal_score >= 0.90
+                    and action_confidence >= 0.70
+                ):
+                    action_score = max(action_score, 45.0)
+                    context_flags.append(f"AI:stable_no_person_warning:{action_label}")
                 score += action_score
                 video_component_score += action_score
                 categories.append(f"action:{action_label}")
                 reasons.append(f"action:{action_label}")
                 context_flags.append(f"AI:{action_label}:{action_confidence:.2f}")
+
+                audio_confirms_action = (
+                    active_text_codes
+                    or audio_component_score >= 20
+                    or recent_audio_level >= 0.16
+                )
+                if audio_confirms_action and action_score >= 25:
+                    class_audio_bonus = {
+                        "violence": 18.0,
+                        "collapse": 14.0,
+                        "loitering": 10.0,
+                    }.get(action_label, 10.0)
+                    if not active_text_codes and audio_component_score < 20:
+                        class_audio_bonus = min(class_audio_bonus, 8.0)
+                    if action_label == "violence" and recent_audio_level >= 0.10:
+                        class_audio_bonus += 4.0
+                    score += class_audio_bonus
+                    fusion_bonus_score += class_audio_bonus
+                    audio_confirmed_class = action_label
+                    categories.append(f"audio_confirmed:{action_label}")
+                    reasons.append(f"audio_confirmed:{action_label}")
+                    context_flags.append(f"audio+action:{action_label}")
             elif abnormal_score >= 0.5:
                 action_score = min(abnormal_score, 1.0) * 18.0
                 score += action_score
@@ -1644,6 +1685,8 @@ class RiskAnalyzer:
 
         raw_score = min(int(round(score)), 100)
         score = self._apply_risk_hysteresis(now, raw_score)
+        video_only_score = min(int(round(video_component_score)), 100)
+        audio_video_gain = max(0, raw_score - video_only_score)
         return RiskAssessment(
             score=score,
             level=self._score_to_level(score),
@@ -1655,6 +1698,9 @@ class RiskAnalyzer:
             audio_score=min(int(round(audio_component_score)), 100),
             fusion_score=score,
             raw_score=raw_score,
+            video_only_score=video_only_score,
+            audio_video_gain=audio_video_gain,
+            audio_confirmed_class=audio_confirmed_class,
             speech_match_quality=self._last_match_quality if active_text_codes else "",
         )
 

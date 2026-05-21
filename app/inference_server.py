@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import os
@@ -12,11 +14,14 @@ import socket
 import string
 import subprocess
 import threading
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
+from types import SimpleNamespace
+from urllib.parse import quote
 import wave
 
 import cv2
@@ -41,6 +46,7 @@ except Exception:
 
 @dataclass
 class ClientSession:
+    client_id: str
     tracker: PersonTracker
     person_filter: PersonPresenceFilter
     risk_analyzer: RiskAnalyzer
@@ -69,6 +75,7 @@ class ServerSpeechResult:
 
 
 PAIRING_CODE_ALPHABET = string.ascii_uppercase + string.digits
+SUPPORTED_ACTION_LABELS = {"violence", "collapse", "loitering"}
 
 
 def env_first(*names: str, default: str = "") -> str:
@@ -106,12 +113,25 @@ def load_local_env_files() -> list[str]:
     return loaded
 
 
-def generate_pairing_code(length: int = 6) -> str:
-    return "".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(length))
+def generate_server_instance_id(host: str | None = None, node: int | None = None) -> str:
+    raw_host = str(host if host is not None else socket.gethostname()).strip().lower()
+    raw_node = str(node if node is not None else uuid.getnode()).strip()
+    seed = f"{raw_host}:{raw_node}".encode("utf-8")
+    return hashlib.sha1(seed).hexdigest()[:32]
 
 
-def normalize_pairing_code(code: object) -> str:
+def normalize_connection_code(code: object) -> str:
     return "".join(ch for ch in str(code or "").upper() if ch.isalnum())[:12]
+
+
+def sanitize_client_id(value: object) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(value or "").strip())[:48]
+    return safe if len(safe) >= 3 else f"client-{secrets.token_hex(3).upper()}"
+
+
+def build_client_cctv_code(server_code: str, client_id: str) -> str:
+    seed = f"{normalize_connection_code(server_code)[:12]}:{sanitize_client_id(client_id)}".encode("utf-8")
+    return base64.b32encode(hashlib.sha1(seed).digest()).decode("ascii").rstrip("=")[:6]
 
 
 def build_server_identity_path() -> Path:
@@ -139,28 +159,20 @@ def save_server_identity(payload: dict, path: Path | None = None) -> None:
     temp_path.replace(identity_path)
 
 
-def save_server_pairing_code(code: str, path: Path | None = None) -> None:
-    identity_path = path or build_server_identity_path()
-    payload = load_server_identity(identity_path)
-    payload["pairing_code"] = normalize_pairing_code(code)[:6]
-    save_server_identity(payload, identity_path)
-
-
 def load_or_create_server_identity(path: Path | None = None) -> dict:
     identity_path = path or build_server_identity_path()
     payload = load_server_identity(identity_path)
-    code = normalize_pairing_code(payload.get("pairing_code"))[:6]
-    if len(code) != 6:
-        code = generate_pairing_code()
-        payload["pairing_code"] = code
+    payload.pop("pairing_code", None)
+    server_instance_id = str(payload.get("server_instance_id") or "").strip()
+    if len(server_instance_id) < 16:
+        server_instance_id = generate_server_instance_id()
+        payload["server_instance_id"] = server_instance_id
     if not isinstance(payload.get("cctv"), dict):
         payload["cctv"] = {}
+    if not isinstance(payload.get("camera_cctvs"), dict):
+        payload["camera_cctvs"] = {}
     save_server_identity(payload, identity_path)
     return payload
-
-
-def load_or_create_server_pairing_code(path: Path | None = None) -> str:
-    return str(load_or_create_server_identity(path).get("pairing_code", ""))
 
 
 def save_server_cctv_settings(settings: dict, path: Path | None = None) -> None:
@@ -510,21 +522,9 @@ def normalize_language(language: str) -> str:
 
 
 def enqueue_latest_audio_job(audio_job_queue: queue.Queue, job: AudioJob) -> bool:
-    """Keep speech responsive by preferring the newest audio chunk per client."""
+    """Queue speech chunks in order, dropping only the oldest chunk when overloaded."""
     try:
         with audio_job_queue.mutex:
-            retained = [
-                queued_job
-                for queued_job in audio_job_queue.queue
-                if getattr(queued_job, "client_id", None) != job.client_id
-            ]
-            dropped_count = len(audio_job_queue.queue) - len(retained)
-            audio_job_queue.queue.clear()
-            audio_job_queue.queue.extend(retained)
-            audio_job_queue.unfinished_tasks = max(
-                0,
-                audio_job_queue.unfinished_tasks - dropped_count,
-            )
             if audio_job_queue._qsize() >= audio_job_queue.maxsize:
                 audio_job_queue._get()
                 audio_job_queue.unfinished_tasks = max(0, audio_job_queue.unfinished_tasks - 1)
@@ -590,7 +590,7 @@ def detection_event_is_risk(event: dict) -> bool:
     level = str(event.get("risk_level", event.get("riskLevel", "")) or "").upper()
     action_label = str(event.get("action_label", "") or "").lower()
     categories = event.get("risk_categories", []) or []
-    if action_label and action_label not in {"normal", "unknown"}:
+    if action_label in SUPPORTED_ACTION_LABELS:
         return True
     if level in {"ELEVATED", "MEDIUM", "HIGH", "CRITICAL", "WARNING", "DANGER"}:
         return True
@@ -601,7 +601,7 @@ def detection_event_class(event: dict) -> str:
     action_label = str(event.get("action_label", "") or "").lower()
     if action_label == "collapse":
         return "fall"
-    if action_label and action_label not in {"normal", "unknown"}:
+    if action_label in SUPPORTED_ACTION_LABELS:
         return action_label
     categories = event.get("risk_categories", []) or []
     if isinstance(categories, list):
@@ -613,8 +613,6 @@ def detection_event_class(event: dict) -> str:
                 return "violence"
             if "loiter" in text:
                 return "loitering"
-            if "abduction" in text:
-                return "abduction"
     source = str(event.get("source", "") or "").lower()
     if source == "audio":
         return "audio_risk"
@@ -631,11 +629,92 @@ def detection_stats_points(counter: Counter) -> list[dict]:
     ]
 
 
+def event_int(event: dict, *names: str, default: int = 0) -> int:
+    for name in names:
+        if name in event:
+            try:
+                return int(event.get(name) or 0)
+            except Exception:
+                return default
+    return default
+
+
+def event_bool(event: dict, *names: str) -> bool:
+    for name in names:
+        value = event.get(name)
+        if isinstance(value, bool):
+            return value
+        if str(value).strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def build_detection_effect_summary(events: list[dict]) -> dict:
+    total = len(events)
+    if total <= 0:
+        return {
+            "totalEvents": 0,
+            "audioLiftedEvents": 0,
+            "audioOnlySuspicionEvents": 0,
+            "videoOnlyDangerEvents": 0,
+            "averageVideoOnlyScore": 0.0,
+            "averageRiskScore": 0.0,
+            "averageAudioVideoGain": 0.0,
+            "maxAudioVideoGain": 0,
+            "stageCounts": {},
+            "audioLiftRate": 0.0,
+        }
+
+    stage_counts: Counter = Counter()
+    audio_lifted = 0
+    audio_only_suspicion = 0
+    video_only_danger = 0
+    total_video_only = 0
+    total_risk = 0
+    total_gain = 0
+    max_gain = 0
+
+    for event in events:
+        stage = str(event.get("risk_stage", event.get("riskStage", "")) or "")
+        signal_source = str(event.get("risk_signal_source", event.get("riskSignalSource", "")) or "")
+        gain = event_int(event, "risk_audio_video_gain", "audioVideoGain")
+        video_only = event_int(event, "risk_video_only_score", "videoOnlyScore", "risk_video_score", "videoScore")
+        score = event_int(event, "risk_score", "riskScore")
+        lifted = event_bool(event, "risk_audio_lifted", "audioLiftedRisk") or gain > 0
+
+        if stage:
+            stage_counts[stage] += 1
+        if lifted:
+            audio_lifted += 1
+        if stage == "위험 의심" and signal_source == "audio":
+            audio_only_suspicion += 1
+        if stage == "위험" and signal_source == "video":
+            video_only_danger += 1
+        total_video_only += video_only
+        total_risk += score
+        total_gain += gain
+        max_gain = max(max_gain, gain)
+
+    return {
+        "totalEvents": total,
+        "audioLiftedEvents": audio_lifted,
+        "audioOnlySuspicionEvents": audio_only_suspicion,
+        "videoOnlyDangerEvents": video_only_danger,
+        "averageVideoOnlyScore": round(total_video_only / total, 1),
+        "averageRiskScore": round(total_risk / total, 1),
+        "averageAudioVideoGain": round(total_gain / total, 1),
+        "maxAudioVideoGain": max_gain,
+        "stageCounts": dict(stage_counts),
+        "audioLiftRate": round(audio_lifted / total * 100.0, 1),
+    }
+
+
 def build_detection_stats(client_id: str = "") -> dict:
     by_day = Counter()
     by_week = Counter()
     by_month = Counter()
     by_class = Counter()
+    risk_events: list[dict] = []
     target_client_id = str(client_id or "").strip()
     path = build_realtime_event_log_path()
     if path.exists():
@@ -657,6 +736,7 @@ def build_detection_stats(client_id: str = "") -> dict:
                     by_week[occurred_at.strftime("%G-W%V")] += 1
                     by_month[occurred_at.strftime("%Y-%m")] += 1
                     by_class[detection_event_class(event)] += 1
+                    risk_events.append(event)
         except Exception:
             pass
     return {
@@ -664,6 +744,7 @@ def build_detection_stats(client_id: str = "") -> dict:
         "weekly": detection_stats_points(by_week),
         "monthly": detection_stats_points(by_month),
         "byClass": dict(by_class),
+        "voiceLift": build_detection_effect_summary(risk_events),
         "source": "detectWarning",
     }
 
@@ -674,6 +755,29 @@ def build_app_backend_url(base_url: str, path: str) -> str:
     if not suffix.startswith("/"):
         suffix = "/" + suffix
     return base + suffix
+
+
+def build_client_frame_url(public_base_url: str, client_id: str) -> str:
+    base = str(public_base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    safe_client_id = quote(sanitize_client_id(client_id), safe="")
+    return f"{base}/api/client/{safe_client_id}/frame.jpg"
+
+
+def infer_public_base_url(args) -> str:
+    configured = env_first("INFERENCE_PUBLIC_BASE_URL", "DETECTWARNING_PUBLIC_BASE_URL", default="")
+    if configured:
+        return configured.strip().rstrip("/")
+    explicit = str(getattr(args, "public_base_url", "") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    host = str(getattr(args, "host", "") or "").strip()
+    port = int(getattr(args, "port", 8001) or 8001)
+    if host and host not in {"0.0.0.0", "::", "127.0.0.1", "localhost"}:
+        return f"http://{host}:{port}"
+    hostname = socket.gethostname().strip()
+    return f"http://{hostname}:{port}" if hostname else ""
 
 
 def post_app_backend_json(args, path: str, payload: dict) -> bool:
@@ -711,13 +815,10 @@ def post_app_backend_json_async(args, path: str, payload: dict) -> None:
 
 
 def map_backend_risk_level(level: str, score: int) -> str:
-    normalized = str(level or "").upper()
-    if normalized in {"CRITICAL", "HIGH"} or score >= 75:
+    if score >= 75:
         return "danger"
-    if normalized == "MEDIUM" or score >= 45:
+    if score >= 45:
         return "warning"
-    if normalized == "ELEVATED" or score >= 20:
-        return "caution"
     return "normal"
 
 
@@ -729,10 +830,8 @@ def map_backend_risk_class(action_label: str, categories: list[str], audio_risk:
         return "violence"
     if label == "loitering":
         return "loitering"
-    if label == "abduction":
-        return "abduction"
     if label and label not in {"normal", "unknown"}:
-        return label
+        return "abnormal"
     if audio_risk:
         return "audio_risk"
     for category in categories or []:
@@ -744,17 +843,220 @@ def map_backend_risk_class(action_label: str, categories: list[str], audio_risk:
     return "abnormal"
 
 
-def build_backend_video_reason(risk, action_result) -> str:
+def classify_user_risk_category(text: str) -> str | None:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return None
+
+    collapse_tokens = (
+        "collapse",
+        "fall",
+        "fallen",
+        "lying",
+        "쓰러",
+        "넘어",
+        "실신",
+        "기절",
+        "장시간",
+    )
+    violence_tokens = (
+        "violence",
+        "fight",
+        "assault",
+        "hit",
+        "punch",
+        "kick",
+        "폭행",
+        "폭력",
+        "몸싸움",
+        "밀치",
+        "위협",
+    )
+    loitering_tokens = (
+        "loitering",
+        "intrusion",
+        "wander",
+        "배회",
+        "침입",
+        "서성",
+        "주변을 맴",
+    )
+    audio_tokens = (
+        "audio",
+        "speech",
+        "voice",
+        "clova",
+        "matched",
+        "발화",
+        "음성",
+        "비명",
+        "도와",
+        "살려",
+        "구해",
+    )
+
+    if any(token in normalized for token in collapse_tokens):
+        return "쓰러짐 의심"
+    if any(token in normalized for token in violence_tokens):
+        return "폭력/몸싸움 의심"
+    if any(token in normalized for token in loitering_tokens):
+        return "배회/침입 의심"
+    if any(token in normalized for token in audio_tokens):
+        return "위험 음성"
+    if normalized.startswith("action:abnormal") or normalized == "abnormal":
+        return "이상행동 의심"
+    return None
+
+
+def action_danger_category(label: str) -> str:
+    mapping = {
+        "violence": "폭력/몸싸움 위험",
+        "collapse": "쓰러짐 위험",
+        "loitering": "배회/침입 위험",
+    }
+    return mapping.get(str(label or "").lower(), "위험")
+
+
+def unique_limited(values: list[str], limit: int = 4) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def build_user_risk_presentation(risk, action_result=None) -> dict:
     action_label = str(getattr(action_result, "label", "") or "")
-    action_confidence = float(getattr(action_result, "confidence", 0.0) or 0.0)
-    reasons = []
-    if action_label and action_label not in {"normal", "unknown"}:
-        reasons.append(f"action:{action_label}:{action_confidence:.2f}")
-    for reason in list(getattr(risk, "categories", []) or []) + list(getattr(risk, "context_flags", []) or []):
-        reason_text = str(reason)
-        if reason_text and not reason_text.startswith("諛쒗솕") and "matched" not in reason_text.lower():
-            reasons.append(reason_text)
-    return ", ".join(list(dict.fromkeys(reasons))[:4]) or "risk metadata detected"
+    action_label = action_label if action_label in SUPPORTED_ACTION_LABELS else ""
+    score = int(getattr(risk, "score", 0) or 0)
+    audio_score = int(getattr(risk, "audio_score", 0) or 0)
+    video_score = int(getattr(risk, "video_score", 0) or 0)
+    audio_gain = int(getattr(risk, "audio_video_gain", 0) or 0)
+    audio_confirmed_class = str(getattr(risk, "audio_confirmed_class", "") or "")
+    match_quality = str(getattr(risk, "speech_match_quality", "") or "").lower()
+    raw_categories = [str(value) for value in getattr(risk, "categories", []) or []]
+    raw_context = [str(value) for value in getattr(risk, "context_flags", []) or []]
+
+    audio_risk = audio_score >= 20 or match_quality in {"weak", "medium", "strong", "critical"}
+    audio_suspicion = audio_score >= 45 or (
+        score >= 45 and match_quality in {"medium", "strong", "critical"}
+    )
+    has_loud_audio = any("loud" in value.lower() or "고성" in value or "큰 소리" in value for value in raw_context + raw_categories)
+    audio_lifted = audio_gain >= 10 or (audio_confirmed_class in SUPPORTED_ACTION_LABELS)
+
+    if action_label and (video_score >= 35 or score >= 45):
+        category = action_danger_category(action_label)
+        stage = "위험"
+        source = "audio_video" if audio_risk or audio_lifted else "video"
+        reasons = [f"영상에서 {category} 감지"]
+        if audio_risk or audio_lifted:
+            reasons.append("음성 신호로 위험 판단 강화")
+        return {
+            "stage": stage,
+            "signal_source": source,
+            "audio_lifted": bool(audio_risk or audio_lifted),
+            "categories": [category],
+            "reasons": unique_limited(reasons, limit=4),
+        }
+
+    if audio_suspicion and not action_label:
+        return {
+            "stage": "위험 의심",
+            "signal_source": "audio",
+            "audio_lifted": True,
+            "categories": ["음성 기반 위험 의심"],
+            "reasons": ["영상에서는 확정하지 못했지만 음성 위험 신호 감지"],
+        }
+
+    if score >= 20 or audio_score > 0 or has_loud_audio:
+        category = "큰 소리 감지" if audio_score > 0 or has_loud_audio else "불명확한 이상 신호"
+        return {
+            "stage": "주의",
+            "signal_source": "audio" if audio_score > 0 or has_loud_audio else "mixed",
+            "audio_lifted": False,
+            "categories": [category],
+            "reasons": ["위험으로 확정하기에는 부족한 신호 감지"],
+        }
+
+    raw_values: list[str] = []
+    if action_label in SUPPORTED_ACTION_LABELS:
+        raw_values.append(f"action:{action_label}")
+    raw_values.extend(str(value) for value in getattr(risk, "categories", []) or [])
+    raw_values.extend(str(value) for value in getattr(risk, "context_flags", []) or [])
+    raw_values.extend(str(value) for value in getattr(risk, "reasons", []) or [])
+    if is_audio_risk_signal_detected(risk):
+        raw_values.append("audio:risk")
+
+    categories = unique_limited(
+        [category for category in (classify_user_risk_category(value) for value in raw_values) if category],
+        limit=4,
+    )
+    if not categories and int(getattr(risk, "score", 0) or 0) >= 45:
+        categories = ["위험 신호"]
+
+    reasons: list[str] = []
+    for category in categories:
+        if category == "위험 음성":
+            reasons.append("음성에서 위험 신호 감지")
+        elif category == "위험 신호":
+            reasons.append("복합 위험 신호 감지")
+        else:
+            reasons.append(f"영상에서 {category}")
+    if int(getattr(risk, "audio_score", 0) or 0) > 0 and int(getattr(risk, "video_score", 0) or 0) > 0:
+        reasons.append("영상+음성 신호 동시 감지")
+
+    return {
+        "stage": "정상" if not categories else "주의",
+        "signal_source": "none" if not categories else "mixed",
+        "audio_lifted": False,
+        "categories": unique_limited(categories, limit=4),
+        "reasons": unique_limited(reasons, limit=4),
+    }
+
+
+def build_backend_video_reason(risk, action_result) -> str:
+    presentation = build_user_risk_presentation(risk, action_result)
+    reasons = presentation["reasons"] or presentation["categories"]
+    return ", ".join(reasons[:4]) or "위험 신호 감지"
+
+
+def build_backend_risk_evidence(risk, action_result, presentation: dict) -> list[dict]:
+    evidence: list[dict] = []
+    action_label = str(getattr(action_result, "label", "") or "")
+    if action_label in SUPPORTED_ACTION_LABELS:
+        evidence.append(
+            {
+                "source": "video",
+                "type": "action_class",
+                "label": action_danger_category(action_label),
+                "confidence": round(float(getattr(action_result, "confidence", 0.0) or 0.0), 4),
+            }
+        )
+    if bool(presentation.get("audio_lifted")) or int(getattr(risk, "audio_score", 0) or 0) >= 20:
+        evidence.append(
+            {
+                "source": "audio",
+                "type": "risk_signal",
+                "label": "음성 위험 신호",
+                "score": int(getattr(risk, "audio_score", 0) or 0),
+            }
+        )
+    if int(getattr(risk, "audio_video_gain", 0) or 0) > 0:
+        evidence.append(
+            {
+                "source": "fusion",
+                "type": "audio_video_gain",
+                "label": "음성 결합으로 위험도 상승",
+                "score": int(getattr(risk, "audio_video_gain", 0) or 0),
+            }
+        )
+    return evidence[:4]
 
 
 def build_backend_cctv_payload(
@@ -766,8 +1068,10 @@ def build_backend_cctv_payload(
     latest_risk_score: int = 0,
     stream_url: str | None = None,
     inference_stream_url: str | None = None,
+    client_id: str | None = None,
+    inference_source_url: str | None = None,
 ) -> dict:
-    code = normalize_pairing_code(cctv_code)[:6]
+    code = normalize_connection_code(cctv_code)[:6]
     return {
         "code": code,
         "name": str(name or f"detectWarning CCTV {code}"),
@@ -776,6 +1080,8 @@ def build_backend_cctv_payload(
         "latestRiskScore": int(max(0, min(100, latest_risk_score))),
         "streamUrl": stream_url or None,
         "inferenceStreamUrl": inference_stream_url or None,
+        "clientId": str(client_id or "") or None,
+        "inferenceSourceUrl": str(inference_source_url or "") or None,
     }
 
 
@@ -790,13 +1096,25 @@ def build_backend_event_payload(cctv_code: str, risk, action_result=None) -> dic
     action_label = str(getattr(action_result, "label", "") or "")
     audio_risk = is_audio_risk_signal_detected(risk)
     score = int(getattr(risk, "score", 0) or 0)
+    presentation = build_user_risk_presentation(risk, action_result)
     return {
-        "cctvCode": normalize_pairing_code(cctv_code)[:6],
+        "cctvCode": normalize_connection_code(cctv_code)[:6],
         "riskLevel": map_backend_risk_level(str(getattr(risk, "level", "") or ""), score),
         "riskClass": map_backend_risk_class(action_label, categories, audio_risk),
         "riskScore": score,
-        "videoReason": build_backend_video_reason(risk, action_result),
+        "videoReason": ", ".join((presentation["reasons"] or presentation["categories"])[:4]) or "위험 신호 감지",
         "audioRiskSignalDetected": bool(audio_risk),
+        "riskStage": str(presentation.get("stage") or "정상"),
+        "riskCategories": list(presentation.get("categories") or []),
+        "riskReasons": list(presentation.get("reasons") or []),
+        "riskSignalSource": str(presentation.get("signal_source") or "none"),
+        "audioLiftedRisk": bool(presentation.get("audio_lifted", False)),
+        "videoOnlyScore": int(getattr(risk, "video_only_score", getattr(risk, "video_score", 0)) or 0),
+        "videoScore": int(getattr(risk, "video_score", 0) or 0),
+        "audioScore": int(getattr(risk, "audio_score", 0) or 0),
+        "audioVideoGain": int(getattr(risk, "audio_video_gain", 0) or 0),
+        "audioConfirmedClass": str(getattr(risk, "audio_confirmed_class", "") or ""),
+        "riskEvidence": build_backend_risk_evidence(risk, action_result, presentation),
         "snapshotUrl": None,
         "clipUrl": None,
     }
@@ -805,21 +1123,22 @@ def build_backend_event_payload(cctv_code: str, risk, action_result=None) -> dic
 def should_send_backend_event(session: ClientSession, payload: dict) -> bool:
     score = int(payload.get("riskScore", 0) or 0)
     level = str(payload.get("riskLevel", "") or "")
-    if level == "normal" and score < 20:
+    if score < 45:
         return False
 
     now = monotonic()
     signature = "|".join(
         [
             level,
+            str(payload.get("riskStage", "")),
             str(payload.get("riskClass", "")),
             str(score // 10),
             str(bool(payload.get("audioRiskSignalDetected", False))),
         ]
     )
-    if signature == session.last_backend_event_signature and now - session.last_backend_event_at < 5.0:
+    if signature == session.last_backend_event_signature and now - session.last_backend_event_at < 10.0:
         return False
-    if now - session.last_backend_event_at < 2.0 and score < 75:
+    if now - session.last_backend_event_at < 4.0 and score < 75:
         return False
 
     session.last_backend_event_at = now
@@ -827,14 +1146,38 @@ def should_send_backend_event(session: ClientSession, payload: dict) -> bool:
     return True
 
 
-def build_adaptive_upload_hint(latency_ms: float, risk_score: int, action_label: str) -> dict:
-    if risk_score >= 45 or (action_label and action_label != "normal"):
-        return {"max_fps": 12.0, "frame_width": 840, "reason": "risk_active"}
+def build_adaptive_upload_hint(
+    latency_ms: float,
+    risk_score: int,
+    action_label: str,
+    active_client_count: int = 1,
+) -> dict:
+    active_clients = max(int(active_client_count or 1), 1)
+    risk_active = risk_score >= 45 or (action_label and action_label != "normal")
+    if latency_ms >= 1200:
+        width = 640 if active_clients >= 2 else 720
+        return {"max_fps": 3.0, "frame_width": width, "reason": "server_latency_overloaded"}
+    if active_clients >= 3:
+        if risk_active:
+            return {"max_fps": 12.0, "frame_width": 840, "reason": "risk_active_multi_camera"}
+        if latency_ms >= 700:
+            return {"max_fps": 4.0, "frame_width": 640, "reason": "server_latency_high_multi_camera"}
+        return {"max_fps": 8.0, "frame_width": 720, "reason": "balanced_multi_camera"}
+    if active_clients >= 2:
+        if risk_active:
+            return {"max_fps": 16.0, "frame_width": 960, "reason": "risk_active_multi_camera"}
+        if latency_ms >= 900:
+            return {"max_fps": 4.0, "frame_width": 720, "reason": "server_latency_high_multi_camera"}
+        if latency_ms >= 550:
+            return {"max_fps": 8.0, "frame_width": 840, "reason": "server_latency_medium_multi_camera"}
+        return {"max_fps": 14.0, "frame_width": 840, "reason": "balanced_multi_camera"}
+    if risk_active:
+        return {"max_fps": 24.0, "frame_width": 1120, "reason": "risk_active"}
     if latency_ms >= 900:
-        return {"max_fps": 3.0, "frame_width": 720, "reason": "server_latency_high"}
+        return {"max_fps": 5.0, "frame_width": 840, "reason": "server_latency_high"}
     if latency_ms >= 550:
-        return {"max_fps": 4.0, "frame_width": 840, "reason": "server_latency_medium"}
-    return {"max_fps": 12.0, "frame_width": 840, "reason": "balanced"}
+        return {"max_fps": 8.0, "frame_width": 960, "reason": "server_latency_medium"}
+    return {"max_fps": 20.0, "frame_width": 960, "reason": "balanced"}
 
 
 def draw_server_overlay(frame, client_id: str, faces, latency_ms: float, people_count: int) -> None:
@@ -915,6 +1258,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="?먭꺽 ?곸긽 異붾줎 ?쒕쾭瑜??ㅽ뻾?⑸땲??")
     parser.add_argument("--host", default="0.0.0.0", help="?쒕쾭 諛붿씤??二쇱냼")
     parser.add_argument("--port", type=int, default=8000, help="?쒕쾭 ?ы듃")
+    parser.add_argument(
+        "--public-base-url",
+        default=os.environ.get("INFERENCE_PUBLIC_BASE_URL", ""),
+        help="Public base URL for backend CCTV stream links. Example: http://DESKTOP-PHTP8KM:8001",
+    )
     parser.add_argument(
         "--person-score-threshold",
         type=float,
@@ -1165,10 +1513,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     )
     sessions: dict[str, ClientSession] = {}
     session_lock = threading.Lock()
-    pairing_lock = threading.Lock()
     cctv_settings_lock = threading.Lock()
     server_identity = load_or_create_server_identity()
-    pairing_code = str(server_identity.get("pairing_code", ""))
+    server_instance_id = str(server_identity.get("server_instance_id", ""))
+    public_base_url = infer_public_base_url(args)
     stored_cctv_settings = server_identity.get("cctv", {}) if isinstance(server_identity.get("cctv"), dict) else {}
     cctv_settings = {
         "name": str(args.app_backend_cctv_name or stored_cctv_settings.get("name") or ""),
@@ -1179,7 +1527,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             args.app_backend_inference_stream_url or stored_cctv_settings.get("inference_stream_url") or ""
         ),
     }
-    paired_clients: dict[str, dict] = {}
+    stored_camera_cctvs = (
+        server_identity.get("camera_cctvs", {}) if isinstance(server_identity.get("camera_cctvs"), dict) else {}
+    )
+    camera_cctv_settings: dict[str, dict] = {
+        sanitize_client_id(client_id): dict(settings)
+        for client_id, settings in stored_camera_cctvs.items()
+        if isinstance(settings, dict)
+    }
     audio_job_queue: queue.Queue[AudioJob] = queue.Queue(maxsize=32)
     system_monitor = SystemMonitor(args, audio_job_queue)
     system_monitor.start()
@@ -1193,6 +1548,25 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             ]
         return max(scores, default=0)
 
+    def active_client_count() -> int:
+        now = monotonic()
+        with session_lock:
+            return sum(1 for session in sessions.values() if now - session.last_seen <= args.client_session_ttl)
+
+    def multi_client_min_action_interval(count: int) -> float:
+        if count >= 3:
+            return 2.0
+        if count >= 2:
+            return 1.5
+        return 1.0
+
+    def multi_client_person_detect_interval(base_interval: int, count: int) -> int:
+        if count >= 3:
+            return max(base_interval, 3)
+        if count >= 2:
+            return max(base_interval, 2)
+        return max(base_interval, 1)
+
     def effective_cctv_status(configured_status: str) -> str:
         with session_lock:
             has_recent_frame = any(
@@ -1203,55 +1577,130 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             return "?ㅽ봽?쇱씤"
         return str(configured_status or "?뺤긽")
 
-    def current_cctv_settings() -> dict:
+    def effective_client_cctv_status(client_id: str, configured_status: str) -> str:
+        with session_lock:
+            session = sessions.get(client_id)
+            has_recent_frame = (
+                session is not None
+                and session.latest_frame_jpeg is not None
+                and monotonic() - session.last_seen <= args.client_session_ttl
+            )
+        if not has_recent_frame:
+            return "오프라인"
+        return str(configured_status or "정상")
+
+    def default_client_cctv_settings(client_id: str) -> dict:
         with cctv_settings_lock:
-            settings = dict(cctv_settings)
-        risk_score = latest_server_risk_score()
+            defaults = dict(cctv_settings)
+        display_id = sanitize_client_id(client_id)
+        base_name = str(defaults.get("name") or "detectWarning CCTV").strip()
+        return {
+            "name": f"{base_name} - {display_id}",
+            "location": str(defaults.get("location") or ""),
+            "status": str(defaults.get("status") or "정상"),
+            "stream_url": str(defaults.get("stream_url") or ""),
+            "inference_stream_url": str(defaults.get("inference_stream_url") or ""),
+        }
+
+    def persist_camera_cctv_settings() -> None:
+        with cctv_settings_lock:
+            server_settings = dict(cctv_settings)
+            camera_settings = {key: dict(value) for key, value in camera_cctv_settings.items()}
+        payload = load_or_create_server_identity()
+        payload["cctv"] = server_settings
+        payload["camera_cctvs"] = camera_settings
+        save_server_identity(payload)
+
+    def current_client_cctv_settings(client_id: str, latest_risk_score: int | None = None) -> dict:
+        safe_client_id = sanitize_client_id(client_id)
+        code = build_client_cctv_code(server_instance_id, safe_client_id)
+        settings = dict(default_client_cctv_settings(safe_client_id))
+        with cctv_settings_lock:
+            settings.update(dict(camera_cctv_settings.get(safe_client_id, {})))
+        risk_score = latest_server_risk_score() if latest_risk_score is None else int(latest_risk_score or 0)
+        inferred_frame_url = build_client_frame_url(public_base_url, safe_client_id)
+        inference_stream_url = str(settings.get("inference_stream_url") or inferred_frame_url or "")
+        stream_url = str(settings.get("stream_url") or inference_stream_url or "")
         payload = build_backend_cctv_payload(
-            pairing_code,
+            code,
             name=settings.get("name", ""),
             location=settings.get("location", ""),
-            status=effective_cctv_status(settings.get("status", "?뺤긽")),
+            status=effective_client_cctv_status(client_id, settings.get("status", "정상")),
             latest_risk_score=risk_score,
-            stream_url=settings.get("stream_url", ""),
-            inference_stream_url=settings.get("inference_stream_url", ""),
+            stream_url=stream_url,
+            inference_stream_url=inference_stream_url,
+            client_id=safe_client_id,
+            inference_source_url=public_base_url,
         )
         return {
             "code": payload["code"],
             "name": payload["name"],
             "location": payload["location"],
             "status": payload["status"],
+            "configuredStatus": str(settings.get("status", "정상") or "정상"),
             "latestRiskScore": payload["latestRiskScore"],
             "streamUrl": payload["streamUrl"],
             "inferenceStreamUrl": payload["inferenceStreamUrl"],
         }
 
-    def sync_cctv_code_with_backend(code: str) -> None:
-        with cctv_settings_lock:
-            current_settings = dict(cctv_settings)
+    def sync_client_cctv_with_backend(client_id: str, latest_risk_score: int | None = None) -> None:
+        cctv = current_client_cctv_settings(client_id, latest_risk_score=latest_risk_score)
         post_app_backend_json_async(
             args,
             args.app_backend_cctv_sync_path,
             build_backend_cctv_payload(
-                code,
-                name=current_settings.get("name", ""),
-                location=current_settings.get("location", ""),
-                status=effective_cctv_status(current_settings.get("status", "?뺤긽")),
-                latest_risk_score=latest_server_risk_score(),
-                stream_url=current_settings.get("stream_url", ""),
-                inference_stream_url=current_settings.get("inference_stream_url", ""),
+                cctv["code"],
+                name=cctv.get("name", ""),
+                location=cctv.get("location", ""),
+                status=cctv.get("status", "정상"),
+                latest_risk_score=int(cctv.get("latestRiskScore", 0) or 0),
+                stream_url=cctv.get("streamUrl", ""),
+                inference_stream_url=cctv.get("inferenceStreamUrl", ""),
+                client_id=client_id,
+                inference_source_url=public_base_url,
             ),
         )
 
+    def remember_client_cctv_meta(session: ClientSession, client_id: str, latest_risk_score: int | None = None) -> dict:
+        cctv = current_client_cctv_settings(client_id, latest_risk_score=latest_risk_score)
+        if session.latest_meta is None:
+            session.latest_meta = {}
+        session.latest_meta.update(
+            {
+                "cctv_code": cctv["code"],
+                "cctv_name": cctv["name"],
+                "cctv_location": cctv["location"],
+                "cctv_status": cctv["status"],
+            }
+        )
+        return cctv
+
+    def current_cctv_settings() -> dict:
+        with cctv_settings_lock:
+            settings = dict(cctv_settings)
+        risk_score = latest_server_risk_score()
+        return {
+            "code": "",
+            "name": str(settings.get("name", "") or ""),
+            "location": str(settings.get("location", "") or ""),
+            "status": effective_cctv_status(settings.get("status", "?뺤긽")),
+            "configuredStatus": str(settings.get("status", "정상") or "정상"),
+            "latestRiskScore": risk_score,
+            "streamUrl": str(settings.get("stream_url", "") or ""),
+            "inferenceStreamUrl": str(settings.get("inference_stream_url", "") or ""),
+        }
+
     def send_backend_event_if_needed(session: ClientSession, risk, action_result=None) -> None:
-        payload = build_backend_event_payload(pairing_code, risk, action_result)
+        cctv_code = str((session.latest_meta or {}).get("cctv_code") or "")
+        if not cctv_code and session.client_id:
+            cctv_code = build_client_cctv_code(server_instance_id, session.client_id)
+        payload = build_backend_event_payload(cctv_code, risk, action_result)
         if should_send_backend_event(session, payload):
             post_app_backend_json_async(args, args.app_backend_event_path, payload)
 
-    sync_cctv_code_with_backend(pairing_code)
-
     def get_session(client_id: str) -> ClientSession:
         now = monotonic()
+        created = False
         with session_lock:
             expired = [
                 key
@@ -1264,15 +1713,20 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             session = sessions.get(client_id)
             if session is None:
                 session = ClientSession(
+                    client_id=client_id,
                     tracker=PersonTracker(),
                     person_filter=PersonPresenceFilter(debug=args.person_debug),
                     risk_analyzer=RiskAnalyzer(),
                     last_seen=now,
                 )
                 sessions[client_id] = session
+                created = True
             else:
                 session.last_seen = now
-            return session
+        if created:
+            remember_client_cctv_meta(session, client_id)
+            sync_client_cctv_with_backend(client_id)
+        return session
 
     def list_client_summaries() -> list[dict]:
         with session_lock:
@@ -1293,6 +1747,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "risk_audio_score": int(meta.get("risk_audio_score", 0)),
                         "risk_video_score": int(meta.get("risk_video_score", 0)),
                         "risk_raw_score": int(meta.get("risk_raw_score", 0)),
+                        "risk_video_only_score": int(meta.get("risk_video_only_score", meta.get("risk_video_score", 0))),
+                        "risk_audio_video_gain": int(meta.get("risk_audio_video_gain", 0)),
+                        "risk_audio_confirmed_class": str(meta.get("risk_audio_confirmed_class", "")),
+                        "risk_stage": str(meta.get("risk_stage", "정상")),
+                        "risk_signal_source": str(meta.get("risk_signal_source", "none")),
+                        "risk_audio_lifted": bool(meta.get("risk_audio_lifted", False)),
                         "risk_level": str(meta.get("risk_level", "LOW")),
                         "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
                         "risk_categories": list(meta.get("risk_categories", [])),
@@ -1304,6 +1764,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "client_type": str(meta.get("client_type", "uploader")),
                         "device_name": str(meta.get("device_name", "")),
                         "paired": bool(meta.get("paired", False)),
+                        "cctv_code": str(meta.get("cctv_code", "")),
+                        "cctv_name": str(meta.get("cctv_name", "")),
+                        "cctv_status": str(meta.get("cctv_status", "")),
                         "has_frame": session.latest_frame_jpeg is not None,
                     }
                 )
@@ -1475,7 +1938,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
     .cctv-settings {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 112px auto;
       gap: 8px;
       align-items: center;
     }
@@ -1618,6 +2081,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     }
     .client-name {
       font-size: 15px;
+      font-weight: 700;
+      line-height: 1.45;
+      word-break: break-all;
+    }
+    .client-id-line {
+      color: var(--muted);
+      font-size: 11px;
       font-weight: 700;
       line-height: 1.45;
       word-break: break-all;
@@ -1776,6 +2246,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       border: 1px solid rgba(148, 163, 184, 0.14);
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
     }
+    .detail-card-wide {
+      grid-column: 1 / -1;
+    }
+    .client-cctv-settings {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 120px auto;
+    }
     .detail-label {
       margin-bottom: 10px;
       color: var(--muted);
@@ -1790,6 +2266,20 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       font-weight: 700;
       line-height: 1.65;
       word-break: keep-all;
+    }
+    .gain-bar {
+      height: 9px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.18);
+      margin-top: 10px;
+    }
+    .gain-bar-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent), var(--success));
+      transition: width 220ms ease;
     }
     .screen-shell {
       padding: 16px;
@@ -1913,6 +2403,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       .system-card-wide {
         grid-column: auto;
       }
+      .cctv-settings {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -1948,16 +2441,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         <div class="system-value" id="desktopRuntime">-</div>
       </article>
       <article class="system-card">
-        <div class="system-title">iOS Pair Code</div>
-        <div class="system-value" id="pairingCode">------</div>
-      </article>
-      <article class="system-card system-card-wide">
-        <div class="system-title">CCTV Name</div>
-        <div class="cctv-settings">
-          <input class="cctv-input" id="cctvNameInput" maxlength="80" placeholder="detectWarning CCTV" />
-          <button class="cctv-button" id="cctvNameSave" type="button">Save</button>
-          <div class="cctv-status" id="cctvNameStatus"></div>
-        </div>
+        <div class="system-title">Camera Codes</div>
+        <div class="system-value" id="cameraCodes">카메라별 코드 사용</div>
       </article>
     </section>
 
@@ -2016,6 +2501,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
               <div class="metric-value status-pill tone-neutral" id="riskLevel">0/100 | 낮음</div>
             </article>
             <article class="metric-card">
+              <div class="metric-label">판단 단계</div>
+              <div class="metric-value status-pill tone-neutral" id="riskStage">정상</div>
+            </article>
+            <article class="metric-card">
               <div class="metric-label">Video-only</div>
               <div class="metric-value metric-compact" id="riskVideoScore">0/100</div>
             </article>
@@ -2028,6 +2517,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
               <div class="metric-value metric-compact" id="riskRawScore">0/100</div>
             </article>
             <article class="metric-card">
+              <div class="metric-label">Audio gain</div>
+              <div class="metric-value metric-compact" id="riskAudioVideoGain">+0</div>
+            </article>
+            <article class="metric-card">
               <div class="metric-label">Action AI</div>
               <div class="metric-value status-pill tone-neutral" id="actionLabel">-</div>
             </article>
@@ -2038,6 +2531,20 @@ def create_app(args: argparse.Namespace) -> FastAPI:
           </section>
 
           <section class="detail-grid">
+            <article class="detail-card detail-card-wide">
+              <div class="detail-label">선택 카메라 CCTV</div>
+              <div class="detail-value" id="clientCctvCode">-</div>
+              <div class="cctv-settings client-cctv-settings">
+                <input class="cctv-input" id="clientCctvNameInput" maxlength="80" placeholder="카메라별 CCTV 이름" />
+                <input class="cctv-input" id="clientCctvLocationInput" maxlength="160" placeholder="설치 위치" />
+                <select class="cctv-input" id="clientCctvStatusInput">
+                  <option value="정상">정상</option>
+                  <option value="오프라인">오프라인</option>
+                </select>
+                <button class="cctv-button" id="clientCctvSave" type="button">Save</button>
+                <div class="cctv-status" id="clientCctvStatus"></div>
+              </div>
+            </article>
             <article class="detail-card">
               <div class="detail-label">인식 내용</div>
               <div class="detail-value" id="transcript">-</div>
@@ -2049,6 +2556,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <article class="detail-card">
               <div class="detail-label">위험 신호</div>
               <div class="detail-value" id="riskReasons">없음</div>
+            </article>
+            <article class="detail-card">
+              <div class="detail-label">음성 기여 요약</div>
+              <div class="detail-value" id="voiceLiftSummary">기록 없음</div>
+              <div class="gain-bar"><div class="gain-bar-fill" id="voiceLiftBar"></div></div>
             </article>
             <article class="detail-card">
               <div class="detail-label">Speech match</div>
@@ -2079,7 +2591,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
   </div>
   <script>
     let selectedClientId = null;
-    let lastCctvSettings = null;
+    let lastClientCctvSettings = null;
 
     function escapeHtml(value) {
       return String(value ?? '')
@@ -2133,43 +2645,63 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       document.getElementById('screen').innerHTML = screenPlaceholder(title, copy);
     }
 
-    function setCctvNameStatus(message, tone = 'neutral') {
-      const status = document.getElementById('cctvNameStatus');
+    function setClientCctvStatus(message, tone = 'neutral') {
+      const status = document.getElementById('clientCctvStatus');
       if (!status) return;
       status.textContent = message || '';
       status.style.color = tone === 'error' ? '#dc2626' : (tone === 'ok' ? '#059669' : '');
     }
 
-    async function saveCctvName() {
-      const input = document.getElementById('cctvNameInput');
-      const button = document.getElementById('cctvNameSave');
-      if (!input || !button) return;
-      const nextName = input.value.trim();
+    function updateClientCctvInputs(cctv) {
+      lastClientCctvSettings = cctv || null;
+      const code = document.getElementById('clientCctvCode');
+      const nameInput = document.getElementById('clientCctvNameInput');
+      const locationInput = document.getElementById('clientCctvLocationInput');
+      const statusInput = document.getElementById('clientCctvStatusInput');
+      if (code) {
+        code.textContent = cctv ? `연결 코드 ${cctv.code || '------'} | ${cctv.status || '-'}` : '-';
+      }
+      if (nameInput && document.activeElement !== nameInput) {
+        nameInput.value = cctv ? cctv.name || '' : '';
+      }
+      if (locationInput && document.activeElement !== locationInput) {
+        locationInput.value = cctv ? cctv.location || '' : '';
+      }
+      if (statusInput && cctv) {
+        statusInput.value = cctv.configuredStatus || cctv.status || '정상';
+      }
+    }
+
+    async function saveClientCctvSettings() {
+      if (!selectedClientId) return;
+      const nameInput = document.getElementById('clientCctvNameInput');
+      const locationInput = document.getElementById('clientCctvLocationInput');
+      const statusInput = document.getElementById('clientCctvStatusInput');
+      const button = document.getElementById('clientCctvSave');
+      if (!nameInput || !button) return;
       button.disabled = true;
-      setCctvNameStatus('Saving...');
+      setClientCctvStatus('Saving...');
       try {
-        const response = await fetch('/api/cctv/settings', {
+        const response = await fetch(`/api/client/${encodeURIComponent(selectedClientId)}/cctv/settings`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            name: nextName,
-            location: lastCctvSettings ? lastCctvSettings.location : '',
-            status: lastCctvSettings ? lastCctvSettings.status : '?뺤긽',
-            streamUrl: lastCctvSettings ? lastCctvSettings.streamUrl : null,
-            inferenceStreamUrl: lastCctvSettings ? lastCctvSettings.inferenceStreamUrl : null,
+            name: nameInput.value.trim(),
+            location: locationInput ? locationInput.value.trim() : '',
+            status: statusInput ? statusInput.value : '정상',
+            streamUrl: lastClientCctvSettings ? lastClientCctvSettings.streamUrl : null,
+            inferenceStreamUrl: lastClientCctvSettings ? lastClientCctvSettings.inferenceStreamUrl : null,
           }),
         });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const data = await response.json();
-        lastCctvSettings = data.cctv || lastCctvSettings;
-        if (lastCctvSettings && document.activeElement !== input) {
-          input.value = lastCctvSettings.name || '';
-        }
-        setCctvNameStatus('Saved and synced', 'ok');
+        updateClientCctvInputs(data.cctv || null);
+        setClientCctvStatus('Saved and synced', 'ok');
+        refreshClients();
       } catch (error) {
-        setCctvNameStatus('Save failed', 'error');
+        setClientCctvStatus('Save failed', 'error');
       } finally {
         button.disabled = false;
       }
@@ -2193,18 +2725,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         `CPU ${data.cpu_percent ?? 0}%\nRAM ${data.memory_percent ?? 0}% (${data.memory_used_gb ?? 0}/${data.memory_total_gb ?? 0} GB)`;
       document.getElementById('desktopCpuRam').textContent = cpuRamLine;
       const runtimeLine =
-        `오디오 큐 ${data.audio_queue_size}\nYOLO ${data.yolo_device}\nSTT ${data.stt_device} / ${data.stt_compute_type}\nbeam ${data.stt_beam_size} | best_of ${data.stt_best_of}`;
+        `활성 카메라 ${data.active_client_count || 0}대${data.multi_camera_mode ? ' | 멀티 카메라 절약 모드' : ''}\n오디오 큐 ${data.audio_queue_size}\nYOLO ${data.yolo_device}\nSTT ${data.stt_device} / ${data.stt_compute_type}\nbeam ${data.stt_beam_size} | best_of ${data.stt_best_of}`;
       document.getElementById('desktopRuntime').textContent = runtimeLine;
-      const pairingElement = document.getElementById('pairingCode');
-      if (pairingElement) {
-        pairingElement.textContent = `${data.pairing_code || '------'}\npaired ${data.paired_clients || 0}`;
-      }
-      if (data.cctv) {
-        lastCctvSettings = data.cctv;
-        const cctvInput = document.getElementById('cctvNameInput');
-        if (cctvInput && document.activeElement !== cctvInput) {
-          cctvInput.value = data.cctv.name || '';
-        }
+      const cameraCodesElement = document.getElementById('cameraCodes');
+      if (cameraCodesElement) {
+        cameraCodesElement.textContent = `각 카메라별 고유 코드 사용\n활성 카메라 ${data.active_client_count || 0}대`;
       }
     }
 
@@ -2233,9 +2758,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       for (const client of clients) {
         const item = document.createElement('div');
         item.className = 'client-card' + (client.client_id === selectedClientId ? ' active' : '');
+        const displayName = client.cctv_name || client.device_name || client.client_id;
         item.innerHTML = `
           <div class="client-top">
-            <div class="client-name">${escapeHtml(client.client_id)}</div>
+            <div>
+              <div class="client-name">${escapeHtml(displayName)}</div>
+              <div class="client-id-line">${escapeHtml(client.client_id)} · ${escapeHtml(client.cctv_code || '------')}</div>
+            </div>
             <div class="client-badges">
               <span class="mini-badge ${speechTone(client.speech_status)}">${escapeHtml(client.speech_status)}</span>
               <span class="mini-badge ${riskTone(client.risk_level)}">${escapeHtml(client.risk_level_label)}</span>
@@ -2248,6 +2777,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             <div class="client-stat">Abnormal<strong>${Number(client.action_abnormal_score || 0).toFixed(2)}</strong></div>
             <div class="client-stat">최근 수신<strong>${client.last_seen_seconds}초 전</strong></div>
             <div class="client-stat">지연<strong>${client.latency_ms.toFixed(1)}ms</strong></div>
+            <div class="client-stat">CCTV<strong>${escapeHtml(client.cctv_status || '-')}</strong></div>
           </div>
           <div class="client-transcript">STT 원문은 앱 백엔드 조회 목록에 표시하지 않습니다.</div>
           <div class="client-categories">카테고리 ${escapeHtml(client.risk_categories && client.risk_categories.length ? client.risk_categories.join(', ') : '없음')}</div>
@@ -2303,8 +2833,39 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       image.src = `/api/client/${encodeURIComponent(selectedClientId)}/frame.jpg?ts=${Date.now()}`;
     }
 
+    async function refreshStats() {
+      if (document.hidden) {
+        return;
+      }
+      const suffix = selectedClientId ? `?client_id=${encodeURIComponent(selectedClientId)}` : '';
+      try {
+        const response = await fetch(`/api/stats${suffix}`);
+        if (!response.ok) return;
+        updateVoiceLiftSummary(await response.json());
+      } catch (_error) {
+        updateVoiceLiftSummary(null);
+      }
+    }
+
+    function updateVoiceLiftSummary(stats) {
+      const target = document.getElementById('voiceLiftSummary');
+      const bar = document.getElementById('voiceLiftBar');
+      if (!target || !bar) return;
+      const summary = stats && stats.voiceLift ? stats.voiceLift : null;
+      if (!summary || !summary.totalEvents) {
+        target.textContent = '기록 없음';
+        bar.style.width = '0%';
+        return;
+      }
+      const rate = Number(summary.audioLiftRate || 0);
+      const gain = Number(summary.averageAudioVideoGain || 0);
+      target.textContent = `음성 보강 ${summary.audioLiftedEvents}/${summary.totalEvents}건 (${rate.toFixed(1)}%), 평균 +${gain.toFixed(1)}점`;
+      bar.style.width = `${Math.max(0, Math.min(100, rate))}%`;
+    }
+
     function updateMeta(data) {
-      document.getElementById('clientName').textContent = data ? data.client_id : '-';
+      document.getElementById('clientName').textContent = data ? ((data.cctv && data.cctv.name) || data.device_name || data.client_id) : '-';
+      updateClientCctvInputs(data ? data.cctv || null : null);
       document.getElementById('peopleCount').textContent = `${data ? data.people_count : 0}`;
       document.getElementById('faceCount').textContent = data && data.face_detection_enabled ? `${data.face_count}` : 'OFF';
       document.getElementById('latency').textContent = `${data ? data.latency_ms.toFixed(1) : 0}ms`;
@@ -2319,9 +2880,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       const riskLevel = document.getElementById('riskLevel');
       riskLevel.textContent = `${data ? data.risk_score : 0}/100 | ${data ? data.risk_level_label : '낮음'}`;
       riskLevel.className = `metric-value status-pill ${riskTone(data ? data.risk_level : 'LOW')}`;
+      const riskStage = document.getElementById('riskStage');
+      const stageText = data && data.risk_stage ? data.risk_stage : '정상';
+      riskStage.textContent = stageText;
+      riskStage.className = `metric-value status-pill ${stageText === '위험' ? 'tone-danger' : stageText === '위험 의심' ? 'tone-warn' : stageText === '주의' ? 'tone-accent' : 'tone-good'}`;
       document.getElementById('riskVideoScore').textContent = `${data ? data.risk_video_score || 0 : 0}/100`;
       document.getElementById('riskAudioScore').textContent = `${data ? data.risk_audio_score || 0 : 0}/100`;
       document.getElementById('riskRawScore').textContent = `${data ? data.risk_raw_score || 0 : 0}/100`;
+      const audioGain = data ? data.risk_audio_video_gain || 0 : 0;
+      const confirmedClass = data && data.risk_audio_confirmed_class ? ` ${data.risk_audio_confirmed_class}` : '';
+      document.getElementById('riskAudioVideoGain').textContent = `+${audioGain}${confirmedClass}`;
 
       const actionLabel = document.getElementById('actionLabel');
       const actionText = data && data.action_available
@@ -2348,25 +2916,29 @@ def create_app(args: argparse.Namespace) -> FastAPI:
       selectedClientId = requestedClientId;
     }
 
-    const cctvNameSaveButton = document.getElementById('cctvNameSave');
-    const cctvNameInput = document.getElementById('cctvNameInput');
-    if (cctvNameSaveButton) {
-      cctvNameSaveButton.addEventListener('click', saveCctvName);
+    const clientCctvSaveButton = document.getElementById('clientCctvSave');
+    const clientCctvNameInput = document.getElementById('clientCctvNameInput');
+    const clientCctvLocationInput = document.getElementById('clientCctvLocationInput');
+    if (clientCctvSaveButton) {
+      clientCctvSaveButton.addEventListener('click', saveClientCctvSettings);
     }
-    if (cctvNameInput) {
-      cctvNameInput.addEventListener('keydown', (event) => {
+    for (const editable of [clientCctvNameInput, clientCctvLocationInput]) {
+      if (!editable) continue;
+      editable.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') {
-          saveCctvName();
+          saveClientCctvSettings();
         }
       });
     }
 
     refreshSystem();
     refreshClients();
+    refreshStats();
     setInterval(refreshSystem, 2000);
     setInterval(refreshClients, 1000);
     setInterval(refreshSelectedClient, 500);
     setInterval(refreshSelectedFrame, 500);
+    setInterval(refreshStats, 3000);
   </script>
 </body>
 </html>"""
@@ -2401,6 +2973,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     def api_system() -> dict:
         snapshot = system_monitor.get_snapshot()
         snapshot["sessions"] = len(sessions)
+        snapshot["active_client_count"] = active_client_count()
+        snapshot["multi_camera_mode"] = snapshot["active_client_count"] >= 2
         snapshot["action_model_enabled"] = bool(action_recognizer.enabled)
         snapshot["action_model_status"] = action_recognizer.latest.status
         snapshot["action_model_reason"] = action_recognizer.latest.reason
@@ -2411,20 +2985,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             and not bool(getattr(args, "disable_app_backend_sync", False))
         )
         snapshot["app_backend_base_url"] = str(getattr(args, "app_backend_base_url", "") or "")
-        with pairing_lock:
-            snapshot["pairing_code"] = pairing_code
-            snapshot["paired_clients"] = len(paired_clients)
+        snapshot["public_base_url"] = public_base_url
+        snapshot["pairing_mode"] = "client_cctv_codes"
         snapshot["cctv"] = current_cctv_settings()
         return snapshot
 
     @app.get("/api/pairing")
     def api_pairing() -> dict:
-        with pairing_lock:
-            return {
-                "pairing_code": pairing_code,
-                "paired_clients": list(paired_clients.values()),
-                "cctv": current_cctv_settings(),
-            }
+        return {
+            "mode": "client_cctv_codes",
+            "message": "Legacy server pairing code is disabled. Use each client's cctv.code instead.",
+            "clients": list_client_summaries(),
+            "cctv": current_cctv_settings(),
+        }
 
     @app.get("/api/cctv/settings")
     def api_cctv_settings() -> dict:
@@ -2456,39 +3029,80 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             cctv_settings.update(updated)
             stored_settings = dict(cctv_settings)
         save_server_cctv_settings(stored_settings)
-        with pairing_lock:
-            current_code = pairing_code
-        sync_cctv_code_with_backend(current_code)
+        with session_lock:
+            active_client_ids = list(sessions.keys())
+        for active_client_id in active_client_ids:
+            with session_lock:
+                active_session = sessions.get(active_client_id)
+            if active_session is not None:
+                remember_client_cctv_meta(active_session, active_client_id)
+            sync_client_cctv_with_backend(active_client_id)
         return {
             "ok": True,
             "cctv": current_cctv_settings(),
         }
 
+    @app.get("/api/client/{client_id}/cctv/settings")
+    def api_client_cctv_settings(client_id: str) -> dict:
+        safe_client_id = sanitize_client_id(client_id)
+        return {
+            "client_id": safe_client_id,
+            "cctv": current_client_cctv_settings(safe_client_id),
+        }
+
+    @app.post("/api/client/{client_id}/cctv/settings")
+    def api_client_cctv_settings_update(client_id: str, payload: dict = Body(...)) -> dict:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body is required.")
+
+        def clean_text(value: object, limit: int = 120) -> str:
+            return str(value or "").strip()[:limit]
+
+        safe_client_id = sanitize_client_id(client_id)
+        default_settings = default_client_cctv_settings(safe_client_id)
+        with cctv_settings_lock:
+            updated = dict(camera_cctv_settings.get(safe_client_id, default_settings))
+            if "name" in payload:
+                updated["name"] = clean_text(payload.get("name"), 80)
+            if "location" in payload:
+                updated["location"] = clean_text(payload.get("location"), 160)
+            if "status" in payload:
+                updated["status"] = clean_text(payload.get("status") or "정상", 40)
+            if "streamUrl" in payload or "stream_url" in payload:
+                updated["stream_url"] = clean_text(payload.get("streamUrl", payload.get("stream_url")), 512)
+            if "inferenceStreamUrl" in payload or "inference_stream_url" in payload:
+                updated["inference_stream_url"] = clean_text(
+                    payload.get("inferenceStreamUrl", payload.get("inference_stream_url")),
+                    512,
+                )
+            camera_cctv_settings[safe_client_id] = updated
+        persist_camera_cctv_settings()
+        with session_lock:
+            session = sessions.get(safe_client_id)
+        if session is not None:
+            remember_client_cctv_meta(session, safe_client_id)
+        sync_client_cctv_with_backend(safe_client_id)
+        return {
+            "ok": True,
+            "client_id": safe_client_id,
+            "cctv": current_client_cctv_settings(safe_client_id),
+        }
+
     @app.post("/api/pairing/regenerate")
     def api_pairing_regenerate() -> dict:
-        nonlocal pairing_code
-        with pairing_lock:
-            pairing_code = generate_pairing_code()
-            save_server_pairing_code(pairing_code)
-            sync_cctv_code_with_backend(pairing_code)
-            return {
-                "pairing_code": pairing_code,
-                "paired_clients": len(paired_clients),
-            }
+        raise HTTPException(
+            status_code=410,
+            detail="Legacy server pairing code is disabled. Each camera/client now owns its own CCTV code.",
+        )
 
     @app.post("/api/pair/register")
     def api_pair_register(payload: dict = Body(...)) -> dict:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON body is required.")
-        submitted_code = normalize_pairing_code(payload.get("code"))
-        with pairing_lock:
-            expected_code = pairing_code
-        if submitted_code != expected_code:
-            raise HTTPException(status_code=403, detail="Invalid pairing code.")
 
         raw_client_id = str(payload.get("client_id") or "").strip()
         if raw_client_id:
-            safe_client_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw_client_id)[:48]
+            safe_client_id = sanitize_client_id(raw_client_id)
         else:
             safe_client_id = f"ios-{secrets.token_hex(3).upper()}"
         if len(safe_client_id) < 3:
@@ -2506,17 +3120,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "paired_at_monotonic": round(monotonic(), 3),
             }
         )
-        with pairing_lock:
-            paired_clients[safe_client_id] = {
-                "client_id": safe_client_id,
-                "device_name": device_name,
-                "client_type": "ios_app",
-                "paired_at_monotonic": session.latest_meta["paired_at_monotonic"],
-            }
+        cctv = remember_client_cctv_meta(session, safe_client_id)
+        sync_client_cctv_with_backend(safe_client_id)
         return {
             "ok": True,
             "client_id": safe_client_id,
             "device_name": device_name,
+            "cctv": cctv,
             "upload": {
                 "frame_url": f"/analyze/frame?client_id={safe_client_id}&lite=1",
                 "audio_url": f"/analyze/audio?client_id={safe_client_id}",
@@ -2530,7 +3140,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             if session is None:
                 raise HTTPException(status_code=404, detail="?대씪?댁뼵?몃? 李얠쓣 ???놁뒿?덈떎.")
             meta = session.latest_meta or {}
-            return {
+            result = {
                 "client_id": client_id,
                 "people_count": int(meta.get("people_count", 0)),
                 "face_count": int(meta.get("face_count", 0)),
@@ -2545,6 +3155,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "risk_audio_score": int(meta.get("risk_audio_score", 0)),
                 "risk_video_score": int(meta.get("risk_video_score", 0)),
                 "risk_raw_score": int(meta.get("risk_raw_score", 0)),
+                "risk_video_only_score": int(meta.get("risk_video_only_score", meta.get("risk_video_score", 0))),
+                "risk_audio_video_gain": int(meta.get("risk_audio_video_gain", 0)),
+                "risk_audio_confirmed_class": str(meta.get("risk_audio_confirmed_class", "")),
+                "risk_stage": str(meta.get("risk_stage", "정상")),
+                "risk_signal_source": str(meta.get("risk_signal_source", "none")),
+                "risk_audio_lifted": bool(meta.get("risk_audio_lifted", False)),
                 "risk_match_quality": str(meta.get("risk_match_quality", "")),
                 "risk_level": str(meta.get("risk_level", "LOW")),
                 "risk_level_label": localize_risk_level(str(meta.get("risk_level", "LOW"))),
@@ -2559,9 +3175,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "action_available": bool(meta.get("action_available", False)),
                 "action_reason": str(meta.get("action_reason", "")),
                 "action_probabilities": dict(meta.get("action_probabilities", {}) or {}),
+                "client_type": str(meta.get("client_type", "uploader")),
+                "device_name": str(meta.get("device_name", "")),
                 "last_seen_seconds": monotonic() - session.last_seen,
                 "has_frame": session.latest_frame_jpeg is not None,
             }
+        result["cctv"] = current_client_cctv_settings(client_id, int(result.get("risk_score", 0) or 0))
+        return result
 
     @app.get("/api/client/{client_id}/frame.jpg")
     def api_client_frame(client_id: str) -> Response:
@@ -2629,7 +3249,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         previous_risk_score = int((session.latest_meta or {}).get("risk_score", 0) or 0)
         session.frame_index += 1
-        detect_interval = max(int(args.person_detect_interval), 1)
+        current_active_clients = active_client_count()
+        base_detect_interval = max(int(args.person_detect_interval), 1)
+        detect_interval = multi_client_person_detect_interval(base_detect_interval, current_active_clients)
         force_person_detect = previous_risk_score >= 35 or session.latest_tracked_people is None
         should_detect_person = force_person_detect or ((session.frame_index - 1) % detect_interval == 0)
         if should_detect_person:
@@ -2654,6 +3276,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             action_recognizer.min_interval_seconds = min(action_recognizer.min_interval_seconds, 1.0)
         elif not confirmed_people:
             action_recognizer.min_interval_seconds = max(action_recognizer.min_interval_seconds, 2.5)
+        action_recognizer.min_interval_seconds = max(
+            action_recognizer.min_interval_seconds,
+            multi_client_min_action_interval(current_active_clients),
+        )
         action_result = action_recognizer.update(frame, confirmed_people)
         latency_ms = (perf_counter() - started_at) * 1000.0
         annotated = frame.copy()
@@ -2672,8 +3298,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             face_count=len(faces),
             action_result=action_result,
         )
+        risk_presentation = build_user_risk_presentation(risk, action_result)
+        cctv = remember_client_cctv_meta(session, client_id, latest_risk_score=risk.score)
         session.latest_meta.update(
             {
+                "active_client_count": current_active_clients,
+                "cctv_code": cctv["code"],
+                "cctv_name": cctv["name"],
+                "cctv_location": cctv["location"],
+                "cctv_status": cctv["status"],
                 "people_count": len(confirmed_people),
                 "uncertain_count": sum(
                     1 for person in evaluated_people if person.get("person_state") == "uncertain"
@@ -2697,14 +3330,28 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "risk_audio_score": risk.audio_score,
                 "risk_video_score": risk.video_score,
                 "risk_raw_score": risk.raw_score,
+                "risk_video_only_score": risk.video_only_score,
+                "risk_audio_video_gain": risk.audio_video_gain,
+                "risk_audio_confirmed_class": risk.audio_confirmed_class,
+                "risk_stage": risk_presentation["stage"],
+                "risk_signal_source": risk_presentation["signal_source"],
+                "risk_audio_lifted": risk_presentation["audio_lifted"],
                 "risk_match_quality": risk.speech_match_quality,
                 "risk_level": risk.level,
-                "risk_categories": list(risk.categories),
-                "risk_reasons": list(risk.reasons),
+                "risk_categories": risk_presentation["categories"],
+                "risk_reasons": risk_presentation["reasons"],
                 "risk_context_flags": list(risk.context_flags),
+                "risk_raw_categories": list(risk.categories),
+                "risk_raw_reasons": list(risk.reasons),
+                "risk_raw_context_flags": list(risk.context_flags),
             }
         )
-        upload_hint = build_adaptive_upload_hint(latency_ms, risk.score, action_result.label)
+        upload_hint = build_adaptive_upload_hint(
+            latency_ms,
+            risk.score,
+            action_result.label,
+            active_client_count=current_active_clients,
+        )
         session.latest_meta["upload_hint"] = upload_hint
         send_backend_event_if_needed(session, risk, action_result)
         if should_log_detection_event(
@@ -2721,10 +3368,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     "risk_audio_score": risk.audio_score,
                     "risk_video_score": risk.video_score,
                     "risk_raw_score": risk.raw_score,
+                    "risk_video_only_score": risk.video_only_score,
+                    "risk_audio_video_gain": risk.audio_video_gain,
+                    "risk_audio_confirmed_class": risk.audio_confirmed_class,
+                    "risk_stage": risk_presentation["stage"],
+                    "risk_signal_source": risk_presentation["signal_source"],
+                    "risk_audio_lifted": risk_presentation["audio_lifted"],
                     "risk_level": risk.level,
-                    "risk_categories": list(risk.categories),
-                    "risk_reasons": list(risk.reasons),
+                    "risk_categories": risk_presentation["categories"],
+                    "risk_reasons": risk_presentation["reasons"],
                     "risk_context_flags": list(risk.context_flags),
+                    "risk_raw_categories": list(risk.categories),
+                    "risk_raw_reasons": list(risk.reasons),
                     "matched_keywords": list(risk.matched_keywords),
                     "transcript": str(session.latest_meta.get("transcript", "")),
                     "action_label": action_result.label,
@@ -2783,8 +3438,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     tracked_people=tracked_people,
                     face_count=face_count,
                 )
+                risk_presentation = build_user_risk_presentation(
+                    risk,
+                    SimpleNamespace(label=str(session.latest_meta.get("action_label", "normal"))),
+                )
+                cctv = remember_client_cctv_meta(session, job.client_id, latest_risk_score=risk.score)
                 session.latest_meta.update(
                     {
+                        "cctv_code": cctv["code"],
+                        "cctv_name": cctv["name"],
+                        "cctv_location": cctv["location"],
+                        "cctv_status": cctv["status"],
                         "speech_status": speech_status,
                         "speech_provider": speech_recognizer.last_provider,
                         "transcript": transcript,
@@ -2793,11 +3457,20 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         "risk_audio_score": risk.audio_score,
                         "risk_video_score": risk.video_score,
                         "risk_raw_score": risk.raw_score,
+                        "risk_video_only_score": risk.video_only_score,
+                        "risk_audio_video_gain": risk.audio_video_gain,
+                        "risk_audio_confirmed_class": risk.audio_confirmed_class,
+                        "risk_stage": risk_presentation["stage"],
+                        "risk_signal_source": risk_presentation["signal_source"],
+                        "risk_audio_lifted": risk_presentation["audio_lifted"],
                         "risk_match_quality": risk.speech_match_quality,
                         "risk_level": risk.level,
-                        "risk_categories": list(risk.categories),
-                        "risk_reasons": list(risk.reasons),
+                        "risk_categories": risk_presentation["categories"],
+                        "risk_reasons": risk_presentation["reasons"],
                         "risk_context_flags": list(risk.context_flags),
+                        "risk_raw_categories": list(risk.categories),
+                        "risk_raw_reasons": list(risk.reasons),
+                        "risk_raw_context_flags": list(risk.context_flags),
                     }
                 )
                 send_backend_event_if_needed(session, risk, None)
@@ -2811,10 +3484,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             "risk_audio_score": risk.audio_score,
                             "risk_video_score": risk.video_score,
                             "risk_raw_score": risk.raw_score,
+                            "risk_video_only_score": risk.video_only_score,
+                            "risk_audio_video_gain": risk.audio_video_gain,
+                            "risk_audio_confirmed_class": risk.audio_confirmed_class,
+                            "risk_stage": risk_presentation["stage"],
+                            "risk_signal_source": risk_presentation["signal_source"],
+                            "risk_audio_lifted": risk_presentation["audio_lifted"],
                             "risk_level": risk.level,
-                            "risk_categories": list(risk.categories),
-                            "risk_reasons": list(risk.reasons),
+                            "risk_categories": risk_presentation["categories"],
+                            "risk_reasons": risk_presentation["reasons"],
                             "risk_context_flags": list(risk.context_flags),
+                            "risk_raw_categories": list(risk.categories),
+                            "risk_raw_reasons": list(risk.reasons),
                             "matched_keywords": list(risk.matched_keywords),
                             "match_quality": risk.speech_match_quality,
                             "transcript": transcript,
@@ -2895,6 +3576,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
